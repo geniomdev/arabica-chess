@@ -6,6 +6,7 @@ A chess engine written in Rust, built on bitboards.
 
 + Bitboards
 + FEN
-- Move generation
++ Move generation
+- Make and unmake move
 - Search
 - UCI protocol

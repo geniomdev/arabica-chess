@@ -49,10 +49,64 @@ impl std::str::FromStr for Square {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MoveKind {
+    Quiet = 0,
+    DoublePush = 1,
+    KingCastle = 2,
+    QueenCastle = 3,
+    Capture = 4,
+    EnPassant = 5,
+    KnightPromotion = 8,
+    BishopPromotion = 9,
+    RookPromotion = 10,
+    QueenPromotion = 11,
+    KnightPromotionCapture = 12,
+    BishopPromotionCapture = 13,
+    RookPromotionCapture = 14,
+    QueenPromotionCapture = 15,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Move(u16);
 
 impl Move {
     pub const NULL: Self = Self(0);
+
+    pub const fn new(from: Square, to: Square, kind: MoveKind) -> Self {
+        Self(from.0 as u16 | (to.0 as u16) << 6 | (kind as u16) << 12)
+    }
+
+    pub const fn from(self) -> Square {
+        Square((self.0 & 0x3F) as u8)
+    }
+
+    pub const fn to(self) -> Square {
+        Square((self.0 >> 6 & 0x3F) as u8)
+    }
+
+    pub const fn flags(self) -> u8 {
+        (self.0 >> 12) as u8
+    }
+
+    pub const fn is_capture(self) -> bool {
+        self.flags() & 4 != 0
+    }
+
+    pub const fn is_promotion(self) -> bool {
+        self.flags() & 8 != 0
+    }
+}
+
+impl std::fmt::Display for Move {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.from(), self.to())?;
+        if self.is_promotion() {
+            let symbol = ['n', 'b', 'r', 'q'][(self.flags() & 3) as usize];
+            write!(f, "{symbol}")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -82,6 +136,14 @@ impl Bitboard {
     pub const fn lowest_square(self) -> Square {
         debug_assert!(!self.is_empty());
         Square(self.0.trailing_zeros() as u8)
+    }
+
+    pub const fn rank(rank: u8) -> Self {
+        Self(0xFF << (rank * 8))
+    }
+
+    pub const fn file(file: u8) -> Self {
+        Self(0x0101_0101_0101_0101 << file)
     }
 }
 
@@ -124,6 +186,30 @@ impl std::ops::BitAndAssign for Bitboard {
 impl std::ops::BitXorAssign for Bitboard {
     fn bitxor_assign(&mut self, rhs: Self) {
         self.0 ^= rhs.0;
+    }
+}
+
+pub struct Squares(u64);
+
+impl Iterator for Squares {
+    type Item = Square;
+
+    fn next(&mut self) -> Option<Square> {
+        if self.0 == 0 {
+            return None;
+        }
+        let square = Square(self.0.trailing_zeros() as u8);
+        self.0 &= self.0 - 1;
+        Some(square)
+    }
+}
+
+impl IntoIterator for Bitboard {
+    type Item = Square;
+    type IntoIter = Squares;
+
+    fn into_iter(self) -> Squares {
+        Squares(self.0)
     }
 }
 

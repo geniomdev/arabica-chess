@@ -1,7 +1,10 @@
 mod fen;
+mod movegen;
 
-pub use fen::KIWIPETE;
+pub use fen::{KIWIPETE, START_POSITION};
+pub use movegen::MoveList;
 
+use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
 use crate::types::{
     Bitboard, CastlingRights, Color, EveryPiece, EverySide, EverySquare, FILES, Move, Piece, RANKS,
     Square,
@@ -161,6 +164,23 @@ impl Board {
         let kings = self.pieces_of(side, Piece::King);
         debug_assert_eq!(kings.count(), 1);
         Square(kings.0.trailing_zeros() as u8)
+    }
+
+    pub fn attackers_to(&self, square: Square, occupancy: Bitboard) -> Bitboard {
+        let pawns = (pawn_attacks(Color::White, square)
+            & self.pieces_of(Color::Black, Piece::Pawn))
+            | (pawn_attacks(Color::Black, square) & self.pieces_of(Color::White, Piece::Pawn));
+        let diagonal = self.pieces[Piece::Bishop] | self.pieces[Piece::Queen];
+        let orthogonal = self.pieces[Piece::Rook] | self.pieces[Piece::Queen];
+        pawns
+            | (knight_attacks(square) & self.pieces[Piece::Knight])
+            | (king_attacks(square) & self.pieces[Piece::King])
+            | (bishop_attacks(square, occupancy) & diagonal)
+            | (rook_attacks(square, occupancy) & orthogonal)
+    }
+
+    pub fn is_attacked(&self, square: Square, by: Color, occupancy: Bitboard) -> bool {
+        !(self.attackers_to(square, occupancy) & self.colors[by]).is_empty()
     }
 
     fn put_piece(&mut self, side: Color, piece: Piece, square: Square) {
