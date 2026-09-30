@@ -96,6 +96,33 @@ impl Move {
     pub const fn is_promotion(self) -> bool {
         self.flags() & 8 != 0
     }
+
+    pub const fn kind(self) -> MoveKind {
+        match self.flags() {
+            0 => MoveKind::Quiet,
+            1 => MoveKind::DoublePush,
+            2 => MoveKind::KingCastle,
+            3 => MoveKind::QueenCastle,
+            4 => MoveKind::Capture,
+            5 => MoveKind::EnPassant,
+            8 => MoveKind::KnightPromotion,
+            9 => MoveKind::BishopPromotion,
+            10 => MoveKind::RookPromotion,
+            11 => MoveKind::QueenPromotion,
+            12 => MoveKind::KnightPromotionCapture,
+            13 => MoveKind::BishopPromotionCapture,
+            14 => MoveKind::RookPromotionCapture,
+            _ => MoveKind::QueenPromotionCapture,
+        }
+    }
+
+    pub const fn promotion(self) -> Option<Piece> {
+        if !self.is_promotion() {
+            return None;
+        }
+        let pieces = [Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen];
+        Some(pieces[(self.flags() & 3) as usize])
+    }
 }
 
 impl std::fmt::Display for Move {
@@ -408,7 +435,26 @@ impl CastlingRights {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+
+    pub const fn after_move(self, from: Square, to: Square) -> Self {
+        Self(
+            self.0
+                & CASTLING_KEPT_AFTER_TOUCH[from.index()]
+                & CASTLING_KEPT_AFTER_TOUCH[to.index()],
+        )
+    }
 }
+
+const CASTLING_KEPT_AFTER_TOUCH: [u8; SQUARES] = {
+    let mut kept = [CastlingRights::ALL.0; SQUARES];
+    kept[0] = !CastlingRights::WHITE_QUEEN.0;
+    kept[4] = !(CastlingRights::WHITE_KING.0 | CastlingRights::WHITE_QUEEN.0);
+    kept[7] = !CastlingRights::WHITE_KING.0;
+    kept[56] = !CastlingRights::BLACK_QUEEN.0;
+    kept[60] = !(CastlingRights::BLACK_KING.0 | CastlingRights::BLACK_QUEEN.0);
+    kept[63] = !CastlingRights::BLACK_KING.0;
+    kept
+};
 
 impl std::fmt::Display for CastlingRights {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -1,5 +1,7 @@
 mod fen;
+mod makemove;
 mod movegen;
+mod perft;
 
 pub use fen::{KIWIPETE, START_POSITION};
 pub use movegen::MoveList;

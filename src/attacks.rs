@@ -245,13 +245,43 @@ mod tests {
         }
     }
 
+    fn square(name: &str) -> Square {
+        name.parse().expect("valid square")
+    }
+
     #[test]
-    fn leaper_tables_have_expected_counts() {
-        assert_eq!(knight_attacks(Square(0)).count(), 2);
-        assert_eq!(knight_attacks(Square(27)).count(), 8);
-        assert_eq!(king_attacks(Square(0)).count(), 3);
-        assert_eq!(king_attacks(Square(27)).count(), 8);
-        assert_eq!(pawn_attacks(Color::White, Square(8)).0, 1u64 << 17);
-        assert_eq!(pawn_attacks(Color::Black, Square(55)).0, 1u64 << 46);
+    fn leaper_tables_match_targets() {
+        let cases: [(&str, Bitboard, &[&str]); 6] = [
+            ("knight a1", knight_attacks(square("a1")), &["b3", "c2"]),
+            (
+                "knight d4",
+                knight_attacks(square("d4")),
+                &["b3", "b5", "c2", "c6", "e2", "e6", "f3", "f5"],
+            ),
+            ("king a1", king_attacks(square("a1")), &["a2", "b1", "b2"]),
+            (
+                "king d4",
+                king_attacks(square("d4")),
+                &["c3", "c4", "c5", "d3", "d5", "e3", "e4", "e5"],
+            ),
+            (
+                "white pawn a2",
+                pawn_attacks(Color::White, square("a2")),
+                &["b3"],
+            ),
+            (
+                "black pawn h7",
+                pawn_attacks(Color::Black, square("h7")),
+                &["g6"],
+            ),
+        ];
+
+        for (name, actual, targets) in cases {
+            let mut expected = Bitboard::empty();
+            for &target in targets {
+                expected |= Bitboard::from_square(square(target));
+            }
+            assert_eq!(actual, expected, "{name}");
+        }
     }
 }
