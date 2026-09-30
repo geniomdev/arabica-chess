@@ -8,5 +8,7 @@ A chess engine written in Rust, built on bitboards.
 + FEN
 + Move generation
 + Make and unmake move
-- Search
++ Search
 - UCI protocol
+- Zobrist and repetition detection
+- TT

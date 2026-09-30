@@ -39,6 +39,10 @@ impl MoveList {
     pub fn as_slice(&self) -> &[Move] {
         &self.moves[..self.len]
     }
+
+    pub fn as_mut_slice(&mut self) -> &mut [Move] {
+        &mut self.moves[..self.len]
+    }
 }
 
 impl Default for MoveList {
@@ -71,13 +75,21 @@ fn push_promotions(moves: &mut MoveList, from: Square, to: Square, kinds: [MoveK
 
 impl Board {
     pub fn generate_pseudo_legal(&self, moves: &mut MoveList) {
+        self.generate(moves, false);
+    }
+
+    pub fn generate_captures(&self, moves: &mut MoveList) {
+        self.generate(moves, true);
+    }
+
+    fn generate(&self, moves: &mut MoveList, captures_only: bool) {
         let side = self.state.active_color;
         let allies = self.occupied_by(side);
         let enemies = self.occupied_by(side.opponent());
         let occupancy = allies | enemies;
-        let targets = !allies;
+        let targets = if captures_only { enemies } else { !allies };
 
-        self.generate_pawn_moves(moves, side, enemies, occupancy);
+        self.generate_pawn_moves(moves, side, enemies, occupancy, captures_only);
         for from in self.pieces_of(side, Piece::Knight) {
             push_targets(moves, from, knight_attacks(from) & targets, enemies);
         }
@@ -99,7 +111,9 @@ impl Board {
         }
         let king = self.king_square(side);
         push_targets(moves, king, king_attacks(king) & targets, enemies);
-        self.generate_castling(moves, side, occupancy);
+        if !captures_only {
+            self.generate_castling(moves, side, occupancy);
+        }
     }
 
     fn generate_pawn_moves(
@@ -108,6 +122,7 @@ impl Board {
         side: Color,
         enemies: Bitboard,
         occupancy: Bitboard,
+        captures_only: bool,
     ) {
         let pawns = self.pieces_of(side, Piece::Pawn);
         let empty = !occupancy;
@@ -119,14 +134,16 @@ impl Board {
         let single = forward(pawns, side) & empty;
         let double = forward(single & double_push_rank, side) & empty;
 
-        for to in single & !promotion_rank {
-            moves.push(Move::new(origin(to, 1), to, MoveKind::Quiet));
-        }
         for to in single & promotion_rank {
             push_promotions(moves, origin(to, 1), to, QUIET_PROMOTIONS);
         }
-        for to in double {
-            moves.push(Move::new(origin(to, 2), to, MoveKind::DoublePush));
+        if !captures_only {
+            for to in single & !promotion_rank {
+                moves.push(Move::new(origin(to, 1), to, MoveKind::Quiet));
+            }
+            for to in double {
+                moves.push(Move::new(origin(to, 2), to, MoveKind::DoublePush));
+            }
         }
         for from in pawns {
             let captures = pawn_attacks(side, from) & enemies;
@@ -291,6 +308,36 @@ mod tests {
                 !generate(fen).contains(&forbidden),
                 "fen {fen:?}, move {notation} {kind:?}"
             );
+        }
+    }
+
+    #[test]
+    fn captures_match_filtered_pseudo_legal_moves() {
+        let fens = [
+            START_POSITION,
+            KIWIPETE,
+            WHITE_EN_PASSANT,
+            BOTH_CASTLES,
+            "3r3k/4P3/8/8/8/8/8/K7 w - - 0 1",
+            "k7/8/8/8/8/8/3p4/4R2K b - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        ];
+
+        for fen in fens {
+            let board: Board = fen
+                .parse()
+                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+            let mut captures = MoveList::new();
+            board.generate_captures(&mut captures);
+            let mut actual = captures.as_slice().to_vec();
+            let mut expected: Vec<Move> = generate(fen)
+                .into_iter()
+                .filter(|candidate| candidate.is_capture() || candidate.is_promotion())
+                .collect();
+            let key = |candidate: &Move| format!("{candidate:?}");
+            actual.sort_by_key(key);
+            expected.sort_by_key(key);
+            assert_eq!(actual, expected, "fen {fen:?}");
         }
     }
 

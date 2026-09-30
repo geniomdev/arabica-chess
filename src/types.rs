@@ -288,6 +288,10 @@ impl<T: Copy> EveryPiece<T> {
     pub const fn new(value: T) -> Self {
         Self([value; PIECE_TYPES])
     }
+
+    pub const fn from_array(values: [T; PIECE_TYPES]) -> Self {
+        Self(values)
+    }
 }
 
 impl<T> std::ops::Index<Piece> for EveryPiece<T> {
