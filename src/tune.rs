@@ -54,35 +54,78 @@ fn term_index(term: Term) -> usize {
     }
 }
 
+const MOBILITY_TABLES: [(&str, Piece, usize); 4] = [
+    ("KNIGHT_MOBILITY", Piece::Knight, KNIGHT_MOBILITY.len()),
+    ("BISHOP_MOBILITY", Piece::Bishop, BISHOP_MOBILITY.len()),
+    ("ROOK_MOBILITY", Piece::Rook, ROOK_MOBILITY.len()),
+    ("QUEEN_MOBILITY", Piece::Queen, QUEEN_MOBILITY.len()),
+];
+
+const SCALAR_TERMS: [(&str, Term); 6] = [
+    ("DOUBLED_PAWN", Term::DoubledPawn),
+    ("ISOLATED_PAWN", Term::IsolatedPawn),
+    ("BISHOP_PAIR", Term::BishopPair),
+    ("ROOK_OPEN_FILE", Term::RookOpenFile),
+    ("ROOK_SEMI_OPEN_FILE", Term::RookSemiOpenFile),
+    ("PAWN_SHIELD", Term::PawnShield),
+];
+
+fn material_terms() -> Vec<Term> {
+    Piece::ALL.into_iter().map(Term::Material).collect()
+}
+
+fn piece_square_terms(piece: Piece) -> Vec<Term> {
+    (0..SQUARES)
+        .map(|square| Term::PieceSquare(piece, square))
+        .collect()
+}
+
+fn mobility_terms(piece: Piece, len: usize) -> Vec<Term> {
+    (0..len).map(|count| Term::Mobility(piece, count)).collect()
+}
+
+fn passed_pawn_terms() -> Vec<Term> {
+    (0..PASSED_PAWN.len()).map(Term::PassedPawn).collect()
+}
+
+fn king_zone_terms() -> Vec<Term> {
+    (0..KING_ZONE_ATTACKS.len())
+        .map(Term::KingZoneAttacks)
+        .collect()
+}
+
 fn all_terms() -> Vec<Term> {
-    let mobility =
-        |piece: Piece, len: usize| (0..len).map(move |count| Term::Mobility(piece, count));
-    Piece::ALL
+    material_terms()
         .into_iter()
-        .map(Term::Material)
+        .chain(Piece::ALL.into_iter().flat_map(piece_square_terms))
         .chain(
-            Piece::ALL
+            MOBILITY_TABLES
                 .into_iter()
-                .flat_map(|piece| (0..SQUARES).map(move |square| Term::PieceSquare(piece, square))),
+                .flat_map(|(_, piece, len)| mobility_terms(piece, len)),
         )
-        .chain(mobility(Piece::Knight, KNIGHT_MOBILITY.len()))
-        .chain(mobility(Piece::Bishop, BISHOP_MOBILITY.len()))
-        .chain(mobility(Piece::Rook, ROOK_MOBILITY.len()))
-        .chain(mobility(Piece::Queen, QUEEN_MOBILITY.len()))
-        .chain((0..PASSED_PAWN.len()).map(Term::PassedPawn))
-        .chain([
-            Term::DoubledPawn,
-            Term::IsolatedPawn,
-            Term::BishopPair,
-            Term::RookOpenFile,
-            Term::RookSemiOpenFile,
-            Term::PawnShield,
-        ])
-        .chain((0..KING_ZONE_ATTACKS.len()).map(Term::KingZoneAttacks))
+        .chain(passed_pawn_terms())
+        .chain(SCALAR_TERMS.map(|(_, term)| term))
+        .chain(king_zone_terms())
+        .collect()
+}
+
+fn initial_weights() -> Weights {
+    all_terms()
+        .into_iter()
+        .map(|term| {
+            let weight = term.weight();
+            [f64::from(weight.mg), f64::from(weight.eg)]
+        })
         .collect()
 }
 
 struct Trace(Vec<i32>);
+
+impl Trace {
+    fn new() -> Self {
+        Self(vec![0; PARAM_COUNT])
+    }
+}
 
 impl Terms for Trace {
     fn add(&mut self, side: Color, term: Term, count: i32) {
@@ -105,6 +148,31 @@ struct Dataset {
     features: Vec<(u16, i16)>,
 }
 
+impl Dataset {
+    fn new() -> Self {
+        Self {
+            positions: Vec::new(),
+            features: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, board: &Board, result: f64, trace: &mut Trace) {
+        trace.0.fill(0);
+        collect_terms(board, trace);
+        let start = self.features.len();
+        for (index, &count) in trace.0.iter().enumerate() {
+            if count != 0 {
+                self.features.push((index as u16, count as i16));
+            }
+        }
+        self.positions.push(Position {
+            features: start..self.features.len(),
+            phase: f64::from(phase(board)) / f64::from(PHASE_TOTAL),
+            result,
+        });
+    }
+}
+
 fn parse_result(line: &str) -> Option<f64> {
     if line.contains("1/2-1/2") {
         Some(0.5)
@@ -119,11 +187,8 @@ fn parse_result(line: &str) -> Option<f64> {
 
 fn load_dataset(path: &str) -> io::Result<Dataset> {
     let reader = BufReader::new(fs::File::open(path)?);
-    let mut dataset = Dataset {
-        positions: Vec::new(),
-        features: Vec::new(),
-    };
-    let mut trace = Trace(vec![0; PARAM_COUNT]);
+    let mut dataset = Dataset::new();
+    let mut trace = Trace::new();
     for line in reader.lines() {
         let line = line?;
         let Some(result) = parse_result(&line) else {
@@ -133,19 +198,7 @@ fn load_dataset(path: &str) -> io::Result<Dataset> {
         let Ok(board) = format!("{} 0 1", fen.join(" ")).parse::<Board>() else {
             continue;
         };
-        trace.0.fill(0);
-        collect_terms(&board, &mut trace);
-        let start = dataset.features.len();
-        for (index, &count) in trace.0.iter().enumerate() {
-            if count != 0 {
-                dataset.features.push((index as u16, count as i16));
-            }
-        }
-        dataset.positions.push(Position {
-            features: start..dataset.features.len(),
-            phase: f64::from(phase(&board)) / f64::from(PHASE_TOTAL),
-            result,
-        });
+        dataset.push(&board, result, &mut trace);
     }
     Ok(dataset)
 }
@@ -246,13 +299,7 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
 
     let dataset = load_dataset(dataset_path)?;
     println!("positions {}", dataset.positions.len());
-    let mut weights: Weights = all_terms()
-        .into_iter()
-        .map(|term| {
-            let weight = term.weight();
-            [f64::from(weight.mg), f64::from(weight.eg)]
-        })
-        .collect();
+    let mut weights = initial_weights();
     let scale = fit_scale(&dataset, &weights);
     println!(
         "scale {scale:.6} loss {:.6}",
@@ -310,74 +357,44 @@ fn render_array(output: &mut String, name: &str, terms: &[Term], weights: &Weigh
 
 fn render_params(weights: &Weights) -> String {
     let mut output = String::from("use crate::eval::{Score, s};\n");
-    let material: Vec<Term> = Piece::ALL.into_iter().map(Term::Material).collect();
-    render_array(&mut output, "MATERIAL", &material, weights);
+    render_array(&mut output, "MATERIAL", &material_terms(), weights);
 
     writeln!(output, "\n#[rustfmt::skip]").unwrap();
     writeln!(output, "pub const PIECE_SQUARE: [[Score; 64]; 6] = [").unwrap();
     for piece in Piece::ALL {
         writeln!(output, "    [").unwrap();
-        for rank in 0..8 {
-            let row: Vec<String> = (0..8)
-                .map(|file| render_score(weights, Term::PieceSquare(piece, rank * 8 + file)))
+        for row in piece_square_terms(piece).chunks(8) {
+            let rendered: Vec<String> = row
+                .iter()
+                .map(|&term| render_score(weights, term))
                 .collect();
-            writeln!(output, "        {},", row.join(", ")).unwrap();
+            writeln!(output, "        {},", rendered.join(", ")).unwrap();
         }
         writeln!(output, "    ],").unwrap();
     }
     writeln!(output, "];").unwrap();
 
-    let mobility = |piece: Piece, len: usize| -> Vec<Term> {
-        (0..len).map(|count| Term::Mobility(piece, count)).collect()
-    };
-    render_array(
-        &mut output,
-        "KNIGHT_MOBILITY",
-        &mobility(Piece::Knight, KNIGHT_MOBILITY.len()),
-        weights,
-    );
-    render_array(
-        &mut output,
-        "BISHOP_MOBILITY",
-        &mobility(Piece::Bishop, BISHOP_MOBILITY.len()),
-        weights,
-    );
-    render_array(
-        &mut output,
-        "ROOK_MOBILITY",
-        &mobility(Piece::Rook, ROOK_MOBILITY.len()),
-        weights,
-    );
-    render_array(
-        &mut output,
-        "QUEEN_MOBILITY",
-        &mobility(Piece::Queen, QUEEN_MOBILITY.len()),
-        weights,
-    );
-    let passed: Vec<Term> = (0..PASSED_PAWN.len()).map(Term::PassedPawn).collect();
-    render_array(&mut output, "PASSED_PAWN", &passed, weights);
-
-    for (name, term) in [
-        ("DOUBLED_PAWN", Term::DoubledPawn),
-        ("ISOLATED_PAWN", Term::IsolatedPawn),
-        ("BISHOP_PAIR", Term::BishopPair),
-        ("ROOK_OPEN_FILE", Term::RookOpenFile),
-        ("ROOK_SEMI_OPEN_FILE", Term::RookSemiOpenFile),
-        ("PAWN_SHIELD", Term::PawnShield),
-    ] {
+    for (name, piece, len) in MOBILITY_TABLES {
+        render_array(&mut output, name, &mobility_terms(piece, len), weights);
+    }
+    render_array(&mut output, "PASSED_PAWN", &passed_pawn_terms(), weights);
+    for (name, term) in SCALAR_TERMS {
         let (mg, eg) = rounded(weights, term);
         writeln!(output, "\npub const {name}: Score = s({mg}, {eg});").unwrap();
     }
-    let king_zone: Vec<Term> = (0..KING_ZONE_ATTACKS.len())
-        .map(Term::KingZoneAttacks)
-        .collect();
-    render_array(&mut output, "KING_ZONE_ATTACKS", &king_zone, weights);
+    render_array(
+        &mut output,
+        "KING_ZONE_ATTACKS",
+        &king_zone_terms(),
+        weights,
+    );
     output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::testing::board;
 
     #[test]
     fn term_indices_are_dense_and_ordered() {
@@ -396,32 +413,12 @@ mod tests {
             "8/8/1p1k4/1P6/8/3p3P/1r4P1/5K2 w - - 0 1",
             "6k1/5ppp/8/1P6/8/2P5/2P2PPP/3R2K1 b - - 0 1",
         ];
-        let weights: Weights = all_terms()
-            .into_iter()
-            .map(|term| [f64::from(term.weight().mg), f64::from(term.weight().eg)])
-            .collect();
+        let weights = initial_weights();
 
         for fen in fens {
-            let board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
-            let mut trace = Trace(vec![0; PARAM_COUNT]);
-            collect_terms(&board, &mut trace);
-            let features: Vec<(u16, i16)> = trace
-                .0
-                .iter()
-                .enumerate()
-                .filter(|&(_, &count)| count != 0)
-                .map(|(index, &count)| (index as u16, count as i16))
-                .collect();
-            let dataset = Dataset {
-                positions: vec![Position {
-                    features: 0..features.len(),
-                    phase: f64::from(phase(&board)) / f64::from(PHASE_TOTAL),
-                    result: 0.5,
-                }],
-                features,
-            };
+            let board = board(fen);
+            let mut dataset = Dataset::new();
+            dataset.push(&board, 0.5, &mut Trace::new());
             let white_eval = crate::eval::evaluate(&board)
                 * match board.state.active_color {
                     Color::White => 1,

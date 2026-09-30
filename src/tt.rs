@@ -25,9 +25,9 @@ struct Entry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit {
     pub best_move: Option<Move>,
-    pub score: i32,
-    pub depth: u8,
-    pub bound: Bound,
+    score: i32,
+    depth: u8,
+    bound: Bound,
 }
 
 impl Hit {

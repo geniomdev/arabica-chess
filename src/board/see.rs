@@ -1,6 +1,7 @@
 use crate::attacks::{bishop_attacks, rook_attacks};
 use crate::board::Board;
-use crate::types::{Bitboard, Move, MoveKind, Piece, Square};
+use crate::board::makemove::en_passant_victim;
+use crate::types::{Bitboard, Move, MoveKind, Piece};
 
 const SEE_VALUES: [i32; 6] = [20_000, 900, 500, 330, 320, 100];
 const CHEAPEST_FIRST: [Piece; 6] = [
@@ -39,7 +40,7 @@ impl Board {
         let mut occupancy =
             self.occupancy() & !Bitboard::from_square(from) & !Bitboard::from_square(to);
         if played.kind() == MoveKind::EnPassant {
-            occupancy &= !Bitboard::from_square(Square(to.0 ^ 8));
+            occupancy &= !Bitboard::from_square(en_passant_victim(to));
         }
         let diagonal = self.pieces(Piece::Bishop) | self.pieces(Piece::Queen);
         let orthogonal = self.pieces(Piece::Rook) | self.pieces(Piece::Queen);
@@ -82,7 +83,7 @@ impl Board {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::{Board, MoveList};
+    use crate::board::testing::{board, find_move};
 
     #[test]
     fn static_exchange_evaluation() {
@@ -103,16 +104,8 @@ mod tests {
         ];
 
         for (fen, notation, threshold, expected) in cases {
-            let board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
-            let mut moves = MoveList::new();
-            board.generate_pseudo_legal(&mut moves);
-            let played = *moves
-                .as_slice()
-                .iter()
-                .find(|candidate| candidate.to_string() == notation)
-                .unwrap_or_else(|| panic!("fen {fen:?}, move {notation} not generated"));
+            let board = board(fen);
+            let played = find_move(&board, notation);
             assert_eq!(
                 board.see(played, threshold),
                 expected,

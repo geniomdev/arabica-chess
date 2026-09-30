@@ -3,7 +3,7 @@ use crate::board::Board;
 use crate::board::zobrist::{castling_key, en_passant_key, side_key};
 use crate::types::{Color, Move, MoveKind, Piece, Square};
 
-fn en_passant_victim(target: Square) -> Square {
+pub(super) fn en_passant_victim(target: Square) -> Square {
     Square(target.0 ^ 8)
 }
 
@@ -69,7 +69,7 @@ impl Board {
         state.captured = captured;
         state.played_move = played;
 
-        let legal = !self.is_attacked(self.king_square(us), them, self.occupancy());
+        let legal = !self.is_king_attacked(us);
         if !legal {
             self.unmake_move();
         }
@@ -125,12 +125,8 @@ impl Board {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::{Board, KIWIPETE, MoveList, START_POSITION};
-
-    fn board(fen: &str) -> Board {
-        fen.parse()
-            .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"))
-    }
+    use crate::board::testing::{board, find_move};
+    use crate::board::{KIWIPETE, MoveList, START_POSITION};
 
     #[test]
     fn unmake_restores_position() {
@@ -218,13 +214,7 @@ mod tests {
 
         for (fen, notation, expected) in cases {
             let mut position = board(fen);
-            let mut moves = MoveList::new();
-            position.generate_pseudo_legal(&mut moves);
-            let candidate = *moves
-                .as_slice()
-                .iter()
-                .find(|candidate| candidate.to_string() == notation)
-                .unwrap_or_else(|| panic!("fen {fen:?}, move {notation} not generated"));
+            let candidate = find_move(&position, notation);
             assert!(
                 position.make_move(candidate),
                 "fen {fen:?}, move {notation}"

@@ -4,7 +4,7 @@ pub const SQUARES: usize = 64;
 pub const FILES: u8 = 8;
 pub const RANKS: u8 = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Square(pub u8);
 
 impl Square {
@@ -48,7 +48,7 @@ impl std::str::FromStr for Square {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MoveKind {
     Quiet = 0,
@@ -67,7 +67,7 @@ pub enum MoveKind {
     QueenPromotionCapture = 15,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Move(u16);
 
 impl Move {
@@ -139,7 +139,7 @@ impl std::fmt::Display for Move {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bitboard(pub u64);
 
 impl Bitboard {
@@ -284,7 +284,7 @@ impl<T> std::ops::IndexMut<Color> for EverySide<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EveryPiece<T>([T; PIECE_TYPES]);
 
 impl<T: Copy> EveryPiece<T> {
@@ -411,7 +411,7 @@ impl Piece {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CastlingRights(u8);
 
 impl CastlingRights {
@@ -429,10 +429,6 @@ impl CastlingRights {
 
     pub fn insert(&mut self, rights: Self) {
         self.0 |= rights.0;
-    }
-
-    pub fn remove(&mut self, rights: Self) {
-        self.0 &= !rights.0;
     }
 
     pub const fn index(self) -> usize {

@@ -224,6 +224,7 @@ impl XorShift {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::testing::square;
 
     #[test]
     fn magic_lookup_matches_ray_walk() {
@@ -243,10 +244,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn square(name: &str) -> Square {
-        name.parse().expect("valid square")
     }
 
     #[test]

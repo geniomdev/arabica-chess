@@ -5,6 +5,7 @@ use super::Board;
 use crate::types::{Bitboard, CastlingRights, Color, FILES, Piece, RANKS, Square};
 
 pub const START_POSITION: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+#[cfg(test)]
 pub const KIWIPETE: &str = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
 
 const BACK_RANKS: Bitboard = Bitboard(0xFF00_0000_0000_00FF);
@@ -249,6 +250,7 @@ fn parse_en_passant(text: &str) -> Result<Option<Square>, FenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::testing::board;
 
     const EN_PASSANT: &str = "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3";
 
@@ -270,9 +272,7 @@ mod tests {
         ];
 
         for (fen, expected) in cases {
-            let board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+            let board = board(fen);
             assert_eq!(board.to_fen(), expected, "fen {fen:?}");
         }
     }

@@ -45,12 +45,6 @@ impl MoveList {
     }
 }
 
-impl Default for MoveList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn forward(pawns: Bitboard, side: Color) -> Bitboard {
     match side {
         Color::White => Bitboard(pawns.0 << 8),
@@ -80,6 +74,16 @@ impl Board {
 
     pub fn generate_captures(&self, moves: &mut MoveList) {
         self.generate(moves, true);
+    }
+
+    pub fn parse_move(&self, notation: &str) -> Option<Move> {
+        let mut moves = MoveList::new();
+        self.generate_pseudo_legal(&mut moves);
+        moves
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|candidate| candidate.to_string() == notation)
     }
 
     fn generate(&self, moves: &mut MoveList, captures_only: bool) {
@@ -187,6 +191,7 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::testing::{board, square};
     use crate::board::{KIWIPETE, START_POSITION};
 
     const BOTH_CASTLES: &str = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1";
@@ -197,16 +202,10 @@ mod tests {
     const NO_CASTLING_RIGHTS: &str = "r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1";
 
     fn generate(fen: &str) -> Vec<Move> {
-        let board: Board = fen
-            .parse()
-            .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+        let board = board(fen);
         let mut moves = MoveList::new();
         board.generate_pseudo_legal(&mut moves);
         moves.as_slice().to_vec()
-    }
-
-    fn square(name: &str) -> Square {
-        name.parse().expect("valid square")
     }
 
     fn encoded(notation: &str, kind: MoveKind) -> Move {
@@ -324,9 +323,7 @@ mod tests {
         ];
 
         for fen in fens {
-            let board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+            let board = board(fen);
             let mut captures = MoveList::new();
             board.generate_captures(&mut captures);
             let mut actual = captures.as_slice().to_vec();

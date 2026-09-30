@@ -261,6 +261,7 @@ fn collect_pawn_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::testing::board;
     use crate::board::{KIWIPETE, START_POSITION};
 
     #[test]
@@ -274,9 +275,7 @@ mod tests {
         ];
 
         for (fen, range) in cases {
-            let board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+            let board = board(fen);
             let score = evaluate(&board);
             assert!(range.contains(&score), "fen {fen:?}, score {score}");
         }
@@ -305,9 +304,7 @@ mod tests {
 
         for (fen, mirrored) in cases {
             let [score, mirrored_score] = [fen, mirrored].map(|fen| {
-                let board: Board = fen
-                    .parse()
-                    .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+                let board = board(fen);
                 evaluate(&board)
             });
             assert_eq!(score, mirrored_score, "fen {fen:?} vs {mirrored:?}");
@@ -382,9 +379,7 @@ mod tests {
         ];
 
         for (fen, side, term, expected) in cases {
-            let board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+            let board = board(fen);
             let mut counts = Counts(Vec::new());
             collect_terms(&board, &mut counts);
             let total: i32 = counts

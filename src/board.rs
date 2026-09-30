@@ -5,7 +5,9 @@ mod perft;
 mod see;
 mod zobrist;
 
-pub use fen::{FenError, KIWIPETE, START_POSITION};
+#[cfg(test)]
+pub use fen::KIWIPETE;
+pub use fen::{FenError, START_POSITION};
 pub use movegen::{MAX_MOVES, MoveList};
 pub use see::see_value;
 
@@ -44,76 +46,13 @@ impl GameState {
     }
 }
 
-impl Default for GameState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone)]
-pub struct History {
-    list: [GameState; MAX_GAME_MOVES],
-    count: usize,
-}
-
-impl History {
-    pub fn new() -> Self {
-        Self {
-            list: [GameState::new(); MAX_GAME_MOVES],
-            count: 0,
-        }
-    }
-
-    pub fn push(&mut self, state: GameState) {
-        self.list[self.count] = state;
-        self.count += 1;
-    }
-
-    pub fn pop(&mut self) -> Option<GameState> {
-        self.count = self.count.checked_sub(1)?;
-        Some(self.list[self.count])
-    }
-
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    pub fn as_slice(&self) -> &[GameState] {
-        &self.list[..self.count]
-    }
-}
-
-impl Default for History {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for History {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl Eq for History {}
-
-impl std::fmt::Debug for History {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.as_slice()).finish()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Board {
     pieces: EveryPiece<Bitboard>,
     colors: EverySide<Bitboard>,
     mailbox: EverySquare<Option<Piece>>,
     pub state: GameState,
-    pub history: History,
+    pub history: Vec<GameState>,
 }
 
 impl Board {
@@ -123,7 +62,7 @@ impl Board {
             colors: EverySide::new(Bitboard::empty()),
             mailbox: EverySquare::new(None),
             state: GameState::new(),
-            history: History::new(),
+            history: Vec::with_capacity(MAX_GAME_MOVES),
         }
     }
 
@@ -168,7 +107,7 @@ impl Board {
     pub fn king_square(&self, side: Color) -> Square {
         let kings = self.pieces_of(side, Piece::King);
         debug_assert_eq!(kings.count(), 1);
-        Square(kings.0.trailing_zeros() as u8)
+        kings.lowest_square()
     }
 
     pub fn attackers_to(&self, square: Square, occupancy: Bitboard) -> Bitboard {
@@ -186,6 +125,14 @@ impl Board {
 
     pub fn is_attacked(&self, square: Square, by: Color, occupancy: Bitboard) -> bool {
         !(self.attackers_to(square, occupancy) & self.colors[by]).is_empty()
+    }
+
+    fn is_king_attacked(&self, side: Color) -> bool {
+        self.is_attacked(self.king_square(side), side.opponent(), self.occupancy())
+    }
+
+    pub fn in_check(&self) -> bool {
+        self.is_king_attacked(self.state.active_color)
     }
 
     fn put_piece(&mut self, side: Color, piece: Piece, square: Square) {
@@ -221,12 +168,6 @@ impl Board {
     }
 }
 
-impl Default for Board {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl std::fmt::Display for Board {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for rank in (0..RANKS).rev() {
@@ -241,5 +182,26 @@ impl std::fmt::Display for Board {
             writeln!(f)?;
         }
         write!(f, "   a b c d e f g h")
+    }
+}
+
+#[cfg(test)]
+pub mod testing {
+    use super::Board;
+    use crate::types::{Move, Square};
+
+    pub fn board(fen: &str) -> Board {
+        fen.parse()
+            .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"))
+    }
+
+    pub fn square(name: &str) -> Square {
+        name.parse().expect("valid square")
+    }
+
+    pub fn find_move(board: &Board, notation: &str) -> Move {
+        board
+            .parse_move(notation)
+            .unwrap_or_else(|| panic!("fen {:?}, move {notation} not generated", board.to_fen()))
     }
 }

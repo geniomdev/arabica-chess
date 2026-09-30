@@ -20,7 +20,8 @@ impl Board {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::{Board, KIWIPETE, START_POSITION};
+    use crate::board::testing::board;
+    use crate::board::{KIWIPETE, START_POSITION};
 
     #[test]
     fn matches_reference_counts() {
@@ -42,9 +43,7 @@ mod tests {
         ];
 
         for (fen, expected) in cases {
-            let mut board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+            let mut board = board(fen);
             for (depth, &nodes) in (1..).zip(expected) {
                 assert_eq!(board.perft(depth), nodes, "fen {fen:?}, depth {depth}");
             }

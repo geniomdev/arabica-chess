@@ -108,7 +108,7 @@ impl Board {
 
     pub fn is_repetition(&self, search_ply: usize) -> bool {
         let key = self.state.zobrist_key;
-        let states = self.history.as_slice();
+        let states = &self.history;
         let reversible_plies = usize::from(self.state.halfmove_clock).min(states.len());
         let mut earlier_occurrences = 0;
         for distance in (4..=reversible_plies).step_by(2) {
@@ -129,21 +129,11 @@ impl Board {
 
 #[cfg(test)]
 mod tests {
+    use crate::board::testing::{board, find_move};
     use crate::board::{Board, KIWIPETE, MoveList, START_POSITION};
 
-    fn board(fen: &str) -> Board {
-        fen.parse()
-            .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"))
-    }
-
     fn play(board: &mut Board, notation: &str) {
-        let mut moves = MoveList::new();
-        board.generate_pseudo_legal(&mut moves);
-        let candidate = *moves
-            .as_slice()
-            .iter()
-            .find(|candidate| candidate.to_string() == notation)
-            .unwrap_or_else(|| panic!("move {notation} not generated"));
+        let candidate = find_move(board, notation);
         assert!(board.make_move(candidate), "move {notation} is illegal");
     }
 

@@ -95,7 +95,6 @@ impl MovePicker {
         killers: [Move; 2],
         history: &HistoryTable,
     ) -> Self {
-        let side_history = &history[board.state.active_color.index()];
         Self::scored(moves, |candidate| {
             if Some(candidate) == hash_move {
                 return HASH_MOVE_SCORE;
@@ -110,7 +109,7 @@ impl MovePicker {
             }
             match killers.iter().position(|&killer| killer == candidate) {
                 Some(rank) => KILLER_SCORES[rank],
-                None => side_history[candidate.from().index()][candidate.to().index()],
+                None => history_score(history, board.state.active_color, candidate),
             }
         })
     }
@@ -172,6 +171,10 @@ fn attacker_rank(attacker: Piece) -> i32 {
         Piece::King => 1_000,
         other => see_value(other),
     }
+}
+
+fn history_score(history: &HistoryTable, side: Color, candidate: Move) -> i32 {
+    history[side.index()][candidate.from().index()][candidate.to().index()]
 }
 
 fn update_history(entry: &mut i32, bonus: i32) {
@@ -306,11 +309,6 @@ impl Searcher {
         self.pv_len[ply] = child_len;
     }
 
-    fn is_in_check(board: &Board) -> bool {
-        let us = board.state.active_color;
-        board.is_attacked(board.king_square(us), us.opponent(), board.occupancy())
-    }
-
     fn reward_quiet(&mut self, side: Color, cutoff: Move, tried: &[Move], depth: i32) {
         let killers = &mut self.killers[self.ply];
         if killers[0] != cutoff {
@@ -331,10 +329,6 @@ impl Searcher {
         }
     }
 
-    fn quiet_history(&self, side: Color, candidate: Move) -> i32 {
-        self.history[side.index()][candidate.from().index()][candidate.to().index()]
-    }
-
     fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32) -> i32 {
         self.pv_len[self.ply] = self.ply;
         let is_root = self.ply == 0;
@@ -345,7 +339,7 @@ impl Searcher {
         if self.ply >= MAX_PLY - 1 {
             return evaluate(board);
         }
-        let in_check = Self::is_in_check(board);
+        let in_check = board.in_check();
         let depth = if in_check { depth + 1 } else { depth };
         if depth <= 0 {
             return self.quiescence(board, alpha, beta);
@@ -445,13 +439,14 @@ impl Searcher {
             let score = if legal_moves == 1 {
                 -self.negamax(board, new_depth, -beta, -alpha)
             } else {
-                let gives_check = Self::is_in_check(board);
+                let gives_check = board.in_check();
                 let mut reduction = 0;
                 if depth >= REDUCTION_DEPTH && is_quiet && !in_check && !gives_check {
                     reduction = late_move_reduction(depth, legal_moves as usize);
                     reduction -= i32::from(is_pv);
                     reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
-                    reduction -= self.quiet_history(us, candidate) / REDUCTION_HISTORY_DIVISOR;
+                    reduction -=
+                        history_score(&self.history, us, candidate) / REDUCTION_HISTORY_DIVISOR;
                     reduction = reduction.clamp(0, new_depth - 1);
                 }
                 let mut score = -self.negamax(board, new_depth - reduction, -alpha - 1, -alpha);
@@ -556,6 +551,7 @@ impl Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::testing::board;
 
     #[test]
     fn finds_best_move() {
@@ -584,9 +580,7 @@ mod tests {
         ];
 
         for (fen, depth, expected_move, expected_score) in cases {
-            let mut board: Board = fen
-                .parse()
-                .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
+            let mut board = board(fen);
             let limits = SearchLimits {
                 depth: Some(depth),
                 ..SearchLimits::default()

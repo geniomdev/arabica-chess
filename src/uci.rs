@@ -241,13 +241,9 @@ fn parse_position(arguments: &[&str]) -> Result<Board, PositionError> {
 }
 
 fn play_uci_move(board: &mut Board, text: &str) -> bool {
-    let mut moves = MoveList::new();
-    board.generate_pseudo_legal(&mut moves);
-    moves
-        .as_slice()
-        .iter()
-        .find(|candidate| candidate.to_string() == text)
-        .is_some_and(|&candidate| board.make_move(candidate))
+    board
+        .parse_move(text)
+        .is_some_and(|candidate| board.make_move(candidate))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
