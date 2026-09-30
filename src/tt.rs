@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn stores_and_probes_entries() {
-        let sample_move = Move::new(Square(12), Square(28), MoveKind::DoublePush);
+        let sample_move = Move::new(Square::E2, Square::E4, MoveKind::DoublePush);
         let cases = [
             (10, 3, Bound::Exact, 5, 5, 3, Some(10)),
             (MATE - 5, 2, Bound::Exact, 2, 6, 2, Some(MATE - 9)),

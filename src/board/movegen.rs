@@ -134,7 +134,8 @@ impl Board {
             Color::White => (8i8, Bitboard::rank(2), Bitboard::rank(7)),
             Color::Black => (-8i8, Bitboard::rank(5), Bitboard::rank(0)),
         };
-        let origin = |to: Square, distance: i8| Square((to.0 as i8 - step * distance) as u8);
+        let origin =
+            |to: Square, distance: i8| Square::from_index((to.raw() as i8 - step * distance) as u8);
         let single = forward(pawns, side) & empty;
         let double = forward(single & double_push_rank, side) & empty;
 
@@ -171,7 +172,7 @@ impl Board {
             Color::Black => (56, CastlingRights::BLACK_KING, CastlingRights::BLACK_QUEEN),
         };
         let enemy = side.opponent();
-        let square = |file: u8| Square(base + file);
+        let square = |file: u8| Square::from_index(base + file);
         let is_free = |files: &[u8]| files.iter().all(|&file| !occupancy.contains(square(file)));
         let is_safe = |files: &[u8]| {
             files

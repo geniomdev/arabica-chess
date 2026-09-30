@@ -5,24 +5,45 @@ pub const FILES: u8 = 8;
 pub const RANKS: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Square(pub u8);
+#[repr(u8)]
+#[rustfmt::skip]
+#[allow(dead_code)]
+pub enum Square {
+    A1, B1, C1, D1, E1, F1, G1, H1,
+    A2, B2, C2, D2, E2, F2, G2, H2,
+    A3, B3, C3, D3, E3, F3, G3, H3,
+    A4, B4, C4, D4, E4, F4, G4, H4,
+    A5, B5, C5, D5, E5, F5, G5, H5,
+    A6, B6, C6, D6, E6, F6, G6, H6,
+    A7, B7, C7, D7, E7, F7, G7, H7,
+    A8, B8, C8, D8, E8, F8, G8, H8,
+}
 
 impl Square {
+    pub const fn from_index(index: u8) -> Self {
+        debug_assert!(index < SQUARES as u8);
+        unsafe { std::mem::transmute::<u8, Self>(index & (SQUARES as u8 - 1)) }
+    }
+
     pub const fn new(file: u8, rank: u8) -> Self {
         debug_assert!(file < FILES && rank < RANKS);
-        Self(rank * FILES + file)
+        Self::from_index(rank * FILES + file)
+    }
+
+    pub const fn raw(self) -> u8 {
+        self as u8
     }
 
     pub const fn index(self) -> usize {
-        self.0 as usize
+        self as usize
     }
 
     pub const fn file(self) -> u8 {
-        self.0 % FILES
+        self.raw() % FILES
     }
 
     pub const fn rank(self) -> u8 {
-        self.0 / FILES
+        self.raw() / FILES
     }
 }
 
@@ -74,15 +95,15 @@ impl Move {
     pub const NULL: Self = Self(0);
 
     pub const fn new(from: Square, to: Square, kind: MoveKind) -> Self {
-        Self(from.0 as u16 | (to.0 as u16) << 6 | (kind as u16) << 12)
+        Self(from.raw() as u16 | (to.raw() as u16) << 6 | (kind as u16) << 12)
     }
 
     pub const fn from(self) -> Square {
-        Square((self.0 & 0x3F) as u8)
+        Square::from_index((self.0 & 0x3F) as u8)
     }
 
     pub const fn to(self) -> Square {
-        Square((self.0 >> 6 & 0x3F) as u8)
+        Square::from_index((self.0 >> 6 & 0x3F) as u8)
     }
 
     pub const fn flags(self) -> u8 {
@@ -148,11 +169,11 @@ impl Bitboard {
     }
 
     pub const fn from_square(square: Square) -> Self {
-        Self(1u64 << square.0)
+        Self(1u64 << square.raw())
     }
 
     pub const fn contains(self, square: Square) -> bool {
-        self.0 & (1u64 << square.0) != 0
+        self.0 & (1u64 << square.raw()) != 0
     }
 
     pub const fn is_empty(self) -> bool {
@@ -165,7 +186,7 @@ impl Bitboard {
 
     pub const fn lowest_square(self) -> Square {
         debug_assert!(!self.is_empty());
-        Square(self.0.trailing_zeros() as u8)
+        Square::from_index(self.0.trailing_zeros() as u8)
     }
 
     pub const fn rank(rank: u8) -> Self {
@@ -228,7 +249,7 @@ impl Iterator for Squares {
         if self.0 == 0 {
             return None;
         }
-        let square = Square(self.0.trailing_zeros() as u8);
+        let square = Square::from_index(self.0.trailing_zeros() as u8);
         self.0 &= self.0 - 1;
         Some(square)
     }
@@ -320,7 +341,7 @@ impl<T> std::ops::Index<Square> for EverySquare<T> {
     type Output = T;
 
     fn index(&self, square: Square) -> &T {
-        &self.0[square.index() & (SQUARES - 1)]
+        &self.0[square.index()]
     }
 }
 

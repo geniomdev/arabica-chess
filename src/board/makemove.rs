@@ -4,14 +4,14 @@ use crate::board::zobrist::{castling_key, en_passant_key, side_key};
 use crate::types::{Color, Move, MoveKind, Piece, Square};
 
 pub(super) fn en_passant_victim(target: Square) -> Square {
-    Square(target.0 ^ 8)
+    Square::from_index(target.raw() ^ 8)
 }
 
 fn castling_rook_path(played: Move) -> Option<(Square, Square)> {
-    let king = played.from().0;
+    let king = played.from().raw();
     match played.kind() {
-        MoveKind::KingCastle => Some((Square(king + 3), Square(king + 1))),
-        MoveKind::QueenCastle => Some((Square(king - 4), Square(king - 1))),
+        MoveKind::KingCastle => Some((Square::from_index(king + 3), Square::from_index(king + 1))),
+        MoveKind::QueenCastle => Some((Square::from_index(king - 4), Square::from_index(king - 1))),
         _ => None,
     }
 }
@@ -47,7 +47,7 @@ impl Board {
             self.move_piece(us, Piece::Rook, rook_from, rook_to);
         }
 
-        let passed = Square((from.0 + to.0) / 2);
+        let passed = Square::from_index((from.raw() + to.raw()) / 2);
         let capturable = !(pawn_attacks(us, passed) & self.pieces_of(them, Piece::Pawn)).is_empty();
         let state = &mut self.state;
         state.zobrist_key ^= castling_key(state.castling) ^ en_passant_key(state.en_passant);

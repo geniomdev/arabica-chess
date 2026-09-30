@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use crate::types::{Bitboard, Color, SQUARES, Square};
 
 type Direction = (i8, i8);
@@ -27,7 +25,139 @@ const KING_STEPS: [Direction; 8] = [
     (1, -1),
 ];
 const SLIDER_TABLE_SIZE: usize = 102_400 + 5_248;
-const MAGIC_SEEDS_BY_RANK: [u64; 8] = [728, 10316, 55013, 32803, 12281, 15100, 16645, 255];
+
+const ROOK_FACTORS: [u64; SQUARES] = [
+    0x0A80004000801220,
+    0x8040004010002008,
+    0x2080200010008008,
+    0x1100100008210004,
+    0xC200209084020008,
+    0x2100010004000208,
+    0x0400081000822421,
+    0x0200010422048844,
+    0x0800800080400024,
+    0x0001402000401000,
+    0x3000801000802001,
+    0x4400800800100083,
+    0x0904802402480080,
+    0x4040800400020080,
+    0x0018808042000100,
+    0x4040800080004100,
+    0x0040048001458024,
+    0x00A0004000205000,
+    0x3100808010002000,
+    0x4825010010000820,
+    0x5004808008000401,
+    0x2024818004000A00,
+    0x0005808002000100,
+    0x2100060004806104,
+    0x0080400880008421,
+    0x4062220600410280,
+    0x010A004A00108022,
+    0x0000100080080080,
+    0x0021000500080010,
+    0x0044000202001008,
+    0x0000100400080102,
+    0xC020128200040545,
+    0x0080002000400040,
+    0x0000804000802004,
+    0x0000120022004080,
+    0x010A386103001001,
+    0x9010080080800400,
+    0x8440020080800400,
+    0x0004228824001001,
+    0x000000490A000084,
+    0x0080002000504000,
+    0x200020005000C000,
+    0x0012088020420010,
+    0x0010010080080800,
+    0x0085001008010004,
+    0x0002000204008080,
+    0x0040413002040008,
+    0x0000304081020004,
+    0x0080204000800080,
+    0x3008804000290100,
+    0x1010100080200080,
+    0x2008100208028080,
+    0x5000850800910100,
+    0x8402019004680200,
+    0x0120911028020400,
+    0x0000008044010200,
+    0x0020850200244012,
+    0x0020850200244012,
+    0x0000102001040841,
+    0x140900040A100021,
+    0x000200282410A102,
+    0x000200282410A102,
+    0x000200282410A102,
+    0x4048240043802106,
+];
+const BISHOP_FACTORS: [u64; SQUARES] = [
+    0x40106000A1160020,
+    0x0020010250810120,
+    0x2010010220280081,
+    0x002806004050C040,
+    0x0002021018000000,
+    0x2001112010000400,
+    0x0881010120218080,
+    0x1030820110010500,
+    0x0000120222042400,
+    0x2000020404040044,
+    0x8000480094208000,
+    0x0003422A02000001,
+    0x000A220210100040,
+    0x8004820202226000,
+    0x0018234854100800,
+    0x0100004042101040,
+    0x0004001004082820,
+    0x0010000810010048,
+    0x1014004208081300,
+    0x2080818802044202,
+    0x0040880C00A00100,
+    0x0080400200522010,
+    0x0001000188180B04,
+    0x0080249202020204,
+    0x1004400004100410,
+    0x00013100A0022206,
+    0x2148500001040080,
+    0x4241080011004300,
+    0x4020848004002000,
+    0x10101380D1004100,
+    0x0008004422020284,
+    0x01010A1041008080,
+    0x0808080400082121,
+    0x0808080400082121,
+    0x0091128200100C00,
+    0x0202200802010104,
+    0x8C0A020200440085,
+    0x01A0008080B10040,
+    0x0889520080122800,
+    0x100902022202010A,
+    0x04081A0816002000,
+    0x0000681208005000,
+    0x8170840041008802,
+    0x0A00004200810805,
+    0x0830404408210100,
+    0x2602208106006102,
+    0x1048300680802628,
+    0x2602208106006102,
+    0x0602010120110040,
+    0x0941010801043000,
+    0x000040440A210428,
+    0x0008240020880021,
+    0x0400002012048200,
+    0x00AC102001210220,
+    0x0220021002009900,
+    0x84440C080A013080,
+    0x0001008044200440,
+    0x0004C04410841000,
+    0x2000500104011130,
+    0x1A0C010011C20229,
+    0x0044800112202200,
+    0x0434804908100424,
+    0x0300404822C08200,
+    0x48081010008A2A80,
+];
 
 static KNIGHT_ATTACKS: [u64; SQUARES] = leaper_table(KNIGHT_STEPS);
 static KING_ATTACKS: [u64; SQUARES] = leaper_table(KING_STEPS);
@@ -35,7 +165,8 @@ static PAWN_ATTACKS: [[u64; SQUARES]; 2] = [
     leaper_table([(-1, 1), (1, 1)]),
     leaper_table([(-1, -1), (1, -1)]),
 ];
-static SLIDERS: LazyLock<Sliders> = LazyLock::new(Sliders::build);
+#[allow(long_running_const_eval)]
+static SLIDERS: Sliders = Sliders::build();
 
 pub fn knight_attacks(square: Square) -> Bitboard {
     Bitboard(KNIGHT_ATTACKS[square.index()])
@@ -50,21 +181,15 @@ pub fn pawn_attacks(side: Color, square: Square) -> Bitboard {
 }
 
 pub fn rook_attacks(square: Square, occupancy: Bitboard) -> Bitboard {
-    let sliders = &*SLIDERS;
-    Bitboard(sliders.attacks[sliders.rook[square.index()].index(occupancy.0)])
+    Bitboard(SLIDERS.attacks[SLIDERS.rook[square.index()].index(occupancy.0)])
 }
 
 pub fn bishop_attacks(square: Square, occupancy: Bitboard) -> Bitboard {
-    let sliders = &*SLIDERS;
-    Bitboard(sliders.attacks[sliders.bishop[square.index()].index(occupancy.0)])
+    Bitboard(SLIDERS.attacks[SLIDERS.bishop[square.index()].index(occupancy.0)])
 }
 
 pub fn queen_attacks(square: Square, occupancy: Bitboard) -> Bitboard {
     rook_attacks(square, occupancy) | bishop_attacks(square, occupancy)
-}
-
-pub fn init() {
-    LazyLock::force(&SLIDERS);
 }
 
 #[derive(Clone, Copy)]
@@ -76,8 +201,15 @@ struct Magic {
 }
 
 impl Magic {
+    const EMPTY: Self = Self {
+        mask: 0,
+        factor: 0,
+        shift: 0,
+        offset: 0,
+    };
+
     #[inline(always)]
-    fn index(self, occupancy: u64) -> usize {
+    const fn index(self, occupancy: u64) -> usize {
         let hash = (occupancy & self.mask).wrapping_mul(self.factor) >> self.shift;
         hash as usize + self.offset as usize
     }
@@ -86,86 +218,81 @@ impl Magic {
 struct Sliders {
     rook: [Magic; SQUARES],
     bishop: [Magic; SQUARES],
-    attacks: Box<[u64]>,
+    attacks: [u64; SLIDER_TABLE_SIZE],
 }
 
 impl Sliders {
-    fn build() -> Self {
-        let mut attacks = Vec::with_capacity(SLIDER_TABLE_SIZE);
-        let rook = std::array::from_fn(|square| {
-            find_magic(Square(square as u8), ROOK_DIRECTIONS, &mut attacks)
-        });
-        let bishop = std::array::from_fn(|square| {
-            find_magic(Square(square as u8), BISHOP_DIRECTIONS, &mut attacks)
-        });
-        debug_assert_eq!(attacks.len(), SLIDER_TABLE_SIZE);
-        Self {
-            rook,
-            bishop,
-            attacks: attacks.into_boxed_slice(),
+    const fn build() -> Self {
+        let mut sliders = Self {
+            rook: [Magic::EMPTY; SQUARES],
+            bishop: [Magic::EMPTY; SQUARES],
+            attacks: [0; SLIDER_TABLE_SIZE],
+        };
+        let mut offset = 0;
+        let mut square = 0;
+        while square < SQUARES {
+            let magic = sliders.fill(square, ROOK_DIRECTIONS, ROOK_FACTORS[square], offset);
+            offset += 1 << magic.mask.count_ones();
+            sliders.rook[square] = magic;
+            square += 1;
         }
+        square = 0;
+        while square < SQUARES {
+            let magic = sliders.fill(square, BISHOP_DIRECTIONS, BISHOP_FACTORS[square], offset);
+            offset += 1 << magic.mask.count_ones();
+            sliders.bishop[square] = magic;
+            square += 1;
+        }
+        assert!(offset == SLIDER_TABLE_SIZE);
+        sliders
     }
-}
 
-fn find_magic(square: Square, directions: [Direction; 4], attacks: &mut Vec<u64>) -> Magic {
-    let mut random = XorShift(MAGIC_SEEDS_BY_RANK[square.rank() as usize]);
-    let mask = relevant_mask(square, directions);
-    let occupancies: Vec<u64> = subsets(mask).collect();
-    let references: Vec<u64> = occupancies
-        .iter()
-        .map(|&occupancy| sliding_attacks(square, occupancy, directions))
-        .collect();
-    let offset = attacks.len();
-    attacks.resize(offset + occupancies.len(), 0);
-    let table = &mut attacks[offset..];
-    let mut used_in_attempt = vec![0u32; table.len()];
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let factor = random.sparse();
-        if (mask.wrapping_mul(factor) >> 56).count_ones() < 6 {
-            continue;
-        }
+    const fn fill(
+        &mut self,
+        square: usize,
+        directions: [Direction; 4],
+        factor: u64,
+        offset: usize,
+    ) -> Magic {
+        let square = Square::from_index(square as u8);
+        let mask = relevant_mask(square, directions);
         let magic = Magic {
             mask,
             factor,
             shift: 64 - mask.count_ones(),
-            offset: 0,
+            offset: offset as u32,
         };
-        let collision_free = occupancies
-            .iter()
-            .zip(&references)
-            .all(|(&occupancy, &reference)| {
-                let slot = magic.index(occupancy);
-                if used_in_attempt[slot] != attempt {
-                    used_in_attempt[slot] = attempt;
-                    table[slot] = reference;
-                    true
-                } else {
-                    table[slot] == reference
-                }
-            });
-        if collision_free {
-            return Magic {
-                offset: offset as u32,
-                ..magic
-            };
+        let mut occupancy = 0;
+        loop {
+            let reference = sliding_attacks(square, occupancy, directions);
+            let slot = magic.index(occupancy);
+            assert!(
+                self.attacks[slot] == 0 || self.attacks[slot] == reference,
+                "magic factor collides"
+            );
+            self.attacks[slot] = reference;
+            occupancy = occupancy.wrapping_sub(mask) & mask;
+            if occupancy == 0 {
+                return magic;
+            }
         }
     }
 }
 
-fn relevant_mask(square: Square, directions: [Direction; 4]) -> u64 {
-    let rank_edges = (Bitboard::rank(0) | Bitboard::rank(7)) & !Bitboard::rank(square.rank());
-    let file_edges = (Bitboard::file(0) | Bitboard::file(7)) & !Bitboard::file(square.file());
-    sliding_attacks(square, 0, directions) & !(rank_edges | file_edges).0
+const fn relevant_mask(square: Square, directions: [Direction; 4]) -> u64 {
+    let rank_edges = (Bitboard::rank(0).0 | Bitboard::rank(7).0) & !Bitboard::rank(square.rank()).0;
+    let file_edges = (Bitboard::file(0).0 | Bitboard::file(7).0) & !Bitboard::file(square.file()).0;
+    sliding_attacks(square, 0, directions) & !(rank_edges | file_edges)
 }
 
-fn sliding_attacks(square: Square, occupancy: u64, directions: [Direction; 4]) -> u64 {
+const fn sliding_attacks(square: Square, occupancy: u64, directions: [Direction; 4]) -> u64 {
     let mut attacks = 0;
-    for (file_step, rank_step) in directions {
+    let mut direction = 0;
+    while direction < directions.len() {
+        let (file_step, rank_step) = directions[direction];
         let mut file = square.file() as i8 + file_step;
         let mut rank = square.rank() as i8 + rank_step;
-        while (0..8).contains(&file) && (0..8).contains(&rank) {
+        while file >= 0 && file < 8 && rank >= 0 && rank < 8 {
             let bit = 1u64 << (rank * 8 + file);
             attacks |= bit;
             if occupancy & bit != 0 {
@@ -174,18 +301,9 @@ fn sliding_attacks(square: Square, occupancy: u64, directions: [Direction; 4]) -
             file += file_step;
             rank += rank_step;
         }
+        direction += 1;
     }
     attacks
-}
-
-fn subsets(mask: u64) -> impl Iterator<Item = u64> {
-    let mut next = Some(0u64);
-    std::iter::from_fn(move || {
-        let current = next?;
-        let following = current.wrapping_sub(mask) & mask;
-        next = (following != 0).then_some(following);
-        Some(current)
-    })
 }
 
 const fn leaper_table<const N: usize>(steps: [Direction; N]) -> [u64; SQUARES] {
@@ -206,31 +324,27 @@ const fn leaper_table<const N: usize>(steps: [Direction; N]) -> [u64; SQUARES] {
     table
 }
 
-struct XorShift(u64);
-
-impl XorShift {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn sparse(&mut self) -> u64 {
-        self.next() & self.next() & self.next()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::board::testing::square;
 
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
     #[test]
     fn magic_lookup_matches_ray_walk() {
         let mut random = XorShift(42);
         for index in 0..SQUARES as u8 {
-            let square = Square(index);
+            let square = Square::from_index(index);
             for _ in 0..1000 {
                 let occupancy = random.next() & random.next();
                 let board = Bitboard(occupancy);

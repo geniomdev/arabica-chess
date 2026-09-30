@@ -25,19 +25,3 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, 
 
 **Tuning**
 - `./target/release/arabica tune <dataset.epd> <params.rs> [epochs]` - Texel-tunes the evaluation weights on a labeled EPD dataset (for example Zurichess `quiet-labeled.epd`) and writes them in the `src/eval/params.rs` format
-
-## Goals
-
-+ Bitboards
-+ FEN
-+ Move generation
-+ Make and unmake move
-+ Search
-+ UCI protocol
-+ Zobrist and repetition detection
-+ TT
-+ Tapered evaluation
-+ Move ordering: killers, history, SEE
-+ PVS, null move pruning, LMR
-+ Reverse futility, futility and late move pruning
-+ Texel tuning
