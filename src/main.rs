@@ -2,6 +2,7 @@ mod attacks;
 mod board;
 mod eval;
 mod search;
+mod tt;
 mod types;
 mod uci;
 

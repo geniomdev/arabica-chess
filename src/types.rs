@@ -67,7 +67,7 @@ pub enum MoveKind {
     QueenPromotionCapture = 15,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Move(u16);
 
 impl Move {

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::{self, BufRead};
+use std::mem;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +9,7 @@ use std::time::Duration;
 
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::search::{Iteration, SearchLimits, Searcher, uci_score};
+use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
 use crate::types::{Color, EverySide};
 
 const ENGINE_NAME: &str = "Arabica";
@@ -37,6 +39,7 @@ enum Flow {
 
 struct Engine {
     board: Board,
+    table: TranspositionTable,
     search: Option<RunningSearch>,
 }
 
@@ -44,6 +47,7 @@ impl Engine {
     fn new() -> Self {
         Self {
             board: start_position(),
+            table: TranspositionTable::new(DEFAULT_HASH_MB),
             search: None,
         }
     }
@@ -53,12 +57,23 @@ impl Engine {
             ["uci", ..] => {
                 println!("id name {ENGINE_NAME} {}", env!("CARGO_PKG_VERSION"));
                 println!("id author {ENGINE_AUTHOR}");
+                println!(
+                    "option name Hash type spin default {DEFAULT_HASH_MB} min {MIN_HASH_MB} max {MAX_HASH_MB}"
+                );
                 println!("uciok");
             }
             ["isready", ..] => println!("readyok"),
             ["ucinewgame", ..] => {
                 self.stop_search();
                 self.board = start_position();
+                self.table.clear();
+            }
+            ["setoption", arguments @ ..] => {
+                self.stop_search();
+                match parse_hash_option(arguments) {
+                    Some(megabytes) => self.table = TranspositionTable::new(megabytes),
+                    None => println!("info string unsupported option: {}", arguments.join(" ")),
+                }
             }
             ["position", arguments @ ..] => {
                 self.stop_search();
@@ -93,28 +108,34 @@ impl Engine {
         self.search = Some(RunningSearch::start(
             self.board.clone(),
             limits,
+            mem::take(&mut self.table),
             params.infinite,
         ));
     }
 
     fn stop_search(&mut self) {
         if let Some(search) = self.search.take() {
-            search.stop();
+            self.table = search.stop();
         }
     }
 }
 
 struct RunningSearch {
     stop_signal: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
+    thread: JoinHandle<TranspositionTable>,
 }
 
 impl RunningSearch {
-    fn start(mut board: Board, limits: SearchLimits, hold_until_stopped: bool) -> Self {
+    fn start(
+        mut board: Board,
+        limits: SearchLimits,
+        table: TranspositionTable,
+        hold_until_stopped: bool,
+    ) -> Self {
         let stop_signal = Arc::new(AtomicBool::new(false));
         let searcher_signal = Arc::clone(&stop_signal);
         let thread = thread::spawn(move || {
-            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_signal));
+            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_signal), table);
             let (best_move, _) = searcher.search(&mut board, print_iteration);
             if hold_until_stopped {
                 while !searcher_signal.load(Ordering::Acquire) {
@@ -122,6 +143,7 @@ impl RunningSearch {
                 }
             }
             println!("bestmove {best_move}");
+            searcher.into_table()
         });
         Self {
             stop_signal,
@@ -129,10 +151,10 @@ impl RunningSearch {
         }
     }
 
-    fn stop(self) {
+    fn stop(self) -> TranspositionTable {
         self.stop_signal.store(true, Ordering::Release);
         self.thread.thread().unpark();
-        self.thread.join().expect("search thread finished cleanly");
+        self.thread.join().expect("search thread finished cleanly")
     }
 }
 
@@ -148,11 +170,12 @@ fn print_iteration(iteration: &Iteration) {
         format!(" pv{pv}")
     };
     println!(
-        "info depth {} score {} nodes {} time {}{pv_section}",
+        "info depth {} score {} nodes {} time {} hashfull {}{pv_section}",
         iteration.depth,
         uci_score(iteration.score),
         iteration.nodes,
         iteration.elapsed.as_millis(),
+        iteration.hashfull,
     );
 }
 
@@ -272,6 +295,13 @@ fn clock_budget(remaining: Duration, increment: Duration, moves_to_go: Option<u3
     TimeBudget {
         soft: hard / 2,
         hard,
+    }
+}
+
+fn parse_hash_option(arguments: &[&str]) -> Option<usize> {
+    match arguments {
+        ["name", name, "value", value] if name.eq_ignore_ascii_case("hash") => value.parse().ok(),
+        _ => None,
     }
 }
 
@@ -418,6 +448,25 @@ mod tests {
 
         for (command, expected) in cases {
             assert_eq!(parse_go(&tokens(command)), expected, "command {command:?}");
+        }
+    }
+
+    #[test]
+    fn parses_hash_option() {
+        let cases = [
+            ("name Hash value 64", Some(64)),
+            ("name hash value 1", Some(1)),
+            ("name Hash value big", None),
+            ("name Threads value 4", None),
+            ("name Hash", None),
+        ];
+
+        for (command, expected) in cases {
+            assert_eq!(
+                parse_hash_option(&tokens(command)),
+                expected,
+                "command {command:?}"
+            );
         }
     }
 

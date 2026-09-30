@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::board::{Board, MAX_MOVES, MoveList};
 use crate::eval::{evaluate, piece_value};
+use crate::tt::{Bound, Store, TranspositionTable};
 use crate::types::{Move, MoveKind, Piece};
 
 pub const INFINITY: i32 = 32_000;
@@ -11,9 +12,9 @@ pub const MATE: i32 = 31_000;
 pub const MAX_PLY: usize = 128;
 pub const MAX_DEPTH: u8 = 64;
 
-const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
+pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 const TIME_CHECK_INTERVAL: u64 = 2048;
-const PV_MOVE_SCORE: i32 = 1_000_000;
+const PRIORITY_MOVE_SCORE: i32 = 1_000_000;
 const CAPTURE_BASE_SCORE: i32 = 100_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,10 +30,12 @@ pub struct Iteration<'a> {
     pub nodes: u64,
     pub elapsed: Duration,
     pub pv: &'a [Move],
+    pub hashfull: usize,
 }
 
 pub struct Searcher {
     limits: SearchLimits,
+    table: TranspositionTable,
     stop_signal: Arc<AtomicBool>,
     start: Instant,
     nodes: u64,
@@ -51,13 +54,15 @@ struct MovePicker {
 }
 
 impl MovePicker {
-    fn new(board: &Board, moves: MoveList, pv_move: Option<Move>) -> Self {
+    fn new(board: &Board, moves: MoveList, priority_moves: [Option<Move>; 2]) -> Self {
         let mut scores = [0; MAX_MOVES];
         for (score, &candidate) in scores.iter_mut().zip(moves.as_slice()) {
-            *score = if Some(candidate) == pv_move {
-                PV_MOVE_SCORE
-            } else {
-                order_score(board, candidate)
+            *score = match priority_moves
+                .iter()
+                .position(|&priority| priority == Some(candidate))
+            {
+                Some(rank) => PRIORITY_MOVE_SCORE - rank as i32,
+                None => order_score(board, candidate),
             };
         }
         Self {
@@ -136,9 +141,14 @@ pub fn uci_score(score: i32) -> String {
 }
 
 impl Searcher {
-    pub fn new(limits: SearchLimits, stop_signal: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        limits: SearchLimits,
+        stop_signal: Arc<AtomicBool>,
+        table: TranspositionTable,
+    ) -> Self {
         Self {
             limits,
+            table,
             stop_signal,
             start: Instant::now(),
             nodes: 0,
@@ -175,6 +185,7 @@ impl Searcher {
                 nodes: self.nodes,
                 elapsed: self.start.elapsed(),
                 pv,
+                hashfull: self.table.hashfull(),
             });
             if is_mate_score(score) || best.0 == Move::NULL || self.soft_time_expired() {
                 break;
@@ -184,6 +195,10 @@ impl Searcher {
             best.0 = first_legal_move(board).unwrap_or(Move::NULL);
         }
         best
+    }
+
+    pub fn into_table(self) -> TranspositionTable {
+        self.table
     }
 
     fn soft_time_expired(&self) -> bool {
@@ -228,7 +243,8 @@ impl Searcher {
 
     fn negamax(&mut self, board: &mut Board, depth: u8, mut alpha: i32, beta: i32) -> i32 {
         self.pv_len[self.ply] = self.ply;
-        if self.ply > 0 && (board.state.halfmove_clock >= 100 || board.is_repetition(self.ply)) {
+        let is_root = self.ply == 0;
+        if !is_root && (board.state.halfmove_clock >= 100 || board.is_repetition(self.ply)) {
             return 0;
         }
         if self.ply >= MAX_PLY - 1 {
@@ -244,11 +260,23 @@ impl Searcher {
             return 0;
         }
 
+        let key = board.state.zobrist_key;
+        let hit = self.table.probe(key, self.ply);
+        if let Some(score) = hit
+            .filter(|_| !is_root)
+            .and_then(|hit| hit.cutoff_score(depth, alpha, beta))
+        {
+            return score;
+        }
+        let hash_move = hit.and_then(|hit| hit.best_move);
+
         let mut moves = MoveList::new();
         board.generate_pseudo_legal(&mut moves);
-        let picker = MovePicker::new(board, moves, self.pv_move());
+        let picker = MovePicker::new(board, moves, [hash_move, self.pv_move()]);
 
+        let original_alpha = alpha;
         let mut best_score = -INFINITY;
+        let mut best_move = Move::NULL;
         let mut legal_moves = 0;
         for candidate in picker {
             if !board.make_move(candidate) {
@@ -265,6 +293,7 @@ impl Searcher {
             best_score = best_score.max(score);
             if score > alpha {
                 alpha = score;
+                best_move = candidate;
                 self.update_pv(candidate);
                 if alpha >= beta {
                     break;
@@ -272,11 +301,29 @@ impl Searcher {
             }
         }
 
-        match legal_moves {
+        let score = match legal_moves {
             0 if in_check => -MATE + self.ply as i32,
             0 => 0,
             _ => best_score,
-        }
+        };
+        let bound = if legal_moves == 0 {
+            Bound::Exact
+        } else if score >= beta {
+            Bound::Lower
+        } else if score <= original_alpha {
+            Bound::Upper
+        } else {
+            Bound::Exact
+        };
+        self.table.store(Store {
+            key,
+            best_move,
+            score,
+            depth,
+            bound,
+            ply: self.ply,
+        });
+        score
     }
 
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32) -> i32 {
@@ -292,7 +339,7 @@ impl Searcher {
 
         let mut moves = MoveList::new();
         board.generate_captures(&mut moves);
-        let picker = MovePicker::new(board, moves, None);
+        let picker = MovePicker::new(board, moves, [None; 2]);
 
         let mut best_score = stand_pat;
         for candidate in picker {
@@ -357,7 +404,8 @@ mod tests {
                 ..SearchLimits::default()
             };
             let (best_move, score) =
-                Searcher::new(limits, Arc::default()).search(&mut board, |_| {});
+                Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+                    .search(&mut board, |_| {});
             if let Some(expected) = expected_move {
                 assert_eq!(best_move.to_string(), expected, "fen {fen:?}");
             }

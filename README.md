@@ -2,7 +2,7 @@
 
 A chess engine written in Rust, built on bitboards.
 
-UCI, Magic bitboards, Negamax, Iterative deepening, Quiescence search, Check extension, Principal variation, Zobrist hashing, Repetition detection
+UCI, Magic bitboards, Negamax, Iterative deepening, Quiescence search, Check extension, Principal variation, Zobrist hashing, Repetition detection, Transposition table
 
 ## Use
 
@@ -12,10 +12,11 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Quiescence search, Check ext
 **Commands**
 `uci` - name, author and uciok
 `isready` - readyok
+`setoption name Hash value <mb>` - resizes the transposition table (1-4096 MB, default 16)
 `position startpos \| fen <fen> [moves ...]` - sets up the position
 `position startpos moves e2e4 e7e5` - sets up the position
 `d` - prints the board, its FEN and Zobrist key
-`ucinewgame` - resets the board to the start position
+`ucinewgame` - resets the board to the start position and clears the transposition table
 `go` - starts a search
 `go depth 8` - starts a search with depth 8
 `go perft <depth>` - perft divide and the total node count
@@ -31,4 +32,4 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Quiescence search, Check ext
 + Search
 + UCI protocol
 + Zobrist and repetition detection
-- TT
++ TT
