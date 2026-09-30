@@ -1,5 +1,6 @@
 use crate::attacks::pawn_attacks;
 use crate::board::Board;
+use crate::board::zobrist::{castling_key, en_passant_key, side_key};
 use crate::types::{Color, Move, MoveKind, Piece, Square};
 
 fn en_passant_victim(target: Square) -> Square {
@@ -49,8 +50,13 @@ impl Board {
         let passed = Square((from.0 + to.0) / 2);
         let capturable = !(pawn_attacks(us, passed) & self.pieces_of(them, Piece::Pawn)).is_empty();
         let state = &mut self.state;
+        state.zobrist_key ^= castling_key(state.castling) ^ en_passant_key(state.en_passant);
         state.castling = state.castling.after_move(from, to);
         state.en_passant = (played.kind() == MoveKind::DoublePush && capturable).then_some(passed);
+        state.zobrist_key ^= castling_key(state.castling)
+            ^ en_passant_key(state.en_passant)
+            ^ side_key(us)
+            ^ side_key(them);
         state.halfmove_clock = if moving == Piece::Pawn || captured.is_some() {
             0
         } else {
@@ -72,8 +78,8 @@ impl Board {
 
     pub fn unmake_move(&mut self) {
         let undone = self.state;
-        self.state = self.history.pop().expect("move to unmake");
-        let us = self.state.active_color;
+        let restored = self.history.pop().expect("move to unmake");
+        let us = restored.active_color;
         let them = us.opponent();
         let played = undone.played_move;
         let (from, to) = (played.from(), played.to());
@@ -96,6 +102,7 @@ impl Board {
             (_, Some(victim)) => self.put_piece(them, victim, to),
             _ => {}
         }
+        self.state = restored;
     }
 }
 

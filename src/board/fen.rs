@@ -65,6 +65,7 @@ impl FromStr for Board {
             None => 1,
         };
         board.validate(&fields)?;
+        board.state.zobrist_key = board.compute_zobrist_key();
         Ok(board)
     }
 }

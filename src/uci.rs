@@ -72,7 +72,12 @@ impl Engine {
                 self.go(parse_go(arguments));
             }
             ["stop", ..] => self.stop_search(),
-            ["d", ..] => println!("{}\n\nFen: {}", self.board, self.board.to_fen()),
+            ["d", ..] => println!(
+                "{}\n\nFen: {}\nKey: {:016X}",
+                self.board,
+                self.board.to_fen(),
+                self.board.state.zobrist_key
+            ),
             ["quit", ..] => return Flow::Quit,
             _ => {}
         }

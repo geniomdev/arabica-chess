@@ -89,9 +89,13 @@ fn order_score(board: &Board, candidate: Move) -> i32 {
     }
     let victim = match candidate.kind() {
         MoveKind::EnPassant => Piece::Pawn,
-        _ => board.piece_on(candidate.to()).expect("piece on captured square"),
+        _ => board
+            .piece_on(candidate.to())
+            .expect("piece on captured square"),
     };
-    let attacker = board.piece_on(candidate.from()).expect("piece on origin square");
+    let attacker = board
+        .piece_on(candidate.from())
+        .expect("piece on origin square");
     CAPTURE_BASE_SCORE + promotion + 10 * piece_value(victim) - attacker_rank(attacker)
 }
 
@@ -123,7 +127,11 @@ pub fn uci_score(score: i32) -> String {
         return format!("cp {score}");
     }
     let plies = MATE - score.abs();
-    let moves = if score > 0 { (plies + 1) / 2 } else { -plies / 2 };
+    let moves = if score > 0 {
+        (plies + 1) / 2
+    } else {
+        -plies / 2
+    };
     format!("mate {moves}")
 }
 
@@ -143,11 +151,7 @@ impl Searcher {
         }
     }
 
-    pub fn search(
-        &mut self,
-        board: &mut Board,
-        mut report: impl FnMut(&Iteration),
-    ) -> (Move, i32) {
+    pub fn search(&mut self, board: &mut Board, mut report: impl FnMut(&Iteration)) -> (Move, i32) {
         self.start = Instant::now();
         self.nodes = 0;
         self.ply = 0;
@@ -224,7 +228,7 @@ impl Searcher {
 
     fn negamax(&mut self, board: &mut Board, depth: u8, mut alpha: i32, beta: i32) -> i32 {
         self.pv_len[self.ply] = self.ply;
-        if self.ply > 0 && board.state.halfmove_clock >= 100 {
+        if self.ply > 0 && (board.state.halfmove_clock >= 100 || board.is_repetition(self.ply)) {
             return 0;
         }
         if self.ply >= MAX_PLY - 1 {
@@ -321,12 +325,27 @@ mod tests {
     #[test]
     fn finds_best_move() {
         let cases = [
-            ("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", 3, Some("a1a8"), Some(MATE - 1)),
-            ("r5k1/8/8/8/8/8/5PPP/6K1 b - - 0 1", 3, Some("a8a1"), Some(MATE - 1)),
+            (
+                "6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1",
+                3,
+                Some("a1a8"),
+                Some(MATE - 1),
+            ),
+            (
+                "r5k1/8/8/8/8/8/5PPP/6K1 b - - 0 1",
+                3,
+                Some("a8a1"),
+                Some(MATE - 1),
+            ),
             ("4k3/8/8/8/8/8/8/RR4K1 w - - 0 1", 4, None, Some(MATE - 3)),
             ("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1", 3, Some("d1d5"), None),
             ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", 3, Some("0000"), Some(0)),
-            ("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1", 3, Some("0000"), Some(-MATE)),
+            (
+                "R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1",
+                3,
+                Some("0000"),
+                Some(-MATE),
+            ),
         ];
 
         for (fen, depth, expected_move, expected_score) in cases {

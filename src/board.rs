@@ -2,6 +2,7 @@ mod fen;
 mod makemove;
 mod movegen;
 mod perft;
+mod zobrist;
 
 pub use fen::{FenError, KIWIPETE, START_POSITION};
 pub use movegen::{MAX_MOVES, MoveList};
@@ -191,6 +192,7 @@ impl Board {
         self.pieces[piece] |= bit;
         self.colors[side] |= bit;
         self.mailbox[square] = Some(piece);
+        self.state.zobrist_key ^= zobrist::piece_key(side, piece, square);
     }
 
     fn remove_piece(&mut self, side: Color, piece: Piece, square: Square) {
@@ -200,6 +202,7 @@ impl Board {
         self.pieces[piece] &= mask;
         self.colors[side] &= mask;
         self.mailbox[square] = None;
+        self.state.zobrist_key ^= zobrist::piece_key(side, piece, square);
     }
 
     fn move_piece(&mut self, side: Color, piece: Piece, from: Square, to: Square) {
@@ -211,6 +214,8 @@ impl Board {
         self.colors[side] ^= bits;
         self.mailbox[from] = None;
         self.mailbox[to] = Some(piece);
+        self.state.zobrist_key ^=
+            zobrist::piece_key(side, piece, from) ^ zobrist::piece_key(side, piece, to);
     }
 }
 
