@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, MAX_MOVES, MoveList};
@@ -14,10 +16,11 @@ const TIME_CHECK_INTERVAL: u64 = 2048;
 const PV_MOVE_SCORE: i32 = 1_000_000;
 const CAPTURE_BASE_SCORE: i32 = 100_000;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchLimits {
     pub depth: Option<u8>,
     pub time: Option<Duration>,
+    pub soft_time: Option<Duration>,
 }
 
 pub struct Iteration<'a> {
@@ -30,6 +33,7 @@ pub struct Iteration<'a> {
 
 pub struct Searcher {
     limits: SearchLimits,
+    stop_signal: Arc<AtomicBool>,
     start: Instant,
     nodes: u64,
     ply: usize,
@@ -98,6 +102,18 @@ fn attacker_rank(attacker: Piece) -> i32 {
     }
 }
 
+fn first_legal_move(board: &mut Board) -> Option<Move> {
+    let mut moves = MoveList::new();
+    board.generate_pseudo_legal(&mut moves);
+    moves.as_slice().iter().copied().find(|&candidate| {
+        let legal = board.make_move(candidate);
+        if legal {
+            board.unmake_move();
+        }
+        legal
+    })
+}
+
 pub fn is_mate_score(score: i32) -> bool {
     score.abs() >= MATE_BOUND
 }
@@ -112,9 +128,10 @@ pub fn uci_score(score: i32) -> String {
 }
 
 impl Searcher {
-    pub fn new(limits: SearchLimits) -> Self {
+    pub fn new(limits: SearchLimits, stop_signal: Arc<AtomicBool>) -> Self {
         Self {
             limits,
+            stop_signal,
             start: Instant::now(),
             nodes: 0,
             ply: 0,
@@ -141,7 +158,7 @@ impl Searcher {
         let mut best = (Move::NULL, 0);
         for depth in 1..=max_depth {
             let score = self.negamax(board, depth, -INFINITY, INFINITY);
-            if self.stopped && best.0 != Move::NULL {
+            if self.stopped {
                 break;
             }
             let pv = &self.pv[0][..self.pv_len[0]];
@@ -155,11 +172,28 @@ impl Searcher {
                 elapsed: self.start.elapsed(),
                 pv,
             });
-            if self.stopped || is_mate_score(score) || best.0 == Move::NULL {
+            if is_mate_score(score) || best.0 == Move::NULL || self.soft_time_expired() {
                 break;
             }
         }
+        if best.0 == Move::NULL {
+            best.0 = first_legal_move(board).unwrap_or(Move::NULL);
+        }
         best
+    }
+
+    fn soft_time_expired(&self) -> bool {
+        self.limits
+            .soft_time
+            .is_some_and(|budget| self.start.elapsed() >= budget)
+    }
+
+    fn hard_limit_reached(&self) -> bool {
+        self.stop_signal.load(Ordering::Relaxed)
+            || self
+                .limits
+                .time
+                .is_some_and(|budget| self.start.elapsed() >= budget)
     }
 
     fn pv_move(&self) -> Option<Move> {
@@ -168,12 +202,7 @@ impl Searcher {
 
     fn visit_node(&mut self) {
         self.nodes += 1;
-        if self.nodes % TIME_CHECK_INTERVAL == 0
-            && self
-                .limits
-                .time
-                .is_some_and(|budget| self.start.elapsed() >= budget)
-        {
+        if self.nodes.is_multiple_of(TIME_CHECK_INTERVAL) && self.hard_limit_reached() {
             self.stopped = true;
         }
     }
@@ -296,8 +325,8 @@ mod tests {
             ("r5k1/8/8/8/8/8/5PPP/6K1 b - - 0 1", 3, Some("a8a1"), Some(MATE - 1)),
             ("4k3/8/8/8/8/8/8/RR4K1 w - - 0 1", 4, None, Some(MATE - 3)),
             ("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1", 3, Some("d1d5"), None),
-            ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", 3, Some("a1a1"), Some(0)),
-            ("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1", 3, Some("a1a1"), Some(-MATE)),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", 3, Some("0000"), Some(0)),
+            ("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1", 3, Some("0000"), Some(-MATE)),
         ];
 
         for (fen, depth, expected_move, expected_score) in cases {
@@ -306,9 +335,10 @@ mod tests {
                 .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"));
             let limits = SearchLimits {
                 depth: Some(depth),
-                time: None,
+                ..SearchLimits::default()
             };
-            let (best_move, score) = Searcher::new(limits).search(&mut board, |_| {});
+            let (best_move, score) =
+                Searcher::new(limits, Arc::default()).search(&mut board, |_| {});
             if let Some(expected) = expected_move {
                 assert_eq!(best_move.to_string(), expected, "fen {fen:?}");
             }

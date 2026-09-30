@@ -127,6 +127,9 @@ impl Move {
 
 impl std::fmt::Display for Move {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if *self == Self::NULL {
+            return write!(f, "0000");
+        }
         write!(f, "{}{}", self.from(), self.to())?;
         if self.is_promotion() {
             let symbol = ['n', 'b', 'r', 'q'][(self.flags() & 3) as usize];

@@ -1,5 +1,5 @@
 [package]
-name = "arabica-chess"
+name = "arabica"
 version = "0.1.0"
 edition = "2024"
 description = "A bitboard-based chess engine written in Rust"

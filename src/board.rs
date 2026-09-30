@@ -3,7 +3,7 @@ mod makemove;
 mod movegen;
 mod perft;
 
-pub use fen::{KIWIPETE, START_POSITION};
+pub use fen::{FenError, KIWIPETE, START_POSITION};
 pub use movegen::{MAX_MOVES, MoveList};
 
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
