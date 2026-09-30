@@ -76,6 +76,23 @@ impl Board {
         legal
     }
 
+    pub fn make_null_move(&mut self) {
+        let us = self.state.active_color;
+        let them = us.opponent();
+        self.history.push(self.state);
+        let state = &mut self.state;
+        state.zobrist_key ^= en_passant_key(state.en_passant) ^ side_key(us) ^ side_key(them);
+        state.en_passant = None;
+        state.halfmove_clock = 0;
+        state.active_color = them;
+        state.captured = None;
+        state.played_move = Move::NULL;
+    }
+
+    pub fn unmake_null_move(&mut self) {
+        self.state = self.history.pop().expect("null move to unmake");
+    }
+
     pub fn unmake_move(&mut self) {
         let undone = self.state;
         let restored = self.history.pop().expect("move to unmake");
@@ -138,6 +155,34 @@ mod tests {
                 assert_eq!(played, original, "fen {fen:?}, move {candidate}");
                 assert_eq!(played.to_fen(), fen, "fen {fen:?}, move {candidate}");
             }
+        }
+    }
+
+    #[test]
+    fn null_move_passes_the_turn() {
+        let cases = [
+            (
+                START_POSITION,
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
+            ),
+            (
+                "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 5 3",
+                "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 3",
+            ),
+        ];
+
+        for (fen, expected) in cases {
+            let original = board(fen);
+            let mut position = original.clone();
+            position.make_null_move();
+            assert_eq!(position.to_fen(), expected, "fen {fen:?}");
+            assert_eq!(
+                position.state.zobrist_key,
+                position.compute_zobrist_key(),
+                "fen {fen:?}"
+            );
+            position.unmake_null_move();
+            assert_eq!(position, original, "fen {fen:?}");
         }
     }
 

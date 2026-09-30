@@ -1,11 +1,11 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use crate::board::{Board, MAX_MOVES, MoveList};
-use crate::eval::{evaluate, piece_value};
+use crate::board::{Board, MAX_MOVES, MoveList, see_value};
+use crate::eval::evaluate;
 use crate::tt::{Bound, Store, TranspositionTable};
-use crate::types::{Move, MoveKind, Piece};
+use crate::types::{Color, Move, MoveKind, Piece, SQUARES};
 
 pub const INFINITY: i32 = 32_000;
 pub const MATE: i32 = 31_000;
@@ -14,8 +14,42 @@ pub const MAX_DEPTH: u8 = 64;
 
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 const TIME_CHECK_INTERVAL: u64 = 2048;
-const PRIORITY_MOVE_SCORE: i32 = 1_000_000;
-const CAPTURE_BASE_SCORE: i32 = 100_000;
+
+const HASH_MOVE_SCORE: i32 = 1_000_000;
+const GOOD_NOISY_SCORE: i32 = 200_000;
+const KILLER_SCORES: [i32; 2] = [100_000, 99_000];
+const BAD_NOISY_SCORE: i32 = -200_000;
+
+const MAX_HISTORY: i32 = 16_384;
+const MAX_HISTORY_BONUS: i32 = 1_200;
+const TRACKED_QUIETS: usize = 64;
+
+const REVERSE_FUTILITY_DEPTH: i32 = 8;
+const REVERSE_FUTILITY_MARGIN: i32 = 80;
+const NULL_MOVE_DEPTH: i32 = 3;
+const LATE_MOVE_PRUNING_DEPTH: i32 = 8;
+const FUTILITY_DEPTH: i32 = 6;
+const FUTILITY_BASE: i32 = 100;
+const FUTILITY_MARGIN: i32 = 100;
+const NOISY_SEE_DEPTH: i32 = 6;
+const NOISY_SEE_MARGIN: i32 = 100;
+const REDUCTION_DEPTH: i32 = 3;
+const REDUCTION_HISTORY_DIVISOR: i32 = 8_192;
+const REDUCTION_TABLE_SIZE: usize = 64;
+
+type HistoryTable = [[[i32; SQUARES]; SQUARES]; 2];
+
+static REDUCTIONS: LazyLock<[[i32; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE]> =
+    LazyLock::new(|| {
+        let mut table = [[0; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE];
+        for (depth, row) in table.iter_mut().enumerate().skip(1) {
+            for (move_number, reduction) in row.iter_mut().enumerate().skip(1) {
+                let scaled = (depth as f64).ln() * (move_number as f64).ln() / 2.25;
+                *reduction = (0.75 + scaled) as i32;
+            }
+        }
+        table
+    });
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchLimits {
@@ -43,8 +77,8 @@ pub struct Searcher {
     stopped: bool,
     pv: [[Move; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
-    previous_pv: [Move; MAX_PLY],
-    previous_pv_len: usize,
+    killers: [[Move; 2]; MAX_PLY],
+    history: Box<HistoryTable>,
 }
 
 struct MovePicker {
@@ -54,16 +88,41 @@ struct MovePicker {
 }
 
 impl MovePicker {
-    fn new(board: &Board, moves: MoveList, priority_moves: [Option<Move>; 2]) -> Self {
+    fn new(
+        board: &Board,
+        moves: MoveList,
+        hash_move: Option<Move>,
+        killers: [Move; 2],
+        history: &HistoryTable,
+    ) -> Self {
+        let side_history = &history[board.state.active_color.index()];
+        Self::scored(moves, |candidate| {
+            if Some(candidate) == hash_move {
+                return HASH_MOVE_SCORE;
+            }
+            if is_noisy(candidate) {
+                let base = if board.see(candidate, 0) {
+                    GOOD_NOISY_SCORE
+                } else {
+                    BAD_NOISY_SCORE
+                };
+                return base + noisy_score(board, candidate);
+            }
+            match killers.iter().position(|&killer| killer == candidate) {
+                Some(rank) => KILLER_SCORES[rank],
+                None => side_history[candidate.from().index()][candidate.to().index()],
+            }
+        })
+    }
+
+    fn noisy(board: &Board, moves: MoveList) -> Self {
+        Self::scored(moves, |candidate| noisy_score(board, candidate))
+    }
+
+    fn scored(moves: MoveList, score: impl Fn(Move) -> i32) -> Self {
         let mut scores = [0; MAX_MOVES];
-        for (score, &candidate) in scores.iter_mut().zip(moves.as_slice()) {
-            *score = match priority_moves
-                .iter()
-                .position(|&priority| priority == Some(candidate))
-            {
-                Some(rank) => PRIORITY_MOVE_SCORE - rank as i32,
-                None => order_score(board, candidate),
-            };
+        for (slot, &candidate) in scores.iter_mut().zip(moves.as_slice()) {
+            *slot = score(candidate);
         }
         Self {
             moves,
@@ -87,8 +146,12 @@ impl Iterator for MovePicker {
     }
 }
 
-fn order_score(board: &Board, candidate: Move) -> i32 {
-    let promotion = candidate.promotion().map_or(0, piece_value);
+fn is_noisy(candidate: Move) -> bool {
+    candidate.is_capture() || candidate.is_promotion()
+}
+
+fn noisy_score(board: &Board, candidate: Move) -> i32 {
+    let promotion = candidate.promotion().map_or(0, see_value);
     if !candidate.is_capture() {
         return promotion;
     }
@@ -101,14 +164,28 @@ fn order_score(board: &Board, candidate: Move) -> i32 {
     let attacker = board
         .piece_on(candidate.from())
         .expect("piece on origin square");
-    CAPTURE_BASE_SCORE + promotion + 10 * piece_value(victim) - attacker_rank(attacker)
+    promotion + 10 * see_value(victim) - attacker_rank(attacker)
 }
 
 fn attacker_rank(attacker: Piece) -> i32 {
     match attacker {
         Piece::King => 1_000,
-        other => piece_value(other),
+        other => see_value(other),
     }
+}
+
+fn update_history(entry: &mut i32, bonus: i32) {
+    *entry += bonus - *entry * bonus.abs() / MAX_HISTORY;
+}
+
+fn has_non_pawn_material(board: &Board, side: Color) -> bool {
+    let pawns_and_kings = board.pieces(Piece::Pawn) | board.pieces(Piece::King);
+    !(board.occupied_by(side) & !pawns_and_kings).is_empty()
+}
+
+fn late_move_reduction(depth: i32, move_number: usize) -> i32 {
+    let depth = (depth as usize).min(REDUCTION_TABLE_SIZE - 1);
+    REDUCTIONS[depth][move_number.min(REDUCTION_TABLE_SIZE - 1)]
 }
 
 fn first_legal_move(board: &mut Board) -> Option<Move> {
@@ -156,8 +233,8 @@ impl Searcher {
             stopped: false,
             pv: [[Move::NULL; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
-            previous_pv: [Move::NULL; MAX_PLY],
-            previous_pv_len: 0,
+            killers: [[Move::NULL; 2]; MAX_PLY],
+            history: Box::new([[[0; SQUARES]; SQUARES]; 2]),
         }
     }
 
@@ -166,19 +243,16 @@ impl Searcher {
         self.nodes = 0;
         self.ply = 0;
         self.stopped = false;
-        self.previous_pv_len = 0;
 
         let max_depth = self.limits.depth.unwrap_or(MAX_DEPTH).clamp(1, MAX_DEPTH);
         let mut best = (Move::NULL, 0);
         for depth in 1..=max_depth {
-            let score = self.negamax(board, depth, -INFINITY, INFINITY);
+            let score = self.negamax(board, i32::from(depth), -INFINITY, INFINITY);
             if self.stopped {
                 break;
             }
             let pv = &self.pv[0][..self.pv_len[0]];
             best = (pv.first().copied().unwrap_or(Move::NULL), score);
-            self.previous_pv[..pv.len()].copy_from_slice(pv);
-            self.previous_pv_len = pv.len();
             report(&Iteration {
                 depth,
                 score,
@@ -215,10 +289,6 @@ impl Searcher {
                 .is_some_and(|budget| self.start.elapsed() >= budget)
     }
 
-    fn pv_move(&self) -> Option<Move> {
-        (self.ply < self.previous_pv_len).then(|| self.previous_pv[self.ply])
-    }
-
     fn visit_node(&mut self) {
         self.nodes += 1;
         if self.nodes.is_multiple_of(TIME_CHECK_INTERVAL) && self.hard_limit_reached() {
@@ -241,9 +311,34 @@ impl Searcher {
         board.is_attacked(board.king_square(us), us.opponent(), board.occupancy())
     }
 
-    fn negamax(&mut self, board: &mut Board, depth: u8, mut alpha: i32, beta: i32) -> i32 {
+    fn reward_quiet(&mut self, side: Color, cutoff: Move, tried: &[Move], depth: i32) {
+        let killers = &mut self.killers[self.ply];
+        if killers[0] != cutoff {
+            killers[1] = killers[0];
+            killers[0] = cutoff;
+        }
+        let bonus = (16 * depth * depth).min(MAX_HISTORY_BONUS);
+        let side_history = &mut self.history[side.index()];
+        update_history(
+            &mut side_history[cutoff.from().index()][cutoff.to().index()],
+            bonus,
+        );
+        for &quiet in tried {
+            update_history(
+                &mut side_history[quiet.from().index()][quiet.to().index()],
+                -bonus,
+            );
+        }
+    }
+
+    fn quiet_history(&self, side: Color, candidate: Move) -> i32 {
+        self.history[side.index()][candidate.from().index()][candidate.to().index()]
+    }
+
+    fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32) -> i32 {
         self.pv_len[self.ply] = self.ply;
         let is_root = self.ply == 0;
+        let is_pv = beta - alpha > 1;
         if !is_root && (board.state.halfmove_clock >= 100 || board.is_repetition(self.ply)) {
             return 0;
         }
@@ -252,39 +347,122 @@ impl Searcher {
         }
         let in_check = Self::is_in_check(board);
         let depth = if in_check { depth + 1 } else { depth };
-        if depth == 0 {
+        if depth <= 0 {
             return self.quiescence(board, alpha, beta);
         }
         self.visit_node();
         if self.stopped {
             return 0;
         }
+        self.killers[self.ply + 1] = [Move::NULL; 2];
 
         let key = board.state.zobrist_key;
         let hit = self.table.probe(key, self.ply);
+        let table_depth = depth.min(i32::from(u8::MAX)) as u8;
         if let Some(score) = hit
-            .filter(|_| !is_root)
-            .and_then(|hit| hit.cutoff_score(depth, alpha, beta))
+            .filter(|_| !is_pv)
+            .and_then(|hit| hit.cutoff_score(table_depth, alpha, beta))
         {
             return score;
         }
         let hash_move = hit.and_then(|hit| hit.best_move);
 
+        let us = board.state.active_color;
+        let static_eval = if in_check { -INFINITY } else { evaluate(board) };
+        let prunable = !is_pv && !in_check;
+
+        if prunable
+            && depth <= REVERSE_FUTILITY_DEPTH
+            && !is_mate_score(beta)
+            && static_eval - REVERSE_FUTILITY_MARGIN * depth >= beta
+        {
+            return static_eval;
+        }
+
+        if prunable
+            && depth >= NULL_MOVE_DEPTH
+            && static_eval >= beta
+            && board.state.played_move != Move::NULL
+            && has_non_pawn_material(board, us)
+        {
+            let reduction = 3 + depth / 4 + ((static_eval - beta) / 200).min(3);
+            board.make_null_move();
+            self.ply += 1;
+            let score = -self.negamax(board, depth - 1 - reduction, -beta, -beta + 1);
+            self.ply -= 1;
+            board.unmake_null_move();
+            if self.stopped {
+                return 0;
+            }
+            if score >= beta {
+                return if is_mate_score(score) { beta } else { score };
+            }
+        }
+
         let mut moves = MoveList::new();
         board.generate_pseudo_legal(&mut moves);
-        let picker = MovePicker::new(board, moves, [hash_move, self.pv_move()]);
+        let picker = MovePicker::new(
+            board,
+            moves,
+            hash_move,
+            self.killers[self.ply],
+            &self.history,
+        );
 
         let original_alpha = alpha;
         let mut best_score = -INFINITY;
         let mut best_move = Move::NULL;
         let mut legal_moves = 0;
+        let mut tried_quiets = [Move::NULL; TRACKED_QUIETS];
+        let mut tried_quiet_count = 0;
         for candidate in picker {
+            let is_quiet = !is_noisy(candidate);
+            if !is_root && !in_check && best_score > -MATE_BOUND {
+                if is_quiet {
+                    if !is_pv
+                        && depth <= LATE_MOVE_PRUNING_DEPTH
+                        && legal_moves >= 3 + depth * depth
+                    {
+                        continue;
+                    }
+                    if depth <= FUTILITY_DEPTH
+                        && static_eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha
+                    {
+                        continue;
+                    }
+                } else if depth <= NOISY_SEE_DEPTH
+                    && !board.see(candidate, -NOISY_SEE_MARGIN * depth)
+                {
+                    continue;
+                }
+            }
             if !board.make_move(candidate) {
                 continue;
             }
             legal_moves += 1;
             self.ply += 1;
-            let score = -self.negamax(board, depth - 1, -beta, -alpha);
+            let new_depth = depth - 1;
+            let score = if legal_moves == 1 {
+                -self.negamax(board, new_depth, -beta, -alpha)
+            } else {
+                let gives_check = Self::is_in_check(board);
+                let mut reduction = 0;
+                if depth >= REDUCTION_DEPTH && is_quiet && !in_check && !gives_check {
+                    reduction = late_move_reduction(depth, legal_moves as usize);
+                    reduction -= i32::from(is_pv);
+                    reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
+                    reduction -= self.quiet_history(us, candidate) / REDUCTION_HISTORY_DIVISOR;
+                    reduction = reduction.clamp(0, new_depth - 1);
+                }
+                let mut score = -self.negamax(board, new_depth - reduction, -alpha - 1, -alpha);
+                if score > alpha && reduction > 0 {
+                    score = -self.negamax(board, new_depth, -alpha - 1, -alpha);
+                }
+                if score > alpha && score < beta {
+                    score = -self.negamax(board, new_depth, -beta, -alpha);
+                }
+                score
+            };
             self.ply -= 1;
             board.unmake_move();
             if self.stopped {
@@ -296,8 +474,15 @@ impl Searcher {
                 best_move = candidate;
                 self.update_pv(candidate);
                 if alpha >= beta {
+                    if is_quiet {
+                        self.reward_quiet(us, candidate, &tried_quiets[..tried_quiet_count], depth);
+                    }
                     break;
                 }
+            }
+            if is_quiet && tried_quiet_count < TRACKED_QUIETS {
+                tried_quiets[tried_quiet_count] = candidate;
+                tried_quiet_count += 1;
             }
         }
 
@@ -319,7 +504,7 @@ impl Searcher {
             key,
             best_move,
             score,
-            depth,
+            depth: table_depth,
             bound,
             ply: self.ply,
         });
@@ -339,10 +524,13 @@ impl Searcher {
 
         let mut moves = MoveList::new();
         board.generate_captures(&mut moves);
-        let picker = MovePicker::new(board, moves, [None; 2]);
+        let picker = MovePicker::noisy(board, moves);
 
         let mut best_score = stand_pat;
         for candidate in picker {
+            if !board.see(candidate, 0) {
+                continue;
+            }
             if !board.make_move(candidate) {
                 continue;
             }

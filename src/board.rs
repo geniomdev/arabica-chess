@@ -2,10 +2,12 @@ mod fen;
 mod makemove;
 mod movegen;
 mod perft;
+mod see;
 mod zobrist;
 
 pub use fen::{FenError, KIWIPETE, START_POSITION};
 pub use movegen::{MAX_MOVES, MoveList};
+pub use see::see_value;
 
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
 use crate::types::{
