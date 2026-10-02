@@ -251,7 +251,8 @@ impl Searcher {
         let mut best = (Move::NULL, 0);
         for depth in 1..=max_depth {
             let score = self.negamax(board, i32::from(depth), -INFINITY, INFINITY);
-            if self.stopped {
+            let root_move_searched = self.pv_len[0] > 0;
+            if self.stopped && !root_move_searched {
                 break;
             }
             let pv = &self.pv[0][..self.pv_len[0]];
@@ -264,7 +265,11 @@ impl Searcher {
                 pv,
                 hashfull: self.table.hashfull(),
             });
-            if is_mate_score(score) || best.0 == Move::NULL || self.soft_time_expired() {
+            if self.stopped
+                || is_mate_score(score)
+                || best.0 == Move::NULL
+                || self.soft_time_expired()
+            {
                 break;
             }
         }
@@ -450,10 +455,10 @@ impl Searcher {
                     reduction = reduction.clamp(0, new_depth - 1);
                 }
                 let mut score = -self.negamax(board, new_depth - reduction, -alpha - 1, -alpha);
-                if score > alpha && reduction > 0 {
+                if !self.stopped && score > alpha && reduction > 0 {
                     score = -self.negamax(board, new_depth, -alpha - 1, -alpha);
                 }
-                if score > alpha && score < beta {
+                if !self.stopped && score > alpha && score < beta {
                     score = -self.negamax(board, new_depth, -beta, -alpha);
                 }
                 score
@@ -461,7 +466,7 @@ impl Searcher {
             self.ply -= 1;
             board.unmake_move();
             if self.stopped {
-                return 0;
+                return if is_root { best_score } else { 0 };
             }
             best_score = best_score.max(score);
             if score > alpha {
@@ -594,6 +599,32 @@ mod tests {
             if let Some(expected) = expected_score {
                 assert_eq!(score, expected, "fen {fen:?}");
             }
+            assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_best_move_from_interrupted_iteration() {
+        let cases = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ];
+
+        for fen in cases {
+            let mut board = board(fen);
+            let limits = SearchLimits {
+                time: Some(Duration::ZERO),
+                ..SearchLimits::default()
+            };
+            let mut last_report = None;
+            let (best_move, _) = Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+                .search(&mut board, |iteration| {
+                    last_report = Some((iteration.nodes, iteration.pv[0]))
+                });
+            let (nodes, pv_head) = last_report.expect("at least one iteration reported");
+            assert_eq!(nodes, TIME_CHECK_INTERVAL, "fen {fen:?}");
+            assert_eq!(best_move, pv_head, "fen {fen:?}");
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
         }
     }
