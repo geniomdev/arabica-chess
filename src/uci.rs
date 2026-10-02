@@ -14,7 +14,8 @@ use crate::types::{Color, EverySide};
 
 const ENGINE_NAME: &str = "Arabica";
 const ENGINE_AUTHOR: &str = "Geniomdev";
-const MOVE_OVERHEAD: Duration = Duration::from_millis(50);
+const DEFAULT_MOVE_OVERHEAD: Duration = Duration::from_millis(50);
+const MAX_MOVE_OVERHEAD_MS: u64 = 5000;
 const DEFAULT_MOVES_TO_GO: u32 = 30;
 
 pub fn run() {
@@ -40,6 +41,7 @@ enum Flow {
 struct Engine {
     board: Board,
     table: TranspositionTable,
+    move_overhead: Duration,
     search: Option<RunningSearch>,
 }
 
@@ -48,6 +50,7 @@ impl Engine {
         Self {
             board: start_position(),
             table: TranspositionTable::new(DEFAULT_HASH_MB),
+            move_overhead: DEFAULT_MOVE_OVERHEAD,
             search: None,
         }
     }
@@ -60,6 +63,10 @@ impl Engine {
                 println!(
                     "option name Hash type spin default {DEFAULT_HASH_MB} min {MIN_HASH_MB} max {MAX_HASH_MB}"
                 );
+                println!(
+                    "option name Move Overhead type spin default {} min 0 max {MAX_MOVE_OVERHEAD_MS}",
+                    DEFAULT_MOVE_OVERHEAD.as_millis()
+                );
                 println!("uciok");
             }
             ["isready", ..] => println!("readyok"),
@@ -70,8 +77,11 @@ impl Engine {
             }
             ["setoption", arguments @ ..] => {
                 self.stop_search();
-                match parse_hash_option(arguments) {
-                    Some(megabytes) => self.table = TranspositionTable::new(megabytes),
+                match parse_option(arguments) {
+                    Some(EngineOption::Hash(megabytes)) => {
+                        self.table = TranspositionTable::new(megabytes);
+                    }
+                    Some(EngineOption::MoveOverhead(overhead)) => self.move_overhead = overhead,
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
                 }
             }
@@ -104,7 +114,7 @@ impl Engine {
             print_perft_divide(&mut self.board, depth);
             return;
         }
-        let limits = params.limits(self.board.state.active_color);
+        let limits = params.limits(self.board.state.active_color, self.move_overhead);
         self.search = Some(RunningSearch::start(
             self.board.clone(),
             limits,
@@ -258,7 +268,7 @@ struct GoParams {
 }
 
 impl GoParams {
-    fn limits(&self, side: Color) -> SearchLimits {
+    fn limits(&self, side: Color, overhead: Duration) -> SearchLimits {
         let mut limits = SearchLimits {
             depth: self.depth,
             ..SearchLimits::default()
@@ -267,10 +277,10 @@ impl GoParams {
             return limits;
         }
         if let Some(move_time) = self.move_time {
-            limits.time = Some(move_time.saturating_sub(MOVE_OVERHEAD));
+            limits.time = Some(move_time.saturating_sub(overhead));
         } else if let Some(remaining) = self.remaining[side] {
             let increment = self.increment[side].unwrap_or_default();
-            let budget = clock_budget(remaining, increment, self.moves_to_go);
+            let budget = clock_budget(remaining, increment, self.moves_to_go, overhead);
             limits.time = Some(budget.hard);
             limits.soft_time = Some(budget.soft);
         }
@@ -283,20 +293,44 @@ struct TimeBudget {
     hard: Duration,
 }
 
-fn clock_budget(remaining: Duration, increment: Duration, moves_to_go: Option<u32>) -> TimeBudget {
-    let available = remaining.saturating_sub(MOVE_OVERHEAD);
+fn clock_budget(
+    remaining: Duration,
+    increment: Duration,
+    moves_to_go: Option<u32>,
+    overhead: Duration,
+) -> TimeBudget {
     let moves_left = moves_to_go.unwrap_or(DEFAULT_MOVES_TO_GO).max(1);
-    let share = remaining / moves_left + increment * 3 / 4;
-    let hard = share.min(available);
+    let future_increments = increment * (moves_left - 1);
+    let pool = (remaining + future_increments).saturating_sub(overhead * moves_left);
+    let share = pool / moves_left;
+    let hard = share.min(remaining.saturating_sub(overhead));
     TimeBudget {
         soft: hard / 2,
         hard,
     }
 }
 
-fn parse_hash_option(arguments: &[&str]) -> Option<usize> {
-    match arguments {
-        ["name", name, "value", value] if name.eq_ignore_ascii_case("hash") => value.parse().ok(),
+#[derive(Debug, PartialEq, Eq)]
+enum EngineOption {
+    Hash(usize),
+    MoveOverhead(Duration),
+}
+
+fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
+    let ["name", rest @ ..] = arguments else {
+        return None;
+    };
+    let value_index = rest.iter().position(|&token| token == "value")?;
+    let [value] = rest[value_index + 1..] else {
+        return None;
+    };
+    match rest[..value_index].join(" ").to_ascii_lowercase().as_str() {
+        "hash" => value.parse().ok().map(EngineOption::Hash),
+        "move overhead" => {
+            let millis: u64 = value.parse().ok()?;
+            let overhead = Duration::from_millis(millis.min(MAX_MOVE_OVERHEAD_MS));
+            Some(EngineOption::MoveOverhead(overhead))
+        }
         _ => None,
     }
 }
@@ -448,18 +482,36 @@ mod tests {
     }
 
     #[test]
-    fn parses_hash_option() {
+    fn parses_options() {
         let cases = [
-            ("name Hash value 64", Some(64)),
-            ("name hash value 1", Some(1)),
+            ("name Hash value 64", Some(EngineOption::Hash(64))),
+            ("name hash value 1", Some(EngineOption::Hash(1))),
             ("name Hash value big", None),
             ("name Threads value 4", None),
             ("name Hash", None),
+            ("name Hash value 64 128", None),
+            ("Hash value 64", None),
+            (
+                "name Move Overhead value 120",
+                Some(EngineOption::MoveOverhead(Duration::from_millis(120))),
+            ),
+            (
+                "name move overhead value 0",
+                Some(EngineOption::MoveOverhead(Duration::ZERO)),
+            ),
+            (
+                "name Move Overhead value 99999",
+                Some(EngineOption::MoveOverhead(Duration::from_millis(
+                    MAX_MOVE_OVERHEAD_MS,
+                ))),
+            ),
+            ("name Move Overhead value -5", None),
+            ("name Overhead value 10", None),
         ];
 
         for (command, expected) in cases {
             assert_eq!(
-                parse_hash_option(&tokens(command)),
+                parse_option(&tokens(command)),
                 expected,
                 "command {command:?}"
             );
@@ -472,58 +524,93 @@ mod tests {
             (
                 "wtime 60000 btime 30000",
                 Color::White,
+                50,
+                None,
+                millis(1950),
+                millis(975),
+            ),
+            (
+                "wtime 60000 btime 30000",
+                Color::Black,
+                50,
+                None,
+                millis(950),
+                millis(475),
+            ),
+            (
+                "wtime 60000",
+                Color::White,
+                0,
                 None,
                 millis(2000),
                 millis(1000),
             ),
             (
-                "wtime 60000 btime 30000",
-                Color::Black,
+                "wtime 60000",
+                Color::White,
+                200,
                 None,
-                millis(1000),
-                millis(500),
+                millis(1800),
+                millis(900),
             ),
             (
-                "wtime 30000 winc 1000",
+                "wtime 30000 winc 1500",
                 Color::White,
+                50,
                 None,
-                millis(1750),
-                millis(875),
+                millis(2400),
+                millis(1200),
+            ),
+            (
+                "wtime 1000 winc 10000",
+                Color::White,
+                50,
+                None,
+                millis(950),
+                millis(475),
             ),
             (
                 "btime 100 movestogo 1",
                 Color::Black,
+                50,
                 None,
                 millis(50),
                 millis(25),
             ),
-            ("wtime -20", Color::White, None, millis(0), millis(0)),
-            ("wtime 60000", Color::Black, None, None, None),
+            ("wtime 3000", Color::White, 200, None, millis(0), millis(0)),
+            ("wtime -20", Color::White, 50, None, millis(0), millis(0)),
+            ("wtime 60000", Color::Black, 50, None, None, None),
             (
                 "movetime 1000 wtime 60000",
                 Color::White,
+                50,
                 None,
                 millis(950),
                 None,
             ),
-            ("depth 5", Color::White, Some(5), None, None),
+            ("movetime 1000", Color::White, 200, None, millis(800), None),
+            ("depth 5", Color::White, 50, Some(5), None, None),
             (
                 "infinite wtime 60000 depth 9",
                 Color::White,
+                50,
                 Some(9),
                 None,
                 None,
             ),
         ];
 
-        for (command, side, depth, time, soft_time) in cases {
+        for (command, side, overhead, depth, time, soft_time) in cases {
             let expected = SearchLimits {
                 depth,
                 time,
                 soft_time,
             };
-            let limits = parse_go(&tokens(command)).limits(side);
-            assert_eq!(limits, expected, "command {command:?}, side {side:?}");
+            let limits = parse_go(&tokens(command)).limits(side, Duration::from_millis(overhead));
+            assert_eq!(
+                limits, expected,
+                "command {command:?}, side {side:?}, overhead {overhead}"
+            );
         }
     }
 }

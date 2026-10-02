@@ -13,6 +13,7 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, 
 - `uci` - name, author and uciok
 - `isready` - readyok
 - `setoption name Hash value <mb>` - resizes the transposition table (1-4096 MB, default 16)
+- `setoption name Move Overhead value <ms>` - time reserved per move for GUI and network latency (0-5000 ms, default 50)
 - `position startpos \| fen <fen> [moves ...]` - sets up the position
 - `position startpos moves e2e4 e7e5` - sets up the position
 - `d` - prints the board, its FEN and Zobrist key
