@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::board::{Board, MAX_MOVES, MoveList, see_value};
 use crate::eval::evaluate;
+use crate::strength::EvalNoise;
 use crate::tt::{Bound, Store, TranspositionTable};
 use crate::types::{Color, Move, MoveKind, Piece, SQUARES};
 
@@ -56,6 +57,7 @@ pub struct SearchLimits {
     pub depth: Option<u8>,
     pub time: Option<Duration>,
     pub soft_time: Option<Duration>,
+    pub nodes: Option<u64>,
 }
 
 pub struct Iteration<'a> {
@@ -75,6 +77,8 @@ pub struct Searcher {
     nodes: u64,
     ply: usize,
     stopped: bool,
+    first_iteration_completed: bool,
+    eval_noise: EvalNoise,
     pv: [[Move; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
     killers: [[Move; 2]; MAX_PLY],
@@ -234,6 +238,8 @@ impl Searcher {
             nodes: 0,
             ply: 0,
             stopped: false,
+            first_iteration_completed: false,
+            eval_noise: EvalNoise::default(),
             pv: [[Move::NULL; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             killers: [[Move::NULL; 2]; MAX_PLY],
@@ -241,11 +247,17 @@ impl Searcher {
         }
     }
 
+    pub fn with_eval_noise(mut self, eval_noise: EvalNoise) -> Self {
+        self.eval_noise = eval_noise;
+        self
+    }
+
     pub fn search(&mut self, board: &mut Board, mut report: impl FnMut(&Iteration)) -> (Move, i32) {
         self.start = Instant::now();
         self.nodes = 0;
         self.ply = 0;
         self.stopped = false;
+        self.first_iteration_completed = false;
 
         let max_depth = self.limits.depth.unwrap_or(MAX_DEPTH).clamp(1, MAX_DEPTH);
         let mut best = (Move::NULL, 0);
@@ -265,7 +277,9 @@ impl Searcher {
                 pv,
                 hashfull: self.table.hashfull(),
             });
+            self.first_iteration_completed = true;
             if self.stopped
+                || self.node_limit_reached()
                 || is_mate_score(score)
                 || best.0 == Move::NULL
                 || self.soft_time_expired()
@@ -297,11 +311,21 @@ impl Searcher {
                 .is_some_and(|budget| self.start.elapsed() >= budget)
     }
 
+    fn node_limit_reached(&self) -> bool {
+        self.first_iteration_completed && self.limits.nodes.is_some_and(|limit| self.nodes >= limit)
+    }
+
     fn visit_node(&mut self) {
         self.nodes += 1;
-        if self.nodes.is_multiple_of(TIME_CHECK_INTERVAL) && self.hard_limit_reached() {
+        if self.node_limit_reached()
+            || (self.nodes.is_multiple_of(TIME_CHECK_INTERVAL) && self.hard_limit_reached())
+        {
             self.stopped = true;
         }
+    }
+
+    fn static_evaluation(&self, board: &Board) -> i32 {
+        evaluate(board) + self.eval_noise.offset(board.state.zobrist_key)
     }
 
     fn update_pv(&mut self, best: Move) {
@@ -342,7 +366,7 @@ impl Searcher {
             return 0;
         }
         if self.ply >= MAX_PLY - 1 {
-            return evaluate(board);
+            return self.static_evaluation(board);
         }
         let in_check = board.in_check();
         let depth = if in_check { depth + 1 } else { depth };
@@ -367,7 +391,11 @@ impl Searcher {
         let hash_move = hit.and_then(|hit| hit.best_move);
 
         let us = board.state.active_color;
-        let static_eval = if in_check { -INFINITY } else { evaluate(board) };
+        let static_eval = if in_check {
+            -INFINITY
+        } else {
+            self.static_evaluation(board)
+        };
         let prunable = !is_pv && !in_check;
 
         if prunable
@@ -516,7 +544,7 @@ impl Searcher {
         if self.stopped {
             return 0;
         }
-        let stand_pat = evaluate(board);
+        let stand_pat = self.static_evaluation(board);
         if self.ply >= MAX_PLY - 1 || stand_pat >= beta {
             return stand_pat;
         }
@@ -556,6 +584,7 @@ impl Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::START_POSITION;
     use crate::board::testing::board;
 
     #[test]
@@ -624,6 +653,43 @@ mod tests {
                 });
             let (nodes, pv_head) = last_report.expect("at least one iteration reported");
             assert_eq!(nodes, TIME_CHECK_INTERVAL, "fen {fen:?}");
+            assert_eq!(best_move, pv_head, "fen {fen:?}");
+            assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
+        }
+    }
+
+    #[test]
+    fn completes_first_iteration_under_node_limit() {
+        let cases = [
+            (START_POSITION, 1),
+            (
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                1,
+            ),
+            (START_POSITION, 5_000),
+        ];
+
+        for (fen, node_limit) in cases {
+            let mut board = board(fen);
+            let limits = SearchLimits {
+                nodes: Some(node_limit),
+                ..SearchLimits::default()
+            };
+            let noise = EvalNoise {
+                amplitude: 400,
+                seed: 42,
+            };
+            let mut reports = Vec::new();
+            let (best_move, _) = Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+                .with_eval_noise(noise)
+                .search(&mut board, |iteration| {
+                    reports.push((iteration.depth, iteration.nodes, iteration.pv[0]))
+                });
+            let &(first_depth, first_nodes, _) = reports.first().expect("an iteration reported");
+            let &(_, last_nodes, pv_head) = reports.last().expect("an iteration reported");
+            assert_eq!(first_depth, 1, "fen {fen:?}");
+            assert!(last_nodes <= node_limit.max(first_nodes), "fen {fen:?}");
+            assert_ne!(best_move, Move::NULL, "fen {fen:?}");
             assert_eq!(best_move, pv_head, "fen {fen:?}");
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
         }

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::search::{Iteration, SearchLimits, Searcher, uci_score};
+use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
 use crate::types::{Color, EverySide};
 
@@ -42,6 +43,9 @@ struct Engine {
     board: Board,
     table: TranspositionTable,
     move_overhead: Duration,
+    limit_strength: bool,
+    elo: u32,
+    noise_seed: u64,
     search: Option<RunningSearch>,
 }
 
@@ -51,8 +55,15 @@ impl Engine {
             board: start_position(),
             table: TranspositionTable::new(DEFAULT_HASH_MB),
             move_overhead: DEFAULT_MOVE_OVERHEAD,
+            limit_strength: false,
+            elo: DEFAULT_ELO,
+            noise_seed: fresh_noise_seed(),
             search: None,
         }
+    }
+
+    fn handicap(&self) -> Option<Handicap> {
+        self.limit_strength.then(|| Handicap::from_elo(self.elo))
     }
 
     fn execute(&mut self, tokens: &[&str]) -> Flow {
@@ -67,6 +78,10 @@ impl Engine {
                     "option name Move Overhead type spin default {} min 0 max {MAX_MOVE_OVERHEAD_MS}",
                     DEFAULT_MOVE_OVERHEAD.as_millis()
                 );
+                println!("option name UCI_LimitStrength type check default false");
+                println!(
+                    "option name UCI_Elo type spin default {DEFAULT_ELO} min {MIN_ELO} max {MAX_ELO}"
+                );
                 println!("uciok");
             }
             ["isready", ..] => println!("readyok"),
@@ -74,6 +89,7 @@ impl Engine {
                 self.stop_search();
                 self.board = start_position();
                 self.table.clear();
+                self.noise_seed = fresh_noise_seed();
             }
             ["setoption", arguments @ ..] => {
                 self.stop_search();
@@ -82,6 +98,8 @@ impl Engine {
                         self.table = TranspositionTable::new(megabytes);
                     }
                     Some(EngineOption::MoveOverhead(overhead)) => self.move_overhead = overhead,
+                    Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
+                    Some(EngineOption::Elo(elo)) => self.elo = elo,
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
                 }
             }
@@ -114,10 +132,23 @@ impl Engine {
             print_perft_divide(&mut self.board, depth);
             return;
         }
-        let limits = params.limits(self.board.state.active_color, self.move_overhead);
+        let mut limits = params.limits(self.board.state.active_color, self.move_overhead);
+        let mut eval_noise = EvalNoise::default();
+        if let Some(handicap) = self.handicap() {
+            limits.nodes = Some(
+                limits
+                    .nodes
+                    .map_or(handicap.nodes, |nodes| nodes.min(handicap.nodes)),
+            );
+            eval_noise = EvalNoise {
+                amplitude: handicap.eval_noise,
+                seed: self.noise_seed,
+            };
+        }
         self.search = Some(RunningSearch::start(
             self.board.clone(),
             limits,
+            eval_noise,
             mem::take(&mut self.table),
             params.infinite,
         ));
@@ -139,13 +170,15 @@ impl RunningSearch {
     fn start(
         mut board: Board,
         limits: SearchLimits,
+        eval_noise: EvalNoise,
         table: TranspositionTable,
         hold_until_stopped: bool,
     ) -> Self {
         let stop_signal = Arc::new(AtomicBool::new(false));
         let searcher_signal = Arc::clone(&stop_signal);
         let thread = thread::spawn(move || {
-            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_signal), table);
+            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_signal), table)
+                .with_eval_noise(eval_noise);
             let (best_move, _) = searcher.search(&mut board, print_iteration);
             if hold_until_stopped {
                 while !searcher_signal.load(Ordering::Acquire) {
@@ -263,6 +296,7 @@ struct GoParams {
     remaining: EverySide<Option<Duration>>,
     increment: EverySide<Option<Duration>>,
     moves_to_go: Option<u32>,
+    nodes: Option<u64>,
     infinite: bool,
     perft: Option<u32>,
 }
@@ -271,6 +305,7 @@ impl GoParams {
     fn limits(&self, side: Color, overhead: Duration) -> SearchLimits {
         let mut limits = SearchLimits {
             depth: self.depth,
+            nodes: self.nodes,
             ..SearchLimits::default()
         };
         if self.infinite {
@@ -314,6 +349,8 @@ fn clock_budget(
 enum EngineOption {
     Hash(usize),
     MoveOverhead(Duration),
+    LimitStrength(bool),
+    Elo(u32),
 }
 
 fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
@@ -330,6 +367,15 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
             let millis: u64 = value.parse().ok()?;
             let overhead = Duration::from_millis(millis.min(MAX_MOVE_OVERHEAD_MS));
             Some(EngineOption::MoveOverhead(overhead))
+        }
+        "uci_limitstrength" => value
+            .to_ascii_lowercase()
+            .parse()
+            .ok()
+            .map(EngineOption::LimitStrength),
+        "uci_elo" => {
+            let elo: u32 = value.parse().ok()?;
+            Some(EngineOption::Elo(elo.clamp(MIN_ELO, MAX_ELO)))
         }
         _ => None,
     }
@@ -348,6 +394,7 @@ fn parse_go(arguments: &[&str]) -> GoParams {
             "winc" => params.increment[Color::White] = next_millis(&mut tokens),
             "binc" => params.increment[Color::Black] = next_millis(&mut tokens),
             "movestogo" => params.moves_to_go = next_number(&mut tokens),
+            "nodes" => params.nodes = next_number(&mut tokens),
             "perft" => params.perft = next_number(&mut tokens),
             _ => {}
         }
@@ -454,6 +501,14 @@ mod tests {
                 },
             ),
             (
+                "nodes 5000 depth 3",
+                GoParams {
+                    nodes: Some(5000),
+                    depth: Some(3),
+                    ..GoParams::default()
+                },
+            ),
+            (
                 "perft 3",
                 GoParams {
                     perft: Some(3),
@@ -507,6 +562,19 @@ mod tests {
             ),
             ("name Move Overhead value -5", None),
             ("name Overhead value 10", None),
+            (
+                "name UCI_LimitStrength value true",
+                Some(EngineOption::LimitStrength(true)),
+            ),
+            (
+                "name uci_limitstrength value False",
+                Some(EngineOption::LimitStrength(false)),
+            ),
+            ("name UCI_LimitStrength value yes", None),
+            ("name UCI_Elo value 1800", Some(EngineOption::Elo(1800))),
+            ("name UCI_Elo value 100", Some(EngineOption::Elo(MIN_ELO))),
+            ("name UCI_Elo value 99999", Some(EngineOption::Elo(MAX_ELO))),
+            ("name UCI_Elo value -5", None),
         ];
 
         for (command, expected) in cases {
@@ -605,6 +673,7 @@ mod tests {
                 depth,
                 time,
                 soft_time,
+                nodes: None,
             };
             let limits = parse_go(&tokens(command)).limits(side, Duration::from_millis(overhead));
             assert_eq!(
