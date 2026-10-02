@@ -38,7 +38,15 @@ const REDUCTION_DEPTH: i32 = 3;
 const REDUCTION_HISTORY_DIVISOR: i32 = 8_192;
 const REDUCTION_TABLE_SIZE: usize = 64;
 
+const STABILITY_TIME_SCALES: [f64; 5] = [2.0, 1.4, 1.1, 0.9, 0.8];
+const SCORE_DROP_RANGE: (i32, i32) = (-50, 100);
+const SCORE_DROP_TIME_DIVISOR: f64 = 200.0;
+const BEST_MOVE_NODES_PIVOT: f64 = 1.5;
+const BEST_MOVE_NODES_SCALE: f64 = 1.35;
+const SOFT_TIME_SCALE_RANGE: (f64, f64) = (0.5, 2.5);
+
 type HistoryTable = [[[i32; SQUARES]; SQUARES]; 2];
+type RootMoveNodes = [[u64; SQUARES]; SQUARES];
 
 static REDUCTIONS: LazyLock<[[i32; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE]> =
     LazyLock::new(|| {
@@ -83,6 +91,7 @@ pub struct Searcher {
     pv_len: [usize; MAX_PLY],
     killers: [[Move; 2]; MAX_PLY],
     history: Box<HistoryTable>,
+    root_move_nodes: Box<RootMoveNodes>,
 }
 
 struct MovePicker {
@@ -185,6 +194,16 @@ fn update_history(entry: &mut i32, bonus: i32) {
     *entry += bonus - *entry * bonus.abs() / MAX_HISTORY;
 }
 
+fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_share: f64) -> f64 {
+    let stability = STABILITY_TIME_SCALES[stable_iterations.min(STABILITY_TIME_SCALES.len() - 1)];
+    let (smallest_drop, largest_drop) = SCORE_DROP_RANGE;
+    let score_trend =
+        1.0 + f64::from(score_drop.clamp(smallest_drop, largest_drop)) / SCORE_DROP_TIME_DIVISOR;
+    let node_share = (BEST_MOVE_NODES_PIVOT - best_move_node_share) * BEST_MOVE_NODES_SCALE;
+    let (lowest, highest) = SOFT_TIME_SCALE_RANGE;
+    (stability * score_trend * node_share).clamp(lowest, highest)
+}
+
 fn has_non_pawn_material(board: &Board, side: Color) -> bool {
     let pawns_and_kings = board.pieces(Piece::Pawn) | board.pieces(Piece::King);
     !(board.occupied_by(side) & !pawns_and_kings).is_empty()
@@ -244,6 +263,7 @@ impl Searcher {
             pv_len: [0; MAX_PLY],
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: Box::new([[[0; SQUARES]; SQUARES]; 2]),
+            root_move_nodes: Box::new([[0; SQUARES]; SQUARES]),
         }
     }
 
@@ -258,9 +278,11 @@ impl Searcher {
         self.ply = 0;
         self.stopped = false;
         self.first_iteration_completed = false;
+        self.root_move_nodes.fill([0; SQUARES]);
 
         let max_depth = self.limits.depth.unwrap_or(MAX_DEPTH).clamp(1, MAX_DEPTH);
         let mut best = (Move::NULL, 0);
+        let mut stable_iterations = 0;
         for depth in 1..=max_depth {
             let score = self.negamax(board, i32::from(depth), -INFINITY, INFINITY);
             let root_move_searched = self.pv_len[0] > 0;
@@ -268,7 +290,13 @@ impl Searcher {
                 break;
             }
             let pv = &self.pv[0][..self.pv_len[0]];
+            let previous = best;
             best = (pv.first().copied().unwrap_or(Move::NULL), score);
+            stable_iterations = if best.0 == previous.0 {
+                stable_iterations + 1
+            } else {
+                0
+            };
             report(&Iteration {
                 depth,
                 score,
@@ -277,12 +305,18 @@ impl Searcher {
                 pv,
                 hashfull: self.table.hashfull(),
             });
+            let score_drop = if depth == 1 { 0 } else { previous.1 - score };
+            let time_scale = soft_time_scale(
+                stable_iterations,
+                score_drop,
+                self.best_move_node_share(best.0),
+            );
             self.first_iteration_completed = true;
             if self.stopped
                 || self.node_limit_reached()
                 || is_mate_score(score)
                 || best.0 == Move::NULL
-                || self.soft_time_expired()
+                || self.soft_time_expired(time_scale)
             {
                 break;
             }
@@ -297,10 +331,19 @@ impl Searcher {
         self.table
     }
 
-    fn soft_time_expired(&self) -> bool {
+    fn soft_time_expired(&self, scale: f64) -> bool {
         self.limits
             .soft_time
-            .is_some_and(|budget| self.start.elapsed() >= budget)
+            .is_some_and(|budget| self.start.elapsed() >= budget.mul_f64(scale))
+    }
+
+    fn best_move_node_share(&self, best_move: Move) -> f64 {
+        if self.nodes == 0 || best_move == Move::NULL {
+            return 0.0;
+        }
+        let best_move_nodes =
+            self.root_move_nodes[best_move.from().index()][best_move.to().index()];
+        best_move_nodes as f64 / self.nodes as f64
     }
 
     fn hard_limit_reached(&self) -> bool {
@@ -463,6 +506,7 @@ impl Searcher {
                     continue;
                 }
             }
+            let nodes_before = self.nodes;
             if !board.make_move(candidate) {
                 continue;
             }
@@ -493,6 +537,10 @@ impl Searcher {
             };
             self.ply -= 1;
             board.unmake_move();
+            if is_root {
+                self.root_move_nodes[candidate.from().index()][candidate.to().index()] +=
+                    self.nodes - nodes_before;
+            }
             if self.stopped {
                 return if is_root { best_score } else { 0 };
             }
@@ -692,6 +740,26 @@ mod tests {
             assert_ne!(best_move, Move::NULL, "fen {fen:?}");
             assert_eq!(best_move, pv_head, "fen {fen:?}");
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
+        }
+    }
+
+    #[test]
+    fn scales_soft_time_by_search_instability() {
+        let cases = [
+            (0, 0, 0.5, 2.5),
+            (2, 100, 0.5, 1.1 * 1.5 * 1.35),
+            (3, 40, 0.8, 0.9 * 1.2 * 0.7 * 1.35),
+            (4, 0, 0.9, 0.8 * 0.6 * 1.35),
+            (10, 0, 0.9, 0.8 * 0.6 * 1.35),
+            (4, -100, 1.0, 0.5),
+        ];
+
+        for (stable_iterations, score_drop, node_share, expected) in cases {
+            let scale = soft_time_scale(stable_iterations, score_drop, node_share);
+            assert!(
+                (scale - expected).abs() < 1e-9,
+                "stable {stable_iterations}, drop {score_drop}, share {node_share}: {scale}"
+            );
         }
     }
 

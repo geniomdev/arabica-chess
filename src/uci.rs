@@ -18,6 +18,7 @@ const ENGINE_AUTHOR: &str = "Geniomdev";
 const DEFAULT_MOVE_OVERHEAD: Duration = Duration::from_millis(50);
 const MAX_MOVE_OVERHEAD_MS: u64 = 5000;
 const DEFAULT_MOVES_TO_GO: u32 = 30;
+const HARD_LIMIT_SHARES: u32 = 3;
 
 pub fn run() {
     let mut engine = Engine::new();
@@ -338,9 +339,13 @@ fn clock_budget(
     let future_increments = increment * (moves_left - 1);
     let pool = (remaining + future_increments).saturating_sub(overhead * moves_left);
     let share = pool / moves_left;
-    let hard = share.min(remaining.saturating_sub(overhead));
+    let usable = remaining.saturating_sub(overhead);
+    let hard = (share * HARD_LIMIT_SHARES)
+        .min(usable / 2)
+        .max(share)
+        .min(usable);
     TimeBudget {
-        soft: hard / 2,
+        soft: share.min(hard) / 2,
         hard,
     }
 }
@@ -594,7 +599,7 @@ mod tests {
                 Color::White,
                 50,
                 None,
-                millis(1950),
+                millis(5850),
                 millis(975),
             ),
             (
@@ -602,7 +607,7 @@ mod tests {
                 Color::Black,
                 50,
                 None,
-                millis(950),
+                millis(2850),
                 millis(475),
             ),
             (
@@ -610,7 +615,7 @@ mod tests {
                 Color::White,
                 0,
                 None,
-                millis(2000),
+                millis(6000),
                 millis(1000),
             ),
             (
@@ -618,7 +623,7 @@ mod tests {
                 Color::White,
                 200,
                 None,
-                millis(1800),
+                millis(5400),
                 millis(900),
             ),
             (
@@ -626,7 +631,7 @@ mod tests {
                 Color::White,
                 50,
                 None,
-                millis(2400),
+                millis(7200),
                 millis(1200),
             ),
             (

@@ -5,3 +5,6 @@ edition = "2024"
 description = "A bitboard-based chess engine written in Rust"
 
 [dependencies]
+
+[profile.release]
+strip = true
