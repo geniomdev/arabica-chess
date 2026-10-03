@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, MAX_MOVES, MoveList, see_value};
-use crate::eval::evaluate;
+use crate::eval::{PawnCache, evaluate};
 use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::strength::EvalNoise;
 use crate::tt::{Bound, Hit, Store, TranspositionTable};
@@ -96,6 +96,7 @@ pub struct Searcher {
     pv_len: [usize; MAX_PLY],
     killers: [[Move; 2]; MAX_PLY],
     history: History,
+    pawn_cache: PawnCache,
     played: [Option<PieceTo>; MAX_PLY],
     root_move_nodes: Box<RootMoveNodes>,
 }
@@ -286,6 +287,7 @@ impl Searcher {
             pv_len: [0; MAX_PLY],
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: History::default(),
+            pawn_cache: PawnCache::default(),
             played: [None; MAX_PLY],
             root_move_nodes: Box::new([[0; SQUARES]; SQUARES]),
         }
@@ -423,11 +425,11 @@ impl Searcher {
         }
     }
 
-    fn static_evaluation(&self, board: &Board) -> i32 {
-        evaluate(board) + self.eval_noise.offset(board.state.zobrist_key)
+    fn static_evaluation(&mut self, board: &Board) -> i32 {
+        evaluate(board, &mut self.pawn_cache) + self.eval_noise.offset(board.state.zobrist_key)
     }
 
-    fn cached_static_evaluation(&self, board: &Board, hit: Option<Hit>) -> i32 {
+    fn cached_static_evaluation(&mut self, board: &Board, hit: Option<Hit>) -> i32 {
         hit.and_then(|hit| hit.static_eval)
             .unwrap_or_else(|| self.static_evaluation(board))
     }
@@ -920,7 +922,7 @@ mod tests {
     fn quiescence_resolves_checks() {
         let cases = [
             ("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1", -MATE..=-MATE),
-            ("4k3/8/8/8/8/8/2n5/R3K3 w - - 0 1", -INFINITY..=-100),
+            ("4k3/p7/8/8/8/8/2n5/R3K3 w - - 0 1", -INFINITY..=-100),
             ("4k3/8/8/8/8/8/4r3/4K3 w - - 0 1", -50..=50),
             ("4k3/8/8/8/8/8/8/R3K3 w - - 0 1", 300..=INFINITY),
         ];

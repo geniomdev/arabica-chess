@@ -2,7 +2,7 @@
 
 A chess engine written in Rust, built on bitboards.
 
-UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, Quiescence search, Check extension, Zobrist hashing, Repetition detection, Transposition table, Killer moves, History heuristic, Continuation history, Capture history, Null move pruning, Late move reductions, Reverse futility pruning, Futility pruning, Late move pruning, Static exchange evaluation, Tapered evaluation, Texel tuning
+UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, Quiescence search, Check extension, Zobrist hashing, Repetition detection, Transposition table, Killer moves, History heuristic, Continuation history, Capture history, Null move pruning, Late move reductions, Reverse futility pruning, Futility pruning, Late move pruning, Static exchange evaluation, Tapered evaluation, Threat evaluation, Nonlinear king danger, Pawn structure evaluation, Endgame scaling, Pawn hash table, Texel tuning
 
 ## Use
 

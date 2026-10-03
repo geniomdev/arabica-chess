@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
@@ -5,10 +6,10 @@ use std::thread;
 
 use crate::board::Board;
 use crate::eval::params::{
-    BISHOP_MOBILITY, KING_ZONE_ATTACKS, KNIGHT_MOBILITY, MATERIAL, PASSED_PAWN, PIECE_SQUARE,
-    QUEEN_MOBILITY, ROOK_MOBILITY,
+    BISHOP_MOBILITY, KING_DANGER, KNIGHT_MOBILITY, PASSED_PAWN, PASSED_PAWN_BLOCKED, PHALANX_PAWN,
+    QUEEN_MOBILITY, ROOK_MOBILITY, SUPPORTED_PAWN,
 };
-use crate::eval::{PHASE_TOTAL, Term, Terms, collect_terms, phase};
+use crate::eval::{PHASE_TOTAL, SCALE_NORMAL, Term, Terms, collect_terms, endgame_scale, phase};
 use crate::types::{Color, Piece, SQUARES};
 
 const DEFAULT_EPOCHS: usize = 2_000;
@@ -18,60 +19,25 @@ const BETA1: f64 = 0.9;
 const BETA2: f64 = 0.999;
 const EPSILON: f64 = 1e-8;
 
-const PIECE_SQUARE_OFFSET: usize = MATERIAL.len();
-const KNIGHT_MOBILITY_OFFSET: usize = PIECE_SQUARE_OFFSET + PIECE_SQUARE.len() * SQUARES;
-const BISHOP_MOBILITY_OFFSET: usize = KNIGHT_MOBILITY_OFFSET + KNIGHT_MOBILITY.len();
-const ROOK_MOBILITY_OFFSET: usize = BISHOP_MOBILITY_OFFSET + BISHOP_MOBILITY.len();
-const QUEEN_MOBILITY_OFFSET: usize = ROOK_MOBILITY_OFFSET + ROOK_MOBILITY.len();
-const PASSED_PAWN_OFFSET: usize = QUEEN_MOBILITY_OFFSET + QUEEN_MOBILITY.len();
-const DOUBLED_PAWN_INDEX: usize = PASSED_PAWN_OFFSET + PASSED_PAWN.len();
-const ISOLATED_PAWN_INDEX: usize = DOUBLED_PAWN_INDEX + 1;
-const BISHOP_PAIR_INDEX: usize = ISOLATED_PAWN_INDEX + 1;
-const ROOK_OPEN_FILE_INDEX: usize = BISHOP_PAIR_INDEX + 1;
-const ROOK_SEMI_OPEN_FILE_INDEX: usize = ROOK_OPEN_FILE_INDEX + 1;
-const PAWN_SHIELD_INDEX: usize = ROOK_SEMI_OPEN_FILE_INDEX + 1;
-const KING_ZONE_ATTACKS_OFFSET: usize = PAWN_SHIELD_INDEX + 1;
-const PARAM_COUNT: usize = KING_ZONE_ATTACKS_OFFSET + KING_ZONE_ATTACKS.len();
-
 type Weights = Vec<[f64; 2]>;
 
-fn term_index(term: Term) -> usize {
-    match term {
-        Term::Material(piece) => piece.index(),
-        Term::PieceSquare(piece, square) => PIECE_SQUARE_OFFSET + piece.index() * SQUARES + square,
-        Term::Mobility(Piece::Knight, count) => KNIGHT_MOBILITY_OFFSET + count,
-        Term::Mobility(Piece::Bishop, count) => BISHOP_MOBILITY_OFFSET + count,
-        Term::Mobility(Piece::Rook, count) => ROOK_MOBILITY_OFFSET + count,
-        Term::Mobility(_, count) => QUEEN_MOBILITY_OFFSET + count,
-        Term::PassedPawn(rank) => PASSED_PAWN_OFFSET + rank,
-        Term::DoubledPawn => DOUBLED_PAWN_INDEX,
-        Term::IsolatedPawn => ISOLATED_PAWN_INDEX,
-        Term::BishopPair => BISHOP_PAIR_INDEX,
-        Term::RookOpenFile => ROOK_OPEN_FILE_INDEX,
-        Term::RookSemiOpenFile => ROOK_SEMI_OPEN_FILE_INDEX,
-        Term::PawnShield => PAWN_SHIELD_INDEX,
-        Term::KingZoneAttacks(attacker) => KING_ZONE_ATTACKS_OFFSET + attacker,
-    }
+enum Layout {
+    Scalar(Term),
+    Table(Vec<Term>),
+    PieceSquare,
 }
 
-const MOBILITY_TABLES: [(&str, Piece, usize); 4] = [
-    ("KNIGHT_MOBILITY", Piece::Knight, KNIGHT_MOBILITY.len()),
-    ("BISHOP_MOBILITY", Piece::Bishop, BISHOP_MOBILITY.len()),
-    ("ROOK_MOBILITY", Piece::Rook, ROOK_MOBILITY.len()),
-    ("QUEEN_MOBILITY", Piece::Queen, QUEEN_MOBILITY.len()),
-];
-
-const SCALAR_TERMS: [(&str, Term); 6] = [
-    ("DOUBLED_PAWN", Term::DoubledPawn),
-    ("ISOLATED_PAWN", Term::IsolatedPawn),
-    ("BISHOP_PAIR", Term::BishopPair),
-    ("ROOK_OPEN_FILE", Term::RookOpenFile),
-    ("ROOK_SEMI_OPEN_FILE", Term::RookSemiOpenFile),
-    ("PAWN_SHIELD", Term::PawnShield),
-];
-
-fn material_terms() -> Vec<Term> {
-    Piece::ALL.into_iter().map(Term::Material).collect()
+impl Layout {
+    fn terms(&self) -> Vec<Term> {
+        match self {
+            Self::Scalar(term) => vec![*term],
+            Self::Table(terms) => terms.clone(),
+            Self::PieceSquare => Piece::ALL
+                .into_iter()
+                .flat_map(piece_square_terms)
+                .collect(),
+        }
+    }
 }
 
 fn piece_square_terms(piece: Piece) -> Vec<Term> {
@@ -80,32 +46,89 @@ fn piece_square_terms(piece: Piece) -> Vec<Term> {
         .collect()
 }
 
-fn mobility_terms(piece: Piece, len: usize) -> Vec<Term> {
-    (0..len).map(|count| Term::Mobility(piece, count)).collect()
+fn indexed(len: usize, term: impl Fn(usize) -> Term) -> Layout {
+    Layout::Table((0..len).map(term).collect())
 }
 
-fn passed_pawn_terms() -> Vec<Term> {
-    (0..PASSED_PAWN.len()).map(Term::PassedPawn).collect()
+fn per_piece(term: fn(Piece) -> Term) -> Layout {
+    Layout::Table(Piece::ALL.into_iter().map(term).collect())
 }
 
-fn king_zone_terms() -> Vec<Term> {
-    (0..KING_ZONE_ATTACKS.len())
-        .map(Term::KingZoneAttacks)
-        .collect()
+fn mobility(piece: Piece, len: usize) -> Layout {
+    indexed(len, |count| Term::Mobility(piece, count))
+}
+
+fn parameter_tables() -> Vec<(&'static str, Layout)> {
+    vec![
+        ("MATERIAL", per_piece(Term::Material)),
+        ("PIECE_SQUARE", Layout::PieceSquare),
+        (
+            "KNIGHT_MOBILITY",
+            mobility(Piece::Knight, KNIGHT_MOBILITY.len()),
+        ),
+        (
+            "BISHOP_MOBILITY",
+            mobility(Piece::Bishop, BISHOP_MOBILITY.len()),
+        ),
+        ("ROOK_MOBILITY", mobility(Piece::Rook, ROOK_MOBILITY.len())),
+        (
+            "QUEEN_MOBILITY",
+            mobility(Piece::Queen, QUEEN_MOBILITY.len()),
+        ),
+        ("PASSED_PAWN", indexed(PASSED_PAWN.len(), Term::PassedPawn)),
+        (
+            "SUPPORTED_PAWN",
+            indexed(SUPPORTED_PAWN.len(), Term::SupportedPawn),
+        ),
+        (
+            "PHALANX_PAWN",
+            indexed(PHALANX_PAWN.len(), Term::PhalanxPawn),
+        ),
+        (
+            "PASSED_PAWN_BLOCKED",
+            indexed(PASSED_PAWN_BLOCKED.len(), Term::PassedPawnBlocked),
+        ),
+        ("KING_DANGER", indexed(KING_DANGER.len(), Term::KingDanger)),
+        ("THREAT_BY_PAWN", per_piece(Term::ThreatByPawn)),
+        ("THREAT_BY_MINOR", per_piece(Term::ThreatByMinor)),
+        ("THREAT_BY_ROOK", per_piece(Term::ThreatByRook)),
+        ("DOUBLED_PAWN", Layout::Scalar(Term::DoubledPawn)),
+        ("ISOLATED_PAWN", Layout::Scalar(Term::IsolatedPawn)),
+        ("BACKWARD_PAWN", Layout::Scalar(Term::BackwardPawn)),
+        (
+            "PASSED_OWN_KING_DISTANCE",
+            Layout::Scalar(Term::PassedOwnKingDistance),
+        ),
+        (
+            "PASSED_ENEMY_KING_DISTANCE",
+            Layout::Scalar(Term::PassedEnemyKingDistance),
+        ),
+        ("BISHOP_PAIR", Layout::Scalar(Term::BishopPair)),
+        ("ROOK_OPEN_FILE", Layout::Scalar(Term::RookOpenFile)),
+        (
+            "ROOK_SEMI_OPEN_FILE",
+            Layout::Scalar(Term::RookSemiOpenFile),
+        ),
+        ("KNIGHT_OUTPOST", Layout::Scalar(Term::KnightOutpost)),
+        ("BISHOP_OUTPOST", Layout::Scalar(Term::BishopOutpost)),
+        ("PAWN_SHIELD", Layout::Scalar(Term::PawnShield)),
+        ("HANGING", Layout::Scalar(Term::Hanging)),
+        ("TEMPO", Layout::Scalar(Term::Tempo)),
+    ]
 }
 
 fn all_terms() -> Vec<Term> {
-    material_terms()
+    parameter_tables()
+        .iter()
+        .flat_map(|(_, layout)| layout.terms())
+        .collect()
+}
+
+fn term_indices() -> HashMap<Term, usize> {
+    all_terms()
         .into_iter()
-        .chain(Piece::ALL.into_iter().flat_map(piece_square_terms))
-        .chain(
-            MOBILITY_TABLES
-                .into_iter()
-                .flat_map(|(_, piece, len)| mobility_terms(piece, len)),
-        )
-        .chain(passed_pawn_terms())
-        .chain(SCALAR_TERMS.map(|(_, term)| term))
-        .chain(king_zone_terms())
+        .enumerate()
+        .map(|(index, term)| (term, index))
         .collect()
 }
 
@@ -119,27 +142,38 @@ fn initial_weights() -> Weights {
         .collect()
 }
 
-struct Trace(Vec<i32>);
+struct Trace<'a> {
+    counts: Vec<i32>,
+    indices: &'a HashMap<Term, usize>,
+}
 
-impl Trace {
-    fn new() -> Self {
-        Self(vec![0; PARAM_COUNT])
+impl<'a> Trace<'a> {
+    fn new(indices: &'a HashMap<Term, usize>) -> Self {
+        Self {
+            counts: vec![0; indices.len()],
+            indices,
+        }
     }
 }
 
-impl Terms for Trace {
+impl Terms for Trace<'_> {
     fn add(&mut self, side: Color, term: Term, count: i32) {
         let signed = match side {
             Color::White => count,
             Color::Black => -count,
         };
-        self.0[term_index(term)] += signed;
+        let index = *self
+            .indices
+            .get(&term)
+            .unwrap_or_else(|| panic!("term {term:?} has no tunable parameter"));
+        self.counts[index] += signed;
     }
 }
 
 struct Position {
     features: std::ops::Range<usize>,
     phase: f64,
+    endgame_scale: f64,
     result: f64,
 }
 
@@ -157,10 +191,10 @@ impl Dataset {
     }
 
     fn push(&mut self, board: &Board, result: f64, trace: &mut Trace) {
-        trace.0.fill(0);
+        trace.counts.fill(0);
         collect_terms(board, trace);
         let start = self.features.len();
-        for (index, &count) in trace.0.iter().enumerate() {
+        for (index, &count) in trace.counts.iter().enumerate() {
             if count != 0 {
                 self.features.push((index as u16, count as i16));
             }
@@ -168,6 +202,7 @@ impl Dataset {
         self.positions.push(Position {
             features: start..self.features.len(),
             phase: f64::from(phase(board)) / f64::from(PHASE_TOTAL),
+            endgame_scale: f64::from(endgame_scale(board)) / f64::from(SCALE_NORMAL),
             result,
         });
     }
@@ -187,8 +222,9 @@ fn parse_result(line: &str) -> Option<f64> {
 
 fn load_dataset(path: &str) -> io::Result<Dataset> {
     let reader = BufReader::new(fs::File::open(path)?);
+    let indices = term_indices();
     let mut dataset = Dataset::new();
-    let mut trace = Trace::new();
+    let mut trace = Trace::new(&indices);
     for line in reader.lines() {
         let line = line?;
         let Some(result) = parse_result(&line) else {
@@ -207,6 +243,13 @@ fn sigmoid(value: f64) -> f64 {
     1.0 / (1.0 + (-value).exp())
 }
 
+fn phase_shares(position: &Position) -> (f64, f64) {
+    (
+        position.phase,
+        (1.0 - position.phase) * position.endgame_scale,
+    )
+}
+
 fn linear_eval(dataset: &Dataset, position: &Position, weights: &Weights) -> f64 {
     let (mut mg, mut eg) = (0.0, 0.0);
     for &(index, count) in &dataset.features[position.features.clone()] {
@@ -214,7 +257,8 @@ fn linear_eval(dataset: &Dataset, position: &Position, weights: &Weights) -> f64
         mg += weight_mg * f64::from(count);
         eg += weight_eg * f64::from(count);
     }
-    mg * position.phase + eg * (1.0 - position.phase)
+    let (mg_share, eg_share) = phase_shares(position);
+    mg * mg_share + eg * eg_share
 }
 
 fn parallel_chunks<T: Send>(dataset: &Dataset, work: impl Fn(&[Position]) -> T + Sync) -> Vec<T> {
@@ -250,20 +294,20 @@ fn loss(dataset: &Dataset, weights: &Weights, scale: f64) -> f64 {
 
 fn gradient(dataset: &Dataset, weights: &Weights, scale: f64) -> Weights {
     let partials = parallel_chunks(dataset, |positions| {
-        let mut partial = vec![[0.0; 2]; PARAM_COUNT];
+        let mut partial = vec![[0.0; 2]; weights.len()];
         for position in positions {
             let predicted = sigmoid(scale * linear_eval(dataset, position, weights));
             let slope = (predicted - position.result) * predicted * (1.0 - predicted);
-            let (mg_share, eg_share) = (slope * position.phase, slope * (1.0 - position.phase));
+            let (mg_share, eg_share) = phase_shares(position);
             for &(index, count) in &dataset.features[position.features.clone()] {
                 let entry = &mut partial[usize::from(index)];
-                entry[0] += mg_share * f64::from(count);
-                entry[1] += eg_share * f64::from(count);
+                entry[0] += slope * mg_share * f64::from(count);
+                entry[1] += slope * eg_share * f64::from(count);
             }
         }
         partial
     });
-    let mut total = vec![[0.0; 2]; PARAM_COUNT];
+    let mut total = vec![[0.0; 2]; weights.len()];
     for partial in partials {
         for (sum, value) in total.iter_mut().zip(partial) {
             sum[0] += value[0];
@@ -306,13 +350,13 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
         loss(&dataset, &weights, scale)
     );
 
-    let mut first_moment = vec![[0.0; 2]; PARAM_COUNT];
-    let mut second_moment = vec![[0.0; 2]; PARAM_COUNT];
+    let mut first_moment = vec![[0.0; 2]; weights.len()];
+    let mut second_moment = vec![[0.0; 2]; weights.len()];
     for epoch in 1..=epochs {
         let gradient = gradient(&dataset, &weights, scale);
         let correction1 = 1.0 - BETA1.powi(epoch as i32);
         let correction2 = 1.0 - BETA2.powi(epoch as i32);
-        for index in 0..PARAM_COUNT {
+        for index in 0..weights.len() {
             for phase in 0..2 {
                 let grad = gradient[index][phase];
                 let first = &mut first_moment[index][phase];
@@ -332,62 +376,49 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn rounded(weights: &Weights, term: Term) -> (i32, i32) {
-    let [mg, eg] = weights[term_index(term)];
-    (mg.round() as i32, eg.round() as i32)
+fn render_score(weights: &Weights, indices: &HashMap<Term, usize>, term: Term) -> String {
+    let [mg, eg] = weights[indices[&term]];
+    format!("s({:4}, {:4})", mg.round() as i32, eg.round() as i32)
 }
 
-fn render_score(weights: &Weights, term: Term) -> String {
-    let (mg, eg) = rounded(weights, term);
-    format!("s({mg:4}, {eg:4})")
-}
-
-fn render_array(output: &mut String, name: &str, terms: &[Term], weights: &Weights) {
-    let rendered: Vec<String> = terms
-        .iter()
-        .map(|&term| render_score(weights, term))
-        .collect();
-    writeln!(output, "\n#[rustfmt::skip]").unwrap();
-    writeln!(output, "pub const {name}: [Score; {}] = [", terms.len()).unwrap();
-    for row in rendered.chunks(8) {
-        writeln!(output, "    {},", row.join(", ")).unwrap();
+fn render_rows(output: &mut String, indent: &str, scores: &[String]) {
+    for row in scores.chunks(8) {
+        writeln!(output, "{indent}{},", row.join(", ")).unwrap();
     }
-    writeln!(output, "];").unwrap();
 }
 
 fn render_params(weights: &Weights) -> String {
+    let indices = term_indices();
+    let render = |term: Term| render_score(weights, &indices, term);
     let mut output = String::from("use crate::eval::{Score, s};\n");
-    render_array(&mut output, "MATERIAL", &material_terms(), weights);
-
-    writeln!(output, "\n#[rustfmt::skip]").unwrap();
-    writeln!(output, "pub const PIECE_SQUARE: [[Score; 64]; 6] = [").unwrap();
-    for piece in Piece::ALL {
-        writeln!(output, "    [").unwrap();
-        for row in piece_square_terms(piece).chunks(8) {
-            let rendered: Vec<String> = row
-                .iter()
-                .map(|&term| render_score(weights, term))
-                .collect();
-            writeln!(output, "        {},", rendered.join(", ")).unwrap();
+    for (name, layout) in parameter_tables() {
+        match layout {
+            Layout::Scalar(term) => {
+                let [mg, eg] = weights[indices[&term]];
+                let (mg, eg) = (mg.round() as i32, eg.round() as i32);
+                writeln!(output, "\npub const {name}: Score = s({mg}, {eg});").unwrap();
+            }
+            Layout::Table(terms) => {
+                let scores: Vec<String> = terms.into_iter().map(render).collect();
+                writeln!(output, "\n#[rustfmt::skip]").unwrap();
+                writeln!(output, "pub const {name}: [Score; {}] = [", scores.len()).unwrap();
+                render_rows(&mut output, "    ", &scores);
+                writeln!(output, "];").unwrap();
+            }
+            Layout::PieceSquare => {
+                writeln!(output, "\n#[rustfmt::skip]").unwrap();
+                writeln!(output, "pub const {name}: [[Score; 64]; 6] = [").unwrap();
+                for piece in Piece::ALL {
+                    let scores: Vec<String> =
+                        piece_square_terms(piece).into_iter().map(render).collect();
+                    writeln!(output, "    [").unwrap();
+                    render_rows(&mut output, "        ", &scores);
+                    writeln!(output, "    ],").unwrap();
+                }
+                writeln!(output, "];").unwrap();
+            }
         }
-        writeln!(output, "    ],").unwrap();
     }
-    writeln!(output, "];").unwrap();
-
-    for (name, piece, len) in MOBILITY_TABLES {
-        render_array(&mut output, name, &mobility_terms(piece, len), weights);
-    }
-    render_array(&mut output, "PASSED_PAWN", &passed_pawn_terms(), weights);
-    for (name, term) in SCALAR_TERMS {
-        let (mg, eg) = rounded(weights, term);
-        writeln!(output, "\npub const {name}: Score = s({mg}, {eg});").unwrap();
-    }
-    render_array(
-        &mut output,
-        "KING_ZONE_ATTACKS",
-        &king_zone_terms(),
-        weights,
-    );
     output
 }
 
@@ -395,38 +426,68 @@ fn render_params(weights: &Weights) -> String {
 mod tests {
     use super::*;
     use crate::board::testing::board;
+    use crate::eval::PawnCache;
 
     #[test]
-    fn term_indices_are_dense_and_ordered() {
+    fn every_term_has_a_unique_parameter() {
         let terms = all_terms();
-        assert_eq!(terms.len(), PARAM_COUNT);
+        let indices = term_indices();
+        assert_eq!(indices.len(), terms.len(), "duplicate terms");
         for (expected, term) in terms.into_iter().enumerate() {
-            assert_eq!(term_index(term), expected, "term {term:?}");
+            assert_eq!(indices[&term], expected, "term {term:?}");
         }
     }
 
     #[test]
+    fn rendered_params_round_trip_current_weights() {
+        let rendered = render_params(&initial_weights());
+        let current = include_str!("eval/params.rs");
+        let normalized = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        let mut rendered_lines = normalized(&rendered);
+        let mut current_lines = normalized(current);
+        rendered_lines.sort();
+        current_lines.sort();
+        assert_eq!(rendered_lines, current_lines);
+    }
+
+    #[test]
     fn linear_eval_matches_engine_eval() {
-        let fens = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-            "8/8/1p1k4/1P6/8/3p3P/1r4P1/5K2 w - - 0 1",
-            "6k1/5ppp/8/1P6/8/2P5/2P2PPP/3R2K1 b - - 0 1",
+        let cases = [
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                1.0,
+            ),
+            (
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                1.0,
+            ),
+            ("8/8/1p1k4/1P6/8/3p3P/1r4P1/5K2 w - - 0 1", 1.0),
+            ("6k1/5ppp/8/1P6/8/2P5/2P2PPP/3R2K1 b - - 0 1", 1.0),
+            ("6k1/5p1p/4N3/8/8/8/8/4K1Q1 w - - 0 1", 1.0),
+            ("4kb2/p7/8/8/8/8/PP6/3BK3 w - - 0 1", 2.0),
+            ("4kn2/8/8/8/8/8/8/R3K3 b - - 0 1", 2.0),
         ];
         let weights = initial_weights();
+        let indices = term_indices();
 
-        for fen in fens {
+        for (fen, tolerance) in cases {
             let board = board(fen);
             let mut dataset = Dataset::new();
-            dataset.push(&board, 0.5, &mut Trace::new());
-            let white_eval = crate::eval::evaluate(&board)
+            dataset.push(&board, 0.5, &mut Trace::new(&indices));
+            let white_eval = crate::eval::evaluate(&board, &mut PawnCache::default())
                 * match board.state.active_color {
                     Color::White => 1,
                     Color::Black => -1,
                 };
             let linear = linear_eval(&dataset, &dataset.positions[0], &weights);
             assert!(
-                (linear - f64::from(white_eval)).abs() <= 1.0,
+                (linear - f64::from(white_eval)).abs() <= tolerance,
                 "fen {fen:?}: linear {linear}, engine {white_eval}"
             );
         }
