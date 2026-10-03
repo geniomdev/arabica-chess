@@ -1,6 +1,7 @@
 mod attacks;
 mod board;
 mod eval;
+mod history;
 mod search;
 mod strength;
 mod tt;

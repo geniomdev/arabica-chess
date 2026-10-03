@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::board::{Board, MAX_MOVES, MoveList, see_value};
 use crate::eval::evaluate;
+use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::strength::EvalNoise;
 use crate::tt::{Bound, Store, TranspositionTable};
 use crate::types::{Color, Move, MoveKind, Piece, SQUARES};
@@ -21,9 +22,9 @@ const GOOD_NOISY_SCORE: i32 = 200_000;
 const KILLER_SCORES: [i32; 2] = [100_000, 99_000];
 const BAD_NOISY_SCORE: i32 = -200_000;
 
-const MAX_HISTORY: i32 = 16_384;
-const MAX_HISTORY_BONUS: i32 = 1_200;
 const TRACKED_QUIETS: usize = 64;
+const TRACKED_NOISY: usize = 32;
+const CAPTURE_HISTORY_ORDER_DIVISOR: i32 = 8;
 
 const REVERSE_FUTILITY_DEPTH: i32 = 8;
 const REVERSE_FUTILITY_MARGIN: i32 = 80;
@@ -35,7 +36,7 @@ const FUTILITY_MARGIN: i32 = 100;
 const NOISY_SEE_DEPTH: i32 = 6;
 const NOISY_SEE_MARGIN: i32 = 100;
 const REDUCTION_DEPTH: i32 = 3;
-const REDUCTION_HISTORY_DIVISOR: i32 = 8_192;
+const REDUCTION_HISTORY_DIVISOR: i32 = 16_384;
 const REDUCTION_TABLE_SIZE: usize = 64;
 
 const STABILITY_TIME_SCALES: [f64; 5] = [2.0, 1.4, 1.1, 0.9, 0.8];
@@ -45,7 +46,6 @@ const BEST_MOVE_NODES_PIVOT: f64 = 1.5;
 const BEST_MOVE_NODES_SCALE: f64 = 1.35;
 const SOFT_TIME_SCALE_RANGE: (f64, f64) = (0.5, 2.5);
 
-type HistoryTable = [[[i32; SQUARES]; SQUARES]; 2];
 type RootMoveNodes = [[u64; SQUARES]; SQUARES];
 
 static REDUCTIONS: LazyLock<[[i32; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE]> =
@@ -90,7 +90,8 @@ pub struct Searcher {
     pv: [[Move; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
     killers: [[Move; 2]; MAX_PLY],
-    history: Box<HistoryTable>,
+    history: History,
+    played: [Option<PieceTo>; MAX_PLY],
     root_move_nodes: Box<RootMoveNodes>,
 }
 
@@ -106,7 +107,8 @@ impl MovePicker {
         moves: MoveList,
         hash_move: Option<Move>,
         killers: [Move; 2],
-        history: &HistoryTable,
+        history: &History,
+        continuations: &Continuations,
     ) -> Self {
         Self::scored(moves, |candidate| {
             if Some(candidate) == hash_move {
@@ -118,17 +120,19 @@ impl MovePicker {
                 } else {
                     BAD_NOISY_SCORE
                 };
-                return base + noisy_score(board, candidate);
+                return base + noisy_score(board, candidate, history);
             }
             match killers.iter().position(|&killer| killer == candidate) {
                 Some(rank) => KILLER_SCORES[rank],
-                None => history_score(history, board.state.active_color, candidate),
+                None => {
+                    history.quiet_score(candidate, moved_piece(board, candidate), continuations)
+                }
             }
         })
     }
 
-    fn noisy(board: &Board, moves: MoveList) -> Self {
-        Self::scored(moves, |candidate| noisy_score(board, candidate))
+    fn noisy(board: &Board, moves: MoveList, history: &History) -> Self {
+        Self::scored(moves, |candidate| noisy_score(board, candidate, history))
     }
 
     fn scored(moves: MoveList, score: impl Fn(Move) -> i32) -> Self {
@@ -162,21 +166,38 @@ fn is_noisy(candidate: Move) -> bool {
     candidate.is_capture() || candidate.is_promotion()
 }
 
-fn noisy_score(board: &Board, candidate: Move) -> i32 {
-    let promotion = candidate.promotion().map_or(0, see_value);
-    if !candidate.is_capture() {
-        return promotion;
+fn moved_piece(board: &Board, candidate: Move) -> PieceTo {
+    PieceTo {
+        side: board.state.active_color,
+        piece: board
+            .piece_on(candidate.from())
+            .expect("piece on origin square"),
+        to: candidate.to(),
     }
-    let victim = match candidate.kind() {
-        MoveKind::EnPassant => Piece::Pawn,
-        _ => board
-            .piece_on(candidate.to())
-            .expect("piece on captured square"),
-    };
-    let attacker = board
-        .piece_on(candidate.from())
-        .expect("piece on origin square");
-    promotion + 10 * see_value(victim) - attacker_rank(attacker)
+}
+
+fn captured_piece(board: &Board, candidate: Move) -> Option<Piece> {
+    match candidate.kind() {
+        MoveKind::EnPassant => Some(Piece::Pawn),
+        _ if candidate.is_capture() => Some(
+            board
+                .piece_on(candidate.to())
+                .expect("piece on captured square"),
+        ),
+        _ => None,
+    }
+}
+
+fn noisy_score(board: &Board, candidate: Move, history: &History) -> i32 {
+    let promotion = candidate.promotion().map_or(0, see_value);
+    let moved = moved_piece(board, candidate);
+    let victim = captured_piece(board, candidate);
+    let victim_attacker_score = victim.map_or(0, |victim| {
+        10 * see_value(victim) - attacker_rank(moved.piece)
+    });
+    promotion
+        + victim_attacker_score
+        + history.capture_score(moved, victim) / CAPTURE_HISTORY_ORDER_DIVISOR
 }
 
 fn attacker_rank(attacker: Piece) -> i32 {
@@ -184,14 +205,6 @@ fn attacker_rank(attacker: Piece) -> i32 {
         Piece::King => 1_000,
         other => see_value(other),
     }
-}
-
-fn history_score(history: &HistoryTable, side: Color, candidate: Move) -> i32 {
-    history[side.index()][candidate.from().index()][candidate.to().index()]
-}
-
-fn update_history(entry: &mut i32, bonus: i32) {
-    *entry += bonus - *entry * bonus.abs() / MAX_HISTORY;
 }
 
 fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_share: f64) -> f64 {
@@ -262,7 +275,8 @@ impl Searcher {
             pv: [[Move::NULL; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             killers: [[Move::NULL; 2]; MAX_PLY],
-            history: Box::new([[[0; SQUARES]; SQUARES]; 2]),
+            history: History::default(),
+            played: [None; MAX_PLY],
             root_move_nodes: Box::new([[0; SQUARES]; SQUARES]),
         }
     }
@@ -327,8 +341,13 @@ impl Searcher {
         best
     }
 
-    pub fn into_table(self) -> TranspositionTable {
-        self.table
+    pub fn with_history(mut self, history: History) -> Self {
+        self.history = history;
+        self
+    }
+
+    pub fn into_parts(self) -> (TranspositionTable, History) {
+        (self.table, self.history)
     }
 
     fn soft_time_expired(&self, scale: f64) -> bool {
@@ -381,21 +400,47 @@ impl Searcher {
         self.pv_len[ply] = child_len;
     }
 
-    fn reward_quiet(&mut self, side: Color, cutoff: Move, tried: &[Move], depth: i32) {
-        let killers = &mut self.killers[self.ply];
-        if killers[0] != cutoff {
-            killers[1] = killers[0];
-            killers[0] = cutoff;
+    fn continuations(&self) -> Continuations {
+        std::array::from_fn(|plies_back| {
+            self.ply
+                .checked_sub(plies_back + 1)
+                .and_then(|ply| self.played[ply])
+        })
+    }
+
+    fn reward_cutoff(
+        &mut self,
+        board: &Board,
+        cutoff: Move,
+        tried_quiets: &[Move],
+        tried_noisy: &[Move],
+        depth: i32,
+    ) {
+        let bonus = history_bonus(depth);
+        if is_noisy(cutoff) {
+            self.history.update_capture(
+                moved_piece(board, cutoff),
+                captured_piece(board, cutoff),
+                bonus,
+            );
+        } else {
+            let killers = &mut self.killers[self.ply];
+            if killers[0] != cutoff {
+                killers[1] = killers[0];
+                killers[0] = cutoff;
+            }
+            let continuations = self.continuations();
+            self.history
+                .update_quiet(cutoff, moved_piece(board, cutoff), &continuations, bonus);
+            for &quiet in tried_quiets {
+                self.history
+                    .update_quiet(quiet, moved_piece(board, quiet), &continuations, -bonus);
+            }
         }
-        let bonus = (16 * depth * depth).min(MAX_HISTORY_BONUS);
-        let side_history = &mut self.history[side.index()];
-        update_history(
-            &mut side_history[cutoff.from().index()][cutoff.to().index()],
-            bonus,
-        );
-        for &quiet in tried {
-            update_history(
-                &mut side_history[quiet.from().index()][quiet.to().index()],
+        for &noisy in tried_noisy {
+            self.history.update_capture(
+                moved_piece(board, noisy),
+                captured_piece(board, noisy),
                 -bonus,
             );
         }
@@ -456,6 +501,7 @@ impl Searcher {
             && has_non_pawn_material(board, us)
         {
             let reduction = 3 + depth / 4 + ((static_eval - beta) / 200).min(3);
+            self.played[self.ply] = None;
             board.make_null_move();
             self.ply += 1;
             let score = -self.negamax(board, depth - 1 - reduction, -beta, -beta + 1);
@@ -471,12 +517,14 @@ impl Searcher {
 
         let mut moves = MoveList::new();
         board.generate_pseudo_legal(&mut moves);
+        let continuations = self.continuations();
         let picker = MovePicker::new(
             board,
             moves,
             hash_move,
             self.killers[self.ply],
             &self.history,
+            &continuations,
         );
 
         let original_alpha = alpha;
@@ -485,6 +533,8 @@ impl Searcher {
         let mut legal_moves = 0;
         let mut tried_quiets = [Move::NULL; TRACKED_QUIETS];
         let mut tried_quiet_count = 0;
+        let mut tried_noisy = [Move::NULL; TRACKED_NOISY];
+        let mut tried_noisy_count = 0;
         for candidate in picker {
             let is_quiet = !is_noisy(candidate);
             if !is_root && !in_check && best_score > -MATE_BOUND {
@@ -507,6 +557,13 @@ impl Searcher {
                 }
             }
             let nodes_before = self.nodes;
+            let moved = moved_piece(board, candidate);
+            let quiet_history = if is_quiet {
+                self.history.quiet_score(candidate, moved, &continuations)
+            } else {
+                0
+            };
+            self.played[self.ply] = Some(moved);
             if !board.make_move(candidate) {
                 continue;
             }
@@ -522,8 +579,7 @@ impl Searcher {
                     reduction = late_move_reduction(depth, legal_moves as usize);
                     reduction -= i32::from(is_pv);
                     reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
-                    reduction -=
-                        history_score(&self.history, us, candidate) / REDUCTION_HISTORY_DIVISOR;
+                    reduction -= quiet_history / REDUCTION_HISTORY_DIVISOR;
                     reduction = reduction.clamp(0, new_depth - 1);
                 }
                 let mut score = -self.negamax(board, new_depth - reduction, -alpha - 1, -alpha);
@@ -550,15 +606,22 @@ impl Searcher {
                 best_move = candidate;
                 self.update_pv(candidate);
                 if alpha >= beta {
-                    if is_quiet {
-                        self.reward_quiet(us, candidate, &tried_quiets[..tried_quiet_count], depth);
-                    }
+                    self.reward_cutoff(
+                        board,
+                        candidate,
+                        &tried_quiets[..tried_quiet_count],
+                        &tried_noisy[..tried_noisy_count],
+                        depth,
+                    );
                     break;
                 }
             }
             if is_quiet && tried_quiet_count < TRACKED_QUIETS {
                 tried_quiets[tried_quiet_count] = candidate;
                 tried_quiet_count += 1;
+            } else if !is_quiet && tried_noisy_count < TRACKED_NOISY {
+                tried_noisy[tried_noisy_count] = candidate;
+                tried_noisy_count += 1;
             }
         }
 
@@ -600,7 +663,7 @@ impl Searcher {
 
         let mut moves = MoveList::new();
         board.generate_captures(&mut moves);
-        let picker = MovePicker::noisy(board, moves);
+        let picker = MovePicker::noisy(board, moves, &self.history);
 
         let mut best_score = stand_pat;
         for candidate in picker {

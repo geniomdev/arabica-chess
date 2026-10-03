@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::board::{Board, FenError, MoveList, START_POSITION};
+use crate::history::History;
 use crate::search::{Iteration, SearchLimits, Searcher, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
@@ -43,6 +44,7 @@ enum Flow {
 struct Engine {
     board: Board,
     table: TranspositionTable,
+    history: History,
     move_overhead: Duration,
     limit_strength: bool,
     elo: u32,
@@ -55,6 +57,7 @@ impl Engine {
         Self {
             board: start_position(),
             table: TranspositionTable::new(DEFAULT_HASH_MB),
+            history: History::default(),
             move_overhead: DEFAULT_MOVE_OVERHEAD,
             limit_strength: false,
             elo: DEFAULT_ELO,
@@ -90,6 +93,7 @@ impl Engine {
                 self.stop_search();
                 self.board = start_position();
                 self.table.clear();
+                self.history.clear();
                 self.noise_seed = fresh_noise_seed();
             }
             ["setoption", arguments @ ..] => {
@@ -151,20 +155,21 @@ impl Engine {
             limits,
             eval_noise,
             mem::take(&mut self.table),
+            mem::take(&mut self.history),
             params.infinite,
         ));
     }
 
     fn stop_search(&mut self) {
         if let Some(search) = self.search.take() {
-            self.table = search.stop();
+            (self.table, self.history) = search.stop();
         }
     }
 }
 
 struct RunningSearch {
     stop_signal: Arc<AtomicBool>,
-    thread: JoinHandle<TranspositionTable>,
+    thread: JoinHandle<(TranspositionTable, History)>,
 }
 
 impl RunningSearch {
@@ -173,13 +178,15 @@ impl RunningSearch {
         limits: SearchLimits,
         eval_noise: EvalNoise,
         table: TranspositionTable,
+        history: History,
         hold_until_stopped: bool,
     ) -> Self {
         let stop_signal = Arc::new(AtomicBool::new(false));
         let searcher_signal = Arc::clone(&stop_signal);
         let thread = thread::spawn(move || {
             let mut searcher = Searcher::new(limits, Arc::clone(&searcher_signal), table)
-                .with_eval_noise(eval_noise);
+                .with_eval_noise(eval_noise)
+                .with_history(history);
             let (best_move, _) = searcher.search(&mut board, print_iteration);
             if hold_until_stopped {
                 while !searcher_signal.load(Ordering::Acquire) {
@@ -187,7 +194,7 @@ impl RunningSearch {
                 }
             }
             println!("bestmove {best_move}");
-            searcher.into_table()
+            searcher.into_parts()
         });
         Self {
             stop_signal,
@@ -195,7 +202,7 @@ impl RunningSearch {
         }
     }
 
-    fn stop(self) -> TranspositionTable {
+    fn stop(self) -> (TranspositionTable, History) {
         self.stop_signal.store(true, Ordering::Release);
         self.thread.thread().unpark();
         self.thread.join().expect("search thread finished cleanly")

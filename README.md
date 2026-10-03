@@ -2,7 +2,7 @@
 
 A chess engine written in Rust, built on bitboards.
 
-UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, Quiescence search, Check extension, Zobrist hashing, Repetition detection, Transposition table, Killer moves, History heuristic, Null move pruning, Late move reductions, Reverse futility pruning, Futility pruning, Late move pruning, Static exchange evaluation, Tapered evaluation, Texel tuning
+UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, Quiescence search, Check extension, Zobrist hashing, Repetition detection, Transposition table, Killer moves, History heuristic, Continuation history, Capture history, Null move pruning, Late move reductions, Reverse futility pruning, Futility pruning, Late move pruning, Static exchange evaluation, Tapered evaluation, Texel tuning
 
 ## Use
 
@@ -19,7 +19,7 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, 
 - `position startpos \| fen <fen> [moves ...]` - sets up the position
 - `position startpos moves e2e4 e7e5` - sets up the position
 - `d` - prints the board, its FEN and Zobrist key
-- `ucinewgame` - resets the board to the start position, clears the transposition table and reseeds the evaluation noise
+- `ucinewgame` - resets the board to the start position, clears the transposition table and move histories and reseeds the evaluation noise
 - `go` - starts a search
 - `go depth 8` - starts a search with depth 8
 - `go nodes 5000` - stops the search after 5000 nodes (the first iteration always completes)
