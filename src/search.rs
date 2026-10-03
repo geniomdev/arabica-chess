@@ -40,6 +40,10 @@ const REDUCTION_DEPTH: i32 = 3;
 const REDUCTION_HISTORY_DIVISOR: i32 = 16_384;
 const REDUCTION_TABLE_SIZE: usize = 64;
 
+const ASPIRATION_DEPTH: i32 = 4;
+const ASPIRATION_WINDOW: i32 = 25;
+const ASPIRATION_FULL_WINDOW_THRESHOLD: i32 = 400;
+
 const STABILITY_TIME_SCALES: [f64; 5] = [2.0, 1.4, 1.1, 0.9, 0.8];
 const SCORE_DROP_RANGE: (i32, i32) = (-50, 100);
 const SCORE_DROP_TIME_DIVISOR: f64 = 200.0;
@@ -305,7 +309,7 @@ impl Searcher {
         let mut best = (Move::NULL, 0);
         let mut stable_iterations = 0;
         for depth in 1..=max_depth {
-            let score = self.negamax(board, i32::from(depth), -INFINITY, INFINITY);
+            let score = self.aspiration_search(board, i32::from(depth), best.1);
             let root_move_searched = self.pv_len[0] > 0;
             if self.stopped && !root_move_searched {
                 break;
@@ -355,6 +359,32 @@ impl Searcher {
 
     pub fn into_parts(self) -> (TranspositionTable, History) {
         (self.table, self.history)
+    }
+
+    fn aspiration_search(&mut self, board: &mut Board, depth: i32, previous_score: i32) -> i32 {
+        if depth < ASPIRATION_DEPTH || is_mate_score(previous_score) {
+            return self.negamax(board, depth, -INFINITY, INFINITY);
+        }
+        let mut window = ASPIRATION_WINDOW;
+        let mut alpha = previous_score - window;
+        let mut beta = previous_score + window;
+        loop {
+            let score = self.negamax(board, depth, alpha, beta);
+            if self.stopped || (alpha < score && score < beta) {
+                return score;
+            }
+            if score <= alpha {
+                beta = (alpha + beta) / 2;
+                alpha = (score - window).max(-INFINITY);
+            } else {
+                beta = (score + window).min(INFINITY);
+            }
+            window += window / 2;
+            if window > ASPIRATION_FULL_WINDOW_THRESHOLD {
+                alpha = -INFINITY;
+                beta = INFINITY;
+            }
+        }
     }
 
     fn soft_time_expired(&self, scale: f64) -> bool {
@@ -812,6 +842,77 @@ mod tests {
                 assert_eq!(score, expected, "fen {fen:?}");
             }
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
+        }
+    }
+
+    #[test]
+    fn aspiration_recovers_from_wrong_previous_score() {
+        let cases = [
+            (
+                "4k3/8/8/8/8/8/8/RR4K1 w - - 0 1",
+                4,
+                0,
+                MATE - 3..=MATE - 3,
+                None,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/RR4K1 w - - 0 1",
+                4,
+                3_000,
+                MATE - 3..=MATE - 3,
+                None,
+            ),
+            (
+                "4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1",
+                5,
+                0,
+                500..=INFINITY,
+                Some("d1d5"),
+            ),
+            (
+                "4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1",
+                5,
+                -3_000,
+                500..=INFINITY,
+                Some("d1d5"),
+            ),
+            (
+                "4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1",
+                5,
+                3_000,
+                500..=INFINITY,
+                Some("d1d5"),
+            ),
+            (
+                "3qk3/8/8/8/8/8/8/3QK3 w - - 0 1",
+                6,
+                2_000,
+                -100..=100,
+                None,
+            ),
+            (
+                "3qk3/8/8/8/8/8/8/3QK3 w - - 0 1",
+                6,
+                -2_000,
+                -100..=100,
+                None,
+            ),
+        ];
+
+        for (fen, depth, previous_score, expected_score, expected_move) in cases {
+            let mut board = board(fen);
+            let mut searcher = Searcher::new(
+                SearchLimits::default(),
+                Arc::default(),
+                TranspositionTable::new(1),
+            );
+            let score = searcher.aspiration_search(&mut board, depth, previous_score);
+            let context = format!("fen {fen:?}, depth {depth}, previous {previous_score}");
+            assert!(expected_score.contains(&score), "{context}: score {score}");
+            if let Some(expected) = expected_move {
+                assert_eq!(searcher.pv[0][0].to_string(), expected, "{context}");
+            }
+            assert_eq!(board.to_fen(), fen, "{context}: board restored");
         }
     }
 
