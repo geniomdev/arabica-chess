@@ -17,6 +17,23 @@ const CAPTURE_PROMOTIONS: [MoveKind; 4] = [
     MoveKind::BishopPromotionCapture,
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Generation {
+    All,
+    Noisy,
+    Quiet,
+}
+
+impl Generation {
+    fn includes_noisy(self) -> bool {
+        self != Self::Quiet
+    }
+
+    fn includes_quiet(self) -> bool {
+        self != Self::Noisy
+    }
+}
+
 pub struct MoveList {
     moves: [Move; MAX_MOVES],
     len: usize,
@@ -34,6 +51,10 @@ impl MoveList {
         debug_assert!(self.len < MAX_MOVES);
         self.moves[self.len] = candidate;
         self.len += 1;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     pub fn as_slice(&self) -> &[Move] {
@@ -67,13 +88,67 @@ fn push_promotions(moves: &mut MoveList, from: Square, to: Square, kinds: [MoveK
     }
 }
 
+fn piece_reach(piece: Piece, from: Square, occupancy: Bitboard) -> Bitboard {
+    match piece {
+        Piece::Knight => knight_attacks(from),
+        Piece::Bishop => bishop_attacks(from, occupancy),
+        Piece::Rook => rook_attacks(from, occupancy),
+        Piece::Queen => bishop_attacks(from, occupancy) | rook_attacks(from, occupancy),
+        Piece::King => king_attacks(from),
+        Piece::Pawn => Bitboard::empty(),
+    }
+}
+
 impl Board {
     pub fn generate_pseudo_legal(&self, moves: &mut MoveList) {
-        self.generate(moves, false);
+        self.generate(moves, Generation::All);
     }
 
-    pub fn generate_captures(&self, moves: &mut MoveList) {
-        self.generate(moves, true);
+    pub fn generate_noisy(&self, moves: &mut MoveList) {
+        self.generate(moves, Generation::Noisy);
+    }
+
+    pub fn generate_quiets(&self, moves: &mut MoveList) {
+        self.generate(moves, Generation::Quiet);
+    }
+
+    pub fn is_pseudo_legal(&self, candidate: Move) -> bool {
+        if candidate == Move::NULL {
+            return false;
+        }
+        let side = self.state.active_color;
+        let Some((owner, piece)) = self.colored_piece_on(candidate.from()) else {
+            return false;
+        };
+        if owner != side {
+            return false;
+        }
+        let allies = self.occupied_by(side);
+        let enemies = self.occupied_by(side.opponent());
+        let occupancy = allies | enemies;
+        let castles = matches!(
+            candidate.kind(),
+            MoveKind::KingCastle | MoveKind::QueenCastle
+        );
+        if piece == Piece::Pawn || castles {
+            let mut moves = MoveList::new();
+            if piece == Piece::Pawn {
+                self.generate_pawn_moves(&mut moves, side, enemies, occupancy, Generation::All);
+            } else if piece == Piece::King {
+                self.generate_castling(&mut moves, side, occupancy);
+            }
+            return moves.as_slice().contains(&candidate);
+        }
+        let to = candidate.to();
+        let expected_kind = if enemies.contains(to) {
+            MoveKind::Capture
+        } else if allies.contains(to) {
+            return false;
+        } else {
+            MoveKind::Quiet
+        };
+        candidate.kind() == expected_kind
+            && piece_reach(piece, candidate.from(), occupancy).contains(to)
     }
 
     pub fn parse_move(&self, notation: &str) -> Option<Move> {
@@ -86,14 +161,18 @@ impl Board {
             .find(|candidate| candidate.to_string() == notation)
     }
 
-    fn generate(&self, moves: &mut MoveList, captures_only: bool) {
+    fn generate(&self, moves: &mut MoveList, generation: Generation) {
         let side = self.state.active_color;
         let allies = self.occupied_by(side);
         let enemies = self.occupied_by(side.opponent());
         let occupancy = allies | enemies;
-        let targets = if captures_only { enemies } else { !allies };
+        let targets = match generation {
+            Generation::All => !allies,
+            Generation::Noisy => enemies,
+            Generation::Quiet => !occupancy,
+        };
 
-        self.generate_pawn_moves(moves, side, enemies, occupancy, captures_only);
+        self.generate_pawn_moves(moves, side, enemies, occupancy, generation);
         for from in self.pieces_of(side, Piece::Knight) {
             push_targets(moves, from, knight_attacks(from) & targets, enemies);
         }
@@ -115,7 +194,7 @@ impl Board {
         }
         let king = self.king_square(side);
         push_targets(moves, king, king_attacks(king) & targets, enemies);
-        if !captures_only {
+        if generation.includes_quiet() {
             self.generate_castling(moves, side, occupancy);
         }
     }
@@ -126,7 +205,7 @@ impl Board {
         side: Color,
         enemies: Bitboard,
         occupancy: Bitboard,
-        captures_only: bool,
+        generation: Generation,
     ) {
         let pawns = self.pieces_of(side, Piece::Pawn);
         let empty = !occupancy;
@@ -139,16 +218,19 @@ impl Board {
         let single = forward(pawns, side) & empty;
         let double = forward(single & double_push_rank, side) & empty;
 
-        for to in single & promotion_rank {
-            push_promotions(moves, origin(to, 1), to, QUIET_PROMOTIONS);
-        }
-        if !captures_only {
+        if generation.includes_quiet() {
             for to in single & !promotion_rank {
                 moves.push(Move::new(origin(to, 1), to, MoveKind::Quiet));
             }
             for to in double {
                 moves.push(Move::new(origin(to, 2), to, MoveKind::DoublePush));
             }
+        }
+        if !generation.includes_noisy() {
+            return;
+        }
+        for to in single & promotion_rank {
+            push_promotions(moves, origin(to, 1), to, QUIET_PROMOTIONS);
         }
         for from in pawns {
             let captures = pawn_attacks(side, from) & enemies;
@@ -311,31 +393,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn captures_match_filtered_pseudo_legal_moves() {
-        let fens = [
-            START_POSITION,
-            KIWIPETE,
-            WHITE_EN_PASSANT,
-            BOTH_CASTLES,
-            "3r3k/4P3/8/8/8/8/8/K7 w - - 0 1",
-            "k7/8/8/8/8/8/3p4/4R2K b - - 0 1",
-            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
-        ];
+    const STAGED_FENS: [&str; 9] = [
+        START_POSITION,
+        KIWIPETE,
+        WHITE_EN_PASSANT,
+        BOTH_CASTLES,
+        F1_ATTACKED,
+        KING_IN_CHECK,
+        "3r3k/4P3/8/8/8/8/8/K7 w - - 0 1",
+        "k7/8/8/8/8/8/3p4/4R2K b - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    ];
 
-        for fen in fens {
+    fn sorted(mut moves: Vec<Move>) -> Vec<Move> {
+        moves.sort_by_key(|candidate| format!("{candidate:?}"));
+        moves
+    }
+
+    #[test]
+    fn noisy_and_quiet_stages_partition_pseudo_legal_moves() {
+        for fen in STAGED_FENS {
             let board = board(fen);
-            let mut captures = MoveList::new();
-            board.generate_captures(&mut captures);
-            let mut actual = captures.as_slice().to_vec();
-            let mut expected: Vec<Move> = generate(fen)
-                .into_iter()
-                .filter(|candidate| candidate.is_capture() || candidate.is_promotion())
-                .collect();
-            let key = |candidate: &Move| format!("{candidate:?}");
-            actual.sort_by_key(key);
-            expected.sort_by_key(key);
-            assert_eq!(actual, expected, "fen {fen:?}");
+            let mut noisy = MoveList::new();
+            board.generate_noisy(&mut noisy);
+            let mut quiets = MoveList::new();
+            board.generate_quiets(&mut quiets);
+            let all = generate(fen);
+            let is_noisy = |candidate: &Move| candidate.is_capture() || candidate.is_promotion();
+            assert!(noisy.as_slice().iter().all(is_noisy), "fen {fen:?}");
+            assert!(!quiets.as_slice().iter().any(is_noisy), "fen {fen:?}");
+            assert_eq!(
+                sorted([noisy.as_slice(), quiets.as_slice()].concat()),
+                sorted(all),
+                "fen {fen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_moves_from_other_positions() {
+        let foreign_moves: Vec<Move> = STAGED_FENS
+            .iter()
+            .flat_map(|fen| generate(fen))
+            .chain([Move::NULL])
+            .collect();
+
+        for fen in STAGED_FENS {
+            let board = board(fen);
+            let generated = generate(fen);
+            for &candidate in &foreign_moves {
+                assert_eq!(
+                    board.is_pseudo_legal(candidate),
+                    generated.contains(&candidate),
+                    "fen {fen:?}, move {candidate} {:?}",
+                    candidate.kind()
+                );
+            }
         }
     }
 

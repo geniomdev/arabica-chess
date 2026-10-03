@@ -2,12 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use crate::board::{Board, MAX_MOVES, MoveList, see_value};
+use crate::board::{Board, MoveList};
 use crate::eval::{PawnCache, evaluate};
 use crate::history::{Continuations, History, PieceTo, history_bonus};
+use crate::movepick::{MovePicker, captured_piece, is_noisy, moved_piece};
 use crate::strength::EvalNoise;
 use crate::tt::{Bound, Hit, Store, TranspositionTable};
-use crate::types::{Color, Move, MoveKind, Piece, SQUARES};
+use crate::types::{Color, Move, Piece, SQUARES};
 
 pub const INFINITY: i32 = 32_000;
 pub const MATE: i32 = 31_000;
@@ -18,14 +19,8 @@ pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 const TIME_CHECK_INTERVAL: u64 = 2048;
 const QUIESCENCE_DEPTH: u8 = 0;
 
-const HASH_MOVE_SCORE: i32 = 1_000_000;
-const GOOD_NOISY_SCORE: i32 = 200_000;
-const KILLER_SCORES: [i32; 2] = [100_000, 99_000];
-const BAD_NOISY_SCORE: i32 = -200_000;
-
 const TRACKED_QUIETS: usize = 64;
 const TRACKED_NOISY: usize = 32;
-const CAPTURE_HISTORY_ORDER_DIVISOR: i32 = 8;
 
 const REVERSE_FUTILITY_DEPTH: i32 = 8;
 const REVERSE_FUTILITY_MARGIN: i32 = 80;
@@ -99,123 +94,6 @@ pub struct Searcher {
     pawn_cache: PawnCache,
     played: [Option<PieceTo>; MAX_PLY],
     root_move_nodes: Box<RootMoveNodes>,
-}
-
-struct MovePicker {
-    moves: MoveList,
-    scores: [i32; MAX_MOVES],
-    next: usize,
-}
-
-impl MovePicker {
-    fn new(
-        board: &Board,
-        moves: MoveList,
-        hash_move: Option<Move>,
-        killers: [Move; 2],
-        history: &History,
-        continuations: &Continuations,
-    ) -> Self {
-        Self::scored(moves, |candidate| {
-            if Some(candidate) == hash_move {
-                return HASH_MOVE_SCORE;
-            }
-            if is_noisy(candidate) {
-                let base = if board.see(candidate, 0) {
-                    GOOD_NOISY_SCORE
-                } else {
-                    BAD_NOISY_SCORE
-                };
-                return base + noisy_score(board, candidate, history);
-            }
-            match killers.iter().position(|&killer| killer == candidate) {
-                Some(rank) => KILLER_SCORES[rank],
-                None => {
-                    history.quiet_score(candidate, moved_piece(board, candidate), continuations)
-                }
-            }
-        })
-    }
-
-    fn noisy(board: &Board, moves: MoveList, hash_move: Option<Move>, history: &History) -> Self {
-        Self::scored(moves, |candidate| {
-            if Some(candidate) == hash_move {
-                return HASH_MOVE_SCORE;
-            }
-            noisy_score(board, candidate, history)
-        })
-    }
-
-    fn scored(moves: MoveList, score: impl Fn(Move) -> i32) -> Self {
-        let mut scores = [0; MAX_MOVES];
-        for (slot, &candidate) in scores.iter_mut().zip(moves.as_slice()) {
-            *slot = score(candidate);
-        }
-        Self {
-            moves,
-            scores,
-            next: 0,
-        }
-    }
-}
-
-impl Iterator for MovePicker {
-    type Item = Move;
-
-    fn next(&mut self) -> Option<Move> {
-        let moves = self.moves.as_mut_slice();
-        let remaining = self.next..moves.len();
-        let best = remaining.max_by_key(|&index| self.scores[index])?;
-        moves.swap(self.next, best);
-        self.scores.swap(self.next, best);
-        self.next += 1;
-        Some(moves[self.next - 1])
-    }
-}
-
-fn is_noisy(candidate: Move) -> bool {
-    candidate.is_capture() || candidate.is_promotion()
-}
-
-fn moved_piece(board: &Board, candidate: Move) -> PieceTo {
-    PieceTo {
-        side: board.state.active_color,
-        piece: board
-            .piece_on(candidate.from())
-            .expect("piece on origin square"),
-        to: candidate.to(),
-    }
-}
-
-fn captured_piece(board: &Board, candidate: Move) -> Option<Piece> {
-    match candidate.kind() {
-        MoveKind::EnPassant => Some(Piece::Pawn),
-        _ if candidate.is_capture() => Some(
-            board
-                .piece_on(candidate.to())
-                .expect("piece on captured square"),
-        ),
-        _ => None,
-    }
-}
-
-fn noisy_score(board: &Board, candidate: Move, history: &History) -> i32 {
-    let promotion = candidate.promotion().map_or(0, see_value);
-    let moved = moved_piece(board, candidate);
-    let victim = captured_piece(board, candidate);
-    let victim_attacker_score = victim.map_or(0, |victim| {
-        10 * see_value(victim) - attacker_rank(moved.piece)
-    });
-    promotion
-        + victim_attacker_score
-        + history.capture_score(moved, victim) / CAPTURE_HISTORY_ORDER_DIVISOR
-}
-
-fn attacker_rank(attacker: Piece) -> i32 {
-    match attacker {
-        Piece::King => 1_000,
-        other => see_value(other),
-    }
 }
 
 fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_share: f64) -> f64 {
@@ -557,17 +435,8 @@ impl Searcher {
             }
         }
 
-        let mut moves = MoveList::new();
-        board.generate_pseudo_legal(&mut moves);
         let continuations = self.continuations();
-        let picker = MovePicker::new(
-            board,
-            moves,
-            hash_move,
-            self.killers[self.ply],
-            &self.history,
-            &continuations,
-        );
+        let mut picker = MovePicker::new(hash_move, self.killers[self.ply]);
 
         let original_alpha = alpha;
         let mut best_score = -INFINITY;
@@ -577,19 +446,17 @@ impl Searcher {
         let mut tried_quiet_count = 0;
         let mut tried_noisy = [Move::NULL; TRACKED_NOISY];
         let mut tried_noisy_count = 0;
-        for candidate in picker {
+        while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
             let is_quiet = !is_noisy(candidate);
             if !is_root && !in_check && best_score > -MATE_BOUND {
                 if is_quiet {
-                    if !is_pv
+                    let late_move = !is_pv
                         && depth <= LATE_MOVE_PRUNING_DEPTH
-                        && legal_moves >= 3 + depth * depth
-                    {
-                        continue;
-                    }
-                    if depth <= FUTILITY_DEPTH
-                        && static_eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha
-                    {
+                        && legal_moves >= 3 + depth * depth;
+                    let futile = depth <= FUTILITY_DEPTH
+                        && static_eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha;
+                    if late_move || futile {
+                        picker.skip_quiets();
                         continue;
                     }
                 } else if depth <= NOISY_SEE_DEPTH
@@ -714,17 +581,8 @@ impl Searcher {
         let in_check = board.in_check();
         let mut unrefined_eval = None;
         let mut best_score = -INFINITY;
-        let mut moves = MoveList::new();
-        let picker = if in_check {
-            board.generate_pseudo_legal(&mut moves);
-            MovePicker::new(
-                board,
-                moves,
-                hash_move,
-                [Move::NULL; 2],
-                &self.history,
-                &self.continuations(),
-            )
+        let mut picker = if in_check {
+            MovePicker::new(hash_move, [Move::NULL; 2])
         } else {
             let eval = self.cached_static_evaluation(board, hit);
             unrefined_eval = Some(eval);
@@ -745,16 +603,13 @@ impl Searcher {
             }
             alpha = alpha.max(stand_pat);
             best_score = stand_pat;
-            board.generate_captures(&mut moves);
-            MovePicker::noisy(board, moves, hash_move, &self.history)
+            MovePicker::good_noisy_only(hash_move)
         };
 
+        let continuations = self.continuations();
         let mut best_move = Move::NULL;
         let mut legal_moves = 0;
-        for candidate in picker {
-            if !in_check && !board.see(candidate, 0) {
-                continue;
-            }
+        while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
             self.played[self.ply] = Some(moved_piece(board, candidate));
             if !board.make_move(candidate) {
                 continue;
