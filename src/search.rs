@@ -6,7 +6,7 @@ use crate::board::{Board, MAX_MOVES, MoveList, see_value};
 use crate::eval::evaluate;
 use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::strength::EvalNoise;
-use crate::tt::{Bound, Store, TranspositionTable};
+use crate::tt::{Bound, Hit, Store, TranspositionTable};
 use crate::types::{Color, Move, MoveKind, Piece, SQUARES};
 
 pub const INFINITY: i32 = 32_000;
@@ -16,6 +16,7 @@ pub const MAX_DEPTH: u8 = 64;
 
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 const TIME_CHECK_INTERVAL: u64 = 2048;
+const QUIESCENCE_DEPTH: u8 = 0;
 
 const HASH_MOVE_SCORE: i32 = 1_000_000;
 const GOOD_NOISY_SCORE: i32 = 200_000;
@@ -131,8 +132,13 @@ impl MovePicker {
         })
     }
 
-    fn noisy(board: &Board, moves: MoveList, history: &History) -> Self {
-        Self::scored(moves, |candidate| noisy_score(board, candidate, history))
+    fn noisy(board: &Board, moves: MoveList, hash_move: Option<Move>, history: &History) -> Self {
+        Self::scored(moves, |candidate| {
+            if Some(candidate) == hash_move {
+                return HASH_MOVE_SCORE;
+            }
+            noisy_score(board, candidate, history)
+        })
     }
 
     fn scored(moves: MoveList, score: impl Fn(Move) -> i32) -> Self {
@@ -293,6 +299,7 @@ impl Searcher {
         self.stopped = false;
         self.first_iteration_completed = false;
         self.root_move_nodes.fill([0; SQUARES]);
+        self.table.new_search();
 
         let max_depth = self.limits.depth.unwrap_or(MAX_DEPTH).clamp(1, MAX_DEPTH);
         let mut best = (Move::NULL, 0);
@@ -390,6 +397,11 @@ impl Searcher {
         evaluate(board) + self.eval_noise.offset(board.state.zobrist_key)
     }
 
+    fn cached_static_evaluation(&self, board: &Board, hit: Option<Hit>) -> i32 {
+        hit.and_then(|hit| hit.static_eval)
+            .unwrap_or_else(|| self.static_evaluation(board))
+    }
+
     fn update_pv(&mut self, best: Move) {
         let ply = self.ply;
         let child_len = self.pv_len[ply + 1].max(ply + 1);
@@ -479,11 +491,9 @@ impl Searcher {
         let hash_move = hit.and_then(|hit| hit.best_move);
 
         let us = board.state.active_color;
-        let static_eval = if in_check {
-            -INFINITY
-        } else {
-            self.static_evaluation(board)
-        };
+        let unrefined_eval = (!in_check).then(|| self.cached_static_evaluation(board, hit));
+        let static_eval =
+            unrefined_eval.map_or(-INFINITY, |eval| hit.map_or(eval, |hit| hit.refine(eval)));
         let prunable = !is_pv && !in_check;
 
         if prunable
@@ -643,6 +653,7 @@ impl Searcher {
             key,
             best_move,
             score,
+            static_eval: unrefined_eval,
             depth: table_depth,
             bound,
             ply: self.ply,
@@ -658,7 +669,18 @@ impl Searcher {
         if self.ply >= MAX_PLY - 1 {
             return self.static_evaluation(board);
         }
+        let is_pv = beta - alpha > 1;
+        let key = board.state.zobrist_key;
+        let hit = self.table.probe(key, self.ply);
+        if let Some(score) = hit
+            .filter(|_| !is_pv)
+            .and_then(|hit| hit.cutoff_score(QUIESCENCE_DEPTH, alpha, beta))
+        {
+            return score;
+        }
+        let hash_move = hit.and_then(|hit| hit.best_move);
         let in_check = board.in_check();
+        let mut unrefined_eval = None;
         let mut best_score = -INFINITY;
         let mut moves = MoveList::new();
         let picker = if in_check {
@@ -666,22 +688,36 @@ impl Searcher {
             MovePicker::new(
                 board,
                 moves,
-                None,
+                hash_move,
                 [Move::NULL; 2],
                 &self.history,
                 &self.continuations(),
             )
         } else {
-            let stand_pat = self.static_evaluation(board);
+            let eval = self.cached_static_evaluation(board, hit);
+            unrefined_eval = Some(eval);
+            let stand_pat = hit.map_or(eval, |hit| hit.refine(eval));
             if stand_pat >= beta {
+                if hit.is_none() {
+                    self.table.store(Store {
+                        key,
+                        best_move: Move::NULL,
+                        score: stand_pat,
+                        static_eval: unrefined_eval,
+                        depth: QUIESCENCE_DEPTH,
+                        bound: Bound::Lower,
+                        ply: self.ply,
+                    });
+                }
                 return stand_pat;
             }
             alpha = alpha.max(stand_pat);
             best_score = stand_pat;
             board.generate_captures(&mut moves);
-            MovePicker::noisy(board, moves, &self.history)
+            MovePicker::noisy(board, moves, hash_move, &self.history)
         };
 
+        let mut best_move = Move::NULL;
         let mut legal_moves = 0;
         for candidate in picker {
             if !in_check && !board.see(candidate, 0) {
@@ -702,6 +738,7 @@ impl Searcher {
             best_score = best_score.max(score);
             if score > alpha {
                 alpha = score;
+                best_move = candidate;
                 if alpha >= beta {
                     break;
                 }
@@ -710,6 +747,19 @@ impl Searcher {
         if in_check && legal_moves == 0 {
             return -MATE + self.ply as i32;
         }
+        self.table.store(Store {
+            key,
+            best_move,
+            score: best_score,
+            static_eval: unrefined_eval,
+            depth: QUIESCENCE_DEPTH,
+            bound: if best_score >= beta {
+                Bound::Lower
+            } else {
+                Bound::Upper
+            },
+            ply: self.ply,
+        });
         best_score
     }
 }
