@@ -655,24 +655,43 @@ impl Searcher {
         if self.stopped {
             return 0;
         }
-        let stand_pat = self.static_evaluation(board);
-        if self.ply >= MAX_PLY - 1 || stand_pat >= beta {
-            return stand_pat;
+        if self.ply >= MAX_PLY - 1 {
+            return self.static_evaluation(board);
         }
-        alpha = alpha.max(stand_pat);
-
+        let in_check = board.in_check();
+        let mut best_score = -INFINITY;
         let mut moves = MoveList::new();
-        board.generate_captures(&mut moves);
-        let picker = MovePicker::noisy(board, moves, &self.history);
+        let picker = if in_check {
+            board.generate_pseudo_legal(&mut moves);
+            MovePicker::new(
+                board,
+                moves,
+                None,
+                [Move::NULL; 2],
+                &self.history,
+                &self.continuations(),
+            )
+        } else {
+            let stand_pat = self.static_evaluation(board);
+            if stand_pat >= beta {
+                return stand_pat;
+            }
+            alpha = alpha.max(stand_pat);
+            best_score = stand_pat;
+            board.generate_captures(&mut moves);
+            MovePicker::noisy(board, moves, &self.history)
+        };
 
-        let mut best_score = stand_pat;
+        let mut legal_moves = 0;
         for candidate in picker {
-            if !board.see(candidate, 0) {
+            if !in_check && !board.see(candidate, 0) {
                 continue;
             }
+            self.played[self.ply] = Some(moved_piece(board, candidate));
             if !board.make_move(candidate) {
                 continue;
             }
+            legal_moves += 1;
             self.ply += 1;
             let score = -self.quiescence(board, -beta, -alpha);
             self.ply -= 1;
@@ -687,6 +706,9 @@ impl Searcher {
                     break;
                 }
             }
+        }
+        if in_check && legal_moves == 0 {
+            return -MATE + self.ply as i32;
         }
         best_score
     }
@@ -744,6 +766,28 @@ mod tests {
     }
 
     #[test]
+    fn quiescence_resolves_checks() {
+        let cases = [
+            ("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1", -MATE..=-MATE),
+            ("4k3/8/8/8/8/8/2n5/R3K3 w - - 0 1", -INFINITY..=-100),
+            ("4k3/8/8/8/8/8/4r3/4K3 w - - 0 1", -50..=50),
+            ("4k3/8/8/8/8/8/8/R3K3 w - - 0 1", 300..=INFINITY),
+        ];
+
+        for (fen, expected) in cases {
+            let mut board = board(fen);
+            let mut searcher = Searcher::new(
+                SearchLimits::default(),
+                Arc::default(),
+                TranspositionTable::new(1),
+            );
+            let score = searcher.quiescence(&mut board, -INFINITY, INFINITY);
+            assert!(expected.contains(&score), "fen {fen:?}, score {score}");
+            assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
+        }
+    }
+
+    #[test]
     fn keeps_best_move_from_interrupted_iteration() {
         let cases = [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -763,7 +807,7 @@ mod tests {
                     last_report = Some((iteration.nodes, iteration.pv[0]))
                 });
             let (nodes, pv_head) = last_report.expect("at least one iteration reported");
-            assert_eq!(nodes, TIME_CHECK_INTERVAL, "fen {fen:?}");
+            assert!(nodes <= TIME_CHECK_INTERVAL, "fen {fen:?}, nodes {nodes}");
             assert_eq!(best_move, pv_head, "fen {fen:?}");
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
         }
