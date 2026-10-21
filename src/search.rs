@@ -83,7 +83,11 @@ pub struct Searcher {
     limits: SearchLimits,
     table: TranspositionTable,
     stop_signal: Arc<AtomicBool>,
+    ponder_signal: Arc<AtomicBool>,
+    pondering: bool,
     start: Instant,
+    clock_start: Instant,
+    ponder_move: Option<Move>,
     nodes: u64,
     ply: usize,
     stopped: bool,
@@ -118,16 +122,22 @@ fn late_move_reduction(depth: i32, move_number: usize) -> i32 {
     REDUCTIONS[depth][move_number.min(REDUCTION_TABLE_SIZE - 1)]
 }
 
+fn is_legal(board: &mut Board, candidate: Move) -> bool {
+    let legal = board.make_move(candidate);
+    if legal {
+        board.unmake_move();
+    }
+    legal
+}
+
 fn first_legal_move(board: &mut Board) -> Option<Move> {
     let mut moves = MoveList::new();
     board.generate_pseudo_legal(&mut moves);
-    moves.as_slice().iter().copied().find(|&candidate| {
-        let legal = board.make_move(candidate);
-        if legal {
-            board.unmake_move();
-        }
-        legal
-    })
+    moves
+        .as_slice()
+        .iter()
+        .copied()
+        .find(|&candidate| is_legal(board, candidate))
 }
 
 pub fn is_mate_score(score: i32) -> bool {
@@ -157,7 +167,11 @@ impl Searcher {
             limits,
             table,
             stop_signal,
+            ponder_signal: Arc::default(),
+            pondering: false,
             start: Instant::now(),
+            clock_start: Instant::now(),
+            ponder_move: None,
             nodes: 0,
             ply: 0,
             stopped: false,
@@ -178,8 +192,16 @@ impl Searcher {
         self
     }
 
+    pub fn with_ponder_signal(mut self, ponder_signal: Arc<AtomicBool>) -> Self {
+        self.ponder_signal = ponder_signal;
+        self
+    }
+
     pub fn search(&mut self, board: &mut Board, mut report: impl FnMut(&Iteration)) -> (Move, i32) {
         self.start = Instant::now();
+        self.clock_start = self.start;
+        self.pondering = self.ponder_signal.load(Ordering::Acquire);
+        self.ponder_move = None;
         self.nodes = 0;
         self.ply = 0;
         self.stopped = false;
@@ -199,6 +221,7 @@ impl Searcher {
             let pv = &self.pv[0][..self.pv_len[0]];
             let previous = best;
             best = (pv.first().copied().unwrap_or(Move::NULL), score);
+            self.ponder_move = pv.get(1).copied();
             stable_iterations = if best.0 == previous.0 {
                 stable_iterations + 1
             } else {
@@ -231,7 +254,27 @@ impl Searcher {
         if best.0 == Move::NULL {
             best.0 = first_legal_move(board).unwrap_or(Move::NULL);
         }
+        if self.ponder_move.is_none() && best.0 != Move::NULL {
+            self.ponder_move = self.table_reply(board, best.0);
+        }
         best
+    }
+
+    pub fn ponder_move(&self) -> Option<Move> {
+        self.ponder_move
+    }
+
+    fn table_reply(&self, board: &mut Board, played: Move) -> Option<Move> {
+        if !board.make_move(played) {
+            return None;
+        }
+        let reply = self
+            .table
+            .probe(board.state.zobrist_key, 0)
+            .and_then(|hit| hit.best_move)
+            .filter(|&reply| board.is_pseudo_legal(reply) && is_legal(board, reply));
+        board.unmake_move();
+        reply
     }
 
     pub fn with_history(mut self, history: History) -> Self {
@@ -269,10 +312,20 @@ impl Searcher {
         }
     }
 
-    fn soft_time_expired(&self, scale: f64) -> bool {
-        self.limits
-            .soft_time
-            .is_some_and(|budget| self.start.elapsed() >= budget.mul_f64(scale))
+    fn clock_running(&mut self) -> bool {
+        if self.pondering && !self.ponder_signal.load(Ordering::Relaxed) {
+            self.pondering = false;
+            self.clock_start = Instant::now();
+        }
+        !self.pondering
+    }
+
+    fn soft_time_expired(&mut self, scale: f64) -> bool {
+        self.clock_running()
+            && self
+                .limits
+                .soft_time
+                .is_some_and(|budget| self.clock_start.elapsed() >= budget.mul_f64(scale))
     }
 
     fn best_move_node_share(&self, best_move: Move) -> f64 {
@@ -284,12 +337,13 @@ impl Searcher {
         best_move_nodes as f64 / self.nodes as f64
     }
 
-    fn hard_limit_reached(&self) -> bool {
+    fn hard_limit_reached(&mut self) -> bool {
         self.stop_signal.load(Ordering::Relaxed)
-            || self
-                .limits
-                .time
-                .is_some_and(|budget| self.start.elapsed() >= budget)
+            || (self.clock_running()
+                && self
+                    .limits
+                    .time
+                    .is_some_and(|budget| self.clock_start.elapsed() >= budget))
     }
 
     fn node_limit_reached(&self) -> bool {
@@ -833,6 +887,41 @@ mod tests {
             assert!(nodes <= TIME_CHECK_INTERVAL, "fen {fen:?}, nodes {nodes}");
             assert_eq!(best_move, pv_head, "fen {fen:?}");
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
+        }
+    }
+
+    #[test]
+    fn ignores_clock_while_pondering() {
+        let cases = [
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                5,
+            ),
+            (
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                4,
+            ),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 6),
+        ];
+
+        for (fen, depth) in cases {
+            let mut board = board(fen);
+            let limits = SearchLimits {
+                depth: Some(depth),
+                time: Some(Duration::ZERO),
+                soft_time: Some(Duration::ZERO),
+                ..SearchLimits::default()
+            };
+            let mut last_depth = 0;
+            let mut searcher = Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+                .with_ponder_signal(Arc::new(AtomicBool::new(true)));
+            let (best_move, _) =
+                searcher.search(&mut board, |iteration| last_depth = iteration.depth);
+            assert_eq!(last_depth, depth, "fen {fen:?}");
+            let reply = searcher.ponder_move().expect("ponder move found");
+            assert!(board.make_move(best_move), "fen {fen:?}");
+            assert!(board.is_pseudo_legal(reply), "fen {fen:?}, reply {reply}");
+            assert!(board.make_move(reply), "fen {fen:?}, reply {reply}");
         }
     }
 

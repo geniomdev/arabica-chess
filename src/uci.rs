@@ -48,6 +48,7 @@ struct Engine {
     table: TranspositionTable,
     history: History,
     move_overhead: Duration,
+    ponder: bool,
     limit_strength: bool,
     elo: u32,
     noise_seed: u64,
@@ -61,6 +62,7 @@ impl Engine {
             table: TranspositionTable::new(DEFAULT_HASH_MB),
             history: History::default(),
             move_overhead: DEFAULT_MOVE_OVERHEAD,
+            ponder: false,
             limit_strength: false,
             elo: DEFAULT_ELO,
             noise_seed: fresh_noise_seed(),
@@ -84,6 +86,7 @@ impl Engine {
                     "option name Move Overhead type spin default {} min 0 max {MAX_MOVE_OVERHEAD_MS}",
                     DEFAULT_MOVE_OVERHEAD.as_millis()
                 );
+                println!("option name Ponder type check default false");
                 println!("option name UCI_LimitStrength type check default false");
                 println!(
                     "option name UCI_Elo type spin default {DEFAULT_ELO} min {MIN_ELO} max {MAX_ELO}"
@@ -105,6 +108,7 @@ impl Engine {
                         self.table = TranspositionTable::new(megabytes);
                     }
                     Some(EngineOption::MoveOverhead(overhead)) => self.move_overhead = overhead,
+                    Some(EngineOption::Ponder(enabled)) => self.ponder = enabled,
                     Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
                     Some(EngineOption::Elo(elo)) => self.elo = elo,
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
@@ -124,6 +128,11 @@ impl Engine {
             ["bench", arguments @ ..] => {
                 self.stop_search();
                 bench::run(arguments);
+            }
+            ["ponderhit", ..] => {
+                if let Some(search) = &self.search {
+                    search.ponder_hit();
+                }
             }
             ["stop", ..] => self.stop_search(),
             ["d", ..] => println!(
@@ -162,7 +171,11 @@ impl Engine {
             eval_noise,
             mem::take(&mut self.table),
             mem::take(&mut self.history),
-            params.infinite,
+            SearchMode {
+                infinite: params.infinite,
+                pondering: params.ponder,
+                announce_ponder_move: self.ponder,
+            },
         ));
     }
 
@@ -173,8 +186,15 @@ impl Engine {
     }
 }
 
+struct SearchMode {
+    infinite: bool,
+    pondering: bool,
+    announce_ponder_move: bool,
+}
+
 struct RunningSearch {
     stop_signal: Arc<AtomicBool>,
+    ponder_signal: Arc<AtomicBool>,
     thread: JoinHandle<(TranspositionTable, History)>,
 }
 
@@ -185,27 +205,39 @@ impl RunningSearch {
         eval_noise: EvalNoise,
         table: TranspositionTable,
         history: History,
-        hold_until_stopped: bool,
+        mode: SearchMode,
     ) -> Self {
         let stop_signal = Arc::new(AtomicBool::new(false));
-        let searcher_signal = Arc::clone(&stop_signal);
+        let ponder_signal = Arc::new(AtomicBool::new(mode.pondering));
+        let searcher_stop = Arc::clone(&stop_signal);
+        let searcher_ponder = Arc::clone(&ponder_signal);
         let thread = thread::spawn(move || {
-            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_signal), table)
+            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_stop), table)
+                .with_ponder_signal(Arc::clone(&searcher_ponder))
                 .with_eval_noise(eval_noise)
                 .with_history(history);
             let (best_move, _) = searcher.search(&mut board, print_iteration);
-            if hold_until_stopped {
-                while !searcher_signal.load(Ordering::Acquire) {
-                    thread::park();
-                }
+            while !searcher_stop.load(Ordering::Acquire)
+                && (mode.infinite || searcher_ponder.load(Ordering::Acquire))
+            {
+                thread::park();
             }
-            println!("bestmove {best_move}");
+            match searcher.ponder_move().filter(|_| mode.announce_ponder_move) {
+                Some(reply) => println!("bestmove {best_move} ponder {reply}"),
+                None => println!("bestmove {best_move}"),
+            }
             searcher.into_parts()
         });
         Self {
             stop_signal,
+            ponder_signal,
             thread,
         }
+    }
+
+    fn ponder_hit(&self) {
+        self.ponder_signal.store(false, Ordering::Release);
+        self.thread.thread().unpark();
     }
 
     fn stop(self) -> (TranspositionTable, History) {
@@ -312,6 +344,7 @@ struct GoParams {
     moves_to_go: Option<u32>,
     nodes: Option<u64>,
     infinite: bool,
+    ponder: bool,
     perft: Option<u32>,
 }
 
@@ -367,6 +400,7 @@ fn clock_budget(
 enum EngineOption {
     Hash(usize),
     MoveOverhead(Duration),
+    Ponder(bool),
     LimitStrength(bool),
     Elo(u32),
 }
@@ -386,11 +420,8 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
             let overhead = Duration::from_millis(millis.min(MAX_MOVE_OVERHEAD_MS));
             Some(EngineOption::MoveOverhead(overhead))
         }
-        "uci_limitstrength" => value
-            .to_ascii_lowercase()
-            .parse()
-            .ok()
-            .map(EngineOption::LimitStrength),
+        "ponder" => parse_check(value).map(EngineOption::Ponder),
+        "uci_limitstrength" => parse_check(value).map(EngineOption::LimitStrength),
         "uci_elo" => {
             let elo: u32 = value.parse().ok()?;
             Some(EngineOption::Elo(elo.clamp(MIN_ELO, MAX_ELO)))
@@ -399,12 +430,17 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
     }
 }
 
+fn parse_check(value: &str) -> Option<bool> {
+    value.to_ascii_lowercase().parse().ok()
+}
+
 fn parse_go(arguments: &[&str]) -> GoParams {
     let mut params = GoParams::default();
     let mut tokens = arguments.iter().copied();
     while let Some(key) = tokens.next() {
         match key {
             "infinite" => params.infinite = true,
+            "ponder" => params.ponder = true,
             "depth" => params.depth = next_number(&mut tokens),
             "movetime" => params.move_time = next_millis(&mut tokens),
             "wtime" => params.remaining[Color::White] = next_millis(&mut tokens),
@@ -537,6 +573,15 @@ mod tests {
                 "depth deep movetime 500 ponder",
                 GoParams {
                     move_time: millis(500),
+                    ponder: true,
+                    ..GoParams::default()
+                },
+            ),
+            (
+                "ponder wtime 1000 btime 2000",
+                GoParams {
+                    remaining: per_side(Some(1000), Some(2000)),
+                    ponder: true,
                     ..GoParams::default()
                 },
             ),
@@ -580,6 +625,9 @@ mod tests {
             ),
             ("name Move Overhead value -5", None),
             ("name Overhead value 10", None),
+            ("name Ponder value true", Some(EngineOption::Ponder(true))),
+            ("name ponder value FALSE", Some(EngineOption::Ponder(false))),
+            ("name Ponder value 1", None),
             (
                 "name UCI_LimitStrength value true",
                 Some(EngineOption::LimitStrength(true)),

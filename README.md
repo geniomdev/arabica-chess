@@ -14,6 +14,7 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, 
 - `isready` - readyok
 - `setoption name Hash value <mb>` - resizes the transposition table (1-4096 MB, default 16)
 - `setoption name Move Overhead value <ms>` - time reserved per move for GUI and network latency (0-5000 ms, default 50)
+- `setoption name Ponder value <true|false>` - appends the expected reply to `bestmove` as `ponder <move>` (default false)
 - `setoption name UCI_LimitStrength value <true|false>` - plays at the strength set by `UCI_Elo` (default false)
 - `setoption name UCI_Elo value <elo>` - target strength when `UCI_LimitStrength` is on (600-3000, default 1500); weakened by a per-move node limit and deterministic Zobrist-keyed noise in the static evaluation, both interpolated from Elo anchors in `src/strength.rs`
 - `position startpos \| fen <fen> [moves ...]` - sets up the position
@@ -25,6 +26,8 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, 
 - `go nodes 5000` - stops the search after 5000 nodes (the first iteration always completes)
 - `go perft <depth>` - perft divide and the total node count
 - `bench [depth]` - searches the Stockfish bench positions to a fixed depth (default 13) and prints total nodes and nps
+- `go ponder ...` - searches on the opponent's time with the clock paused and holds `bestmove` until `ponderhit` or `stop`
+- `ponderhit` - the expected reply was played: the clock starts now and the ongoing search continues under the usual time limits
 - `stop` - stops the search
 - `quit` - stops the search and exits
 
