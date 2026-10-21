@@ -84,9 +84,9 @@ struct Bucket([Entry; BUCKET_SIZE]);
 pub struct Hit {
     pub best_move: Option<Move>,
     pub static_eval: Option<i32>,
-    score: i32,
-    depth: u8,
-    bound: Bound,
+    pub score: i32,
+    pub depth: u8,
+    pub bound: Bound,
 }
 
 impl Hit {

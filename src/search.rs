@@ -19,13 +19,13 @@ pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 const TIME_CHECK_INTERVAL: u64 = 2048;
 const QUIESCENCE_DEPTH: u8 = 0;
 const QUIESCENCE_FUTILITY_MARGIN: i32 = 200;
-const QUIESCENCE_MOVE_LIMIT: usize = 3;
 
 const TRACKED_QUIETS: usize = 64;
 const TRACKED_NOISY: usize = 32;
 
 const REVERSE_FUTILITY_DEPTH: i32 = 8;
 const REVERSE_FUTILITY_MARGIN: i32 = 80;
+const REVERSE_FUTILITY_IMPROVING_MARGIN: i32 = 40;
 const NULL_MOVE_DEPTH: i32 = 3;
 const LATE_MOVE_PRUNING_DEPTH: i32 = 8;
 const FUTILITY_DEPTH: i32 = 6;
@@ -36,6 +36,19 @@ const NOISY_SEE_MARGIN: i32 = 100;
 const REDUCTION_DEPTH: i32 = 3;
 const REDUCTION_HISTORY_DIVISOR: i32 = 16_384;
 const REDUCTION_TABLE_SIZE: usize = 64;
+const INTERNAL_REDUCTION_DEPTH: i32 = 4;
+const SINGULAR_DEPTH: i32 = 8;
+const SINGULAR_TABLE_DEPTH_MARGIN: i32 = 3;
+const SINGULAR_BETA_MARGIN: i32 = 2;
+const PROBCUT_DEPTH: i32 = 5;
+const PROBCUT_MARGIN: i32 = 200;
+const PROBCUT_REDUCTION: i32 = 4;
+const HISTORY_PRUNING_DEPTH: i32 = 4;
+const HISTORY_PRUNING_MARGIN: i32 = 2_048;
+const QUIET_SEE_DEPTH: i32 = 8;
+const QUIET_SEE_MARGIN: i32 = 60;
+const PAWN_KEY_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+const BLACK_PAWNS_ROTATION: u32 = 29;
 
 const ASPIRATION_DEPTH: i32 = 4;
 const ASPIRATION_WINDOW: i32 = 25;
@@ -95,6 +108,8 @@ pub struct Searcher {
     eval_noise: EvalNoise,
     pv: [[Move; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
+    eval_stack: [i32; MAX_PLY],
+    excluded: [Move; MAX_PLY],
     killers: [[Move; 2]; MAX_PLY],
     history: History,
     pawn_cache: PawnCache,
@@ -115,6 +130,12 @@ fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_sha
 fn has_non_pawn_material(board: &Board, side: Color) -> bool {
     let pawns_and_kings = board.pieces(Piece::Pawn) | board.pieces(Piece::King);
     !(board.occupied_by(side) & !pawns_and_kings).is_empty()
+}
+
+fn pawn_key(board: &Board) -> u64 {
+    let white = board.pieces_of(Color::White, Piece::Pawn).0;
+    let black = board.pieces_of(Color::Black, Piece::Pawn).0;
+    (white ^ black.rotate_left(BLACK_PAWNS_ROTATION)).wrapping_mul(PAWN_KEY_MULTIPLIER)
 }
 
 fn late_move_reduction(depth: i32, move_number: usize) -> i32 {
@@ -179,6 +200,8 @@ impl Searcher {
             eval_noise: EvalNoise::default(),
             pv: [[Move::NULL; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
+            eval_stack: [-INFINITY; MAX_PLY],
+            excluded: [Move::NULL; MAX_PLY],
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: History::default(),
             pawn_cache: PawnCache::default(),
@@ -368,6 +391,24 @@ impl Searcher {
             .unwrap_or_else(|| self.static_evaluation(board))
     }
 
+    fn corrected_evaluation(&self, board: &Board, raw_eval: i32) -> i32 {
+        self.history
+            .corrected_eval(board.state.active_color, pawn_key(board), raw_eval)
+            .clamp(-MATE_BOUND + 1, MATE_BOUND - 1)
+    }
+
+    fn improving(&self, corrected_eval: Option<i32>) -> bool {
+        let Some(eval) = corrected_eval else {
+            return false;
+        };
+        [2, 4]
+            .into_iter()
+            .filter_map(|plies_back| self.ply.checked_sub(plies_back))
+            .map(|ply| self.eval_stack[ply])
+            .find(|&previous| previous != -INFINITY)
+            .is_none_or(|previous| eval > previous)
+    }
+
     fn update_pv(&mut self, best: Move) {
         let ply = self.ply;
         let child_len = self.pv_len[ply + 1].max(ply + 1);
@@ -424,6 +465,69 @@ impl Searcher {
         }
     }
 
+    fn probcut(
+        &mut self,
+        board: &mut Board,
+        hash_move: Option<Move>,
+        probcut_beta: i32,
+        static_eval: i32,
+        depth: i32,
+    ) -> Option<(Move, i32)> {
+        let continuations = self.continuations();
+        let mut picker = MovePicker::good_noisy_only(hash_move);
+        while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
+            if !board.see(candidate, probcut_beta - static_eval) {
+                continue;
+            }
+            self.played[self.ply] = Some(moved_piece(board, candidate));
+            if !board.make_move(candidate) {
+                continue;
+            }
+            self.ply += 1;
+            let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1);
+            if score >= probcut_beta {
+                score = -self.negamax(
+                    board,
+                    depth - PROBCUT_REDUCTION - 1,
+                    -probcut_beta,
+                    -probcut_beta + 1,
+                );
+            }
+            self.ply -= 1;
+            board.unmake_move();
+            if self.stopped {
+                return None;
+            }
+            if score >= probcut_beta {
+                return Some((candidate, score));
+            }
+        }
+        None
+    }
+
+    fn singular_extension(
+        &mut self,
+        board: &mut Board,
+        candidate: Move,
+        hit: Hit,
+        depth: i32,
+        beta: i32,
+    ) -> Result<i32, i32> {
+        let singular_beta = hit.score - SINGULAR_BETA_MARGIN * depth;
+        self.excluded[self.ply] = candidate;
+        let score = self.negamax(board, (depth - 1) / 2, singular_beta - 1, singular_beta);
+        self.excluded[self.ply] = Move::NULL;
+        if score < singular_beta {
+            Ok(1)
+        } else if singular_beta >= beta {
+            Err(singular_beta)
+        } else if hit.score >= beta {
+            Ok(-1)
+        } else {
+            Ok(0)
+        }
+    }
+
     fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32) -> i32 {
         self.pv_len[self.ply] = self.ply;
         let is_root = self.ply == 0;
@@ -435,7 +539,7 @@ impl Searcher {
             return self.static_evaluation(board);
         }
         let in_check = board.in_check();
-        let depth = if in_check { depth + 1 } else { depth };
+        let mut depth = if in_check { depth + 1 } else { depth };
         if depth <= 0 {
             return self.quiescence(board, alpha, beta);
         }
@@ -444,30 +548,41 @@ impl Searcher {
             return 0;
         }
         self.killers[self.ply + 1] = [Move::NULL; 2];
+        let excluded = self.excluded[self.ply];
+        let singular_search = excluded != Move::NULL;
 
         let key = board.state.zobrist_key;
         let hit = self.table.probe(key, self.ply);
-        let table_depth = depth.min(i32::from(u8::MAX)) as u8;
+        let probe_depth = depth.min(i32::from(u8::MAX)) as u8;
         if let Some(score) = hit
-            .filter(|_| !is_pv)
-            .and_then(|hit| hit.cutoff_score(table_depth, alpha, beta))
+            .filter(|_| !is_pv && !singular_search)
+            .and_then(|hit| hit.cutoff_score(probe_depth, alpha, beta))
         {
             return score;
         }
         let hash_move = hit.and_then(|hit| hit.best_move);
+        if depth >= INTERNAL_REDUCTION_DEPTH && hash_move.is_none() {
+            depth -= 1;
+        }
+        let table_depth = depth.min(i32::from(u8::MAX)) as u8;
 
         let us = board.state.active_color;
         let unrefined_eval = (!in_check).then(|| self.cached_static_evaluation(board, hit));
+        let corrected_eval = unrefined_eval.map(|eval| self.corrected_evaluation(board, eval));
         let static_eval =
-            unrefined_eval.map_or(-INFINITY, |eval| hit.map_or(eval, |hit| hit.refine(eval)));
-        let prunable = !is_pv && !in_check;
+            corrected_eval.map_or(-INFINITY, |eval| hit.map_or(eval, |hit| hit.refine(eval)));
+        self.eval_stack[self.ply] = corrected_eval.unwrap_or(-INFINITY);
+        let improving = self.improving(corrected_eval);
+        let prunable = !is_pv && !in_check && !singular_search;
 
         if prunable
             && depth <= REVERSE_FUTILITY_DEPTH
             && !is_mate_score(beta)
-            && static_eval - REVERSE_FUTILITY_MARGIN * depth >= beta
+            && static_eval - REVERSE_FUTILITY_MARGIN * depth
+                + REVERSE_FUTILITY_IMPROVING_MARGIN * i32::from(improving)
+                >= beta
         {
-            return static_eval;
+            return (static_eval + beta) / 2;
         }
 
         if prunable
@@ -491,8 +606,37 @@ impl Searcher {
             }
         }
 
+        let probcut_beta = beta + PROBCUT_MARGIN;
+        let probcut_depth = depth - PROBCUT_REDUCTION + 1;
+        if prunable
+            && depth >= PROBCUT_DEPTH
+            && !is_mate_score(beta)
+            && !hit.is_some_and(|hit| {
+                i32::from(hit.depth) >= probcut_depth && hit.score < probcut_beta
+            })
+        {
+            if let Some((best_move, score)) =
+                self.probcut(board, hash_move, probcut_beta, static_eval, depth)
+            {
+                self.table.store(Store {
+                    key,
+                    best_move,
+                    score,
+                    static_eval: unrefined_eval,
+                    depth: probcut_depth as u8,
+                    bound: Bound::Lower,
+                    ply: self.ply,
+                });
+                return score;
+            }
+            if self.stopped {
+                return 0;
+            }
+        }
+
         let continuations = self.continuations();
         let mut picker = MovePicker::new(hash_move, self.killers[self.ply]);
+        let hash_move_is_noisy = hash_move.is_some_and(is_noisy);
 
         let original_alpha = alpha;
         let mut best_score = -INFINITY;
@@ -503,16 +647,35 @@ impl Searcher {
         let mut tried_noisy = [Move::NULL; TRACKED_NOISY];
         let mut tried_noisy_count = 0;
         while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
+            if candidate == excluded {
+                continue;
+            }
             let is_quiet = !is_noisy(candidate);
+            let moved = moved_piece(board, candidate);
+            let move_history = if is_quiet {
+                self.history.quiet_score(candidate, moved, &continuations)
+            } else {
+                self.history
+                    .capture_score(moved, captured_piece(board, candidate))
+            };
             if !is_root && !in_check && best_score > -MATE_BOUND {
                 if is_quiet {
                     let late_move = !is_pv
                         && depth <= LATE_MOVE_PRUNING_DEPTH
-                        && legal_moves >= 3 + depth * depth;
+                        && legal_moves >= (3 + depth * depth) / (2 - i32::from(improving));
                     let futile = depth <= FUTILITY_DEPTH
                         && static_eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha;
                     if late_move || futile {
                         picker.skip_quiets();
+                        continue;
+                    }
+                    if depth <= HISTORY_PRUNING_DEPTH
+                        && move_history < -HISTORY_PRUNING_MARGIN * depth
+                    {
+                        continue;
+                    }
+                    if depth <= QUIET_SEE_DEPTH && !board.see(candidate, -QUIET_SEE_MARGIN * depth)
+                    {
                         continue;
                     }
                 } else if depth <= NOISY_SEE_DEPTH
@@ -521,20 +684,32 @@ impl Searcher {
                     continue;
                 }
             }
+
+            let mut extension = 0;
+            if let Some(hit) = hit
+                && !is_root
+                && !singular_search
+                && depth >= SINGULAR_DEPTH
+                && Some(candidate) == hash_move
+                && hit.bound != Bound::Upper
+                && i32::from(hit.depth) >= depth - SINGULAR_TABLE_DEPTH_MARGIN
+                && !is_mate_score(hit.score)
+            {
+                match self.singular_extension(board, candidate, hit, depth, beta) {
+                    _ if self.stopped => return 0,
+                    Ok(singular_extension) => extension = singular_extension,
+                    Err(multi_cut_score) => return multi_cut_score,
+                }
+            }
+
             let nodes_before = self.nodes;
-            let moved = moved_piece(board, candidate);
-            let quiet_history = if is_quiet {
-                self.history.quiet_score(candidate, moved, &continuations)
-            } else {
-                0
-            };
             self.played[self.ply] = Some(moved);
             if !board.make_move(candidate) {
                 continue;
             }
             legal_moves += 1;
             self.ply += 1;
-            let new_depth = depth - 1;
+            let new_depth = depth - 1 + extension;
             let score = if legal_moves == 1 {
                 -self.negamax(board, new_depth, -beta, -alpha)
             } else {
@@ -544,8 +719,10 @@ impl Searcher {
                     reduction = late_move_reduction(depth, legal_moves as usize);
                     reduction -= i32::from(is_pv);
                     reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
-                    reduction -= quiet_history / REDUCTION_HISTORY_DIVISOR;
-                    reduction = reduction.clamp(0, new_depth - 1);
+                    reduction += i32::from(!improving);
+                    reduction += i32::from(hash_move_is_noisy);
+                    reduction -= move_history / REDUCTION_HISTORY_DIVISOR;
+                    reduction = reduction.clamp(0, (new_depth - 1).max(0));
                 }
                 let mut score = -self.negamax(board, new_depth - reduction, -alpha - 1, -alpha);
                 if !self.stopped && score > alpha && reduction > 0 {
@@ -590,6 +767,9 @@ impl Searcher {
             }
         }
 
+        if singular_search {
+            return if legal_moves == 0 { alpha } else { best_score };
+        }
         let score = match legal_moves {
             0 if in_check => -MATE + self.ply as i32,
             0 => 0,
@@ -604,6 +784,18 @@ impl Searcher {
         } else {
             Bound::Exact
         };
+        if let (Some(raw_eval), Some(corrected_eval)) = (unrefined_eval, corrected_eval) {
+            let quiet_best = best_move == Move::NULL || !is_noisy(best_move);
+            let consistent = match bound {
+                Bound::Lower => score > corrected_eval,
+                Bound::Upper => score < corrected_eval,
+                Bound::Exact => true,
+            };
+            if quiet_best && consistent && !is_mate_score(score) {
+                self.history
+                    .update_correction(us, pawn_key(board), depth, score - raw_eval);
+            }
+        }
         self.table.store(Store {
             key,
             best_move,
@@ -642,7 +834,8 @@ impl Searcher {
         } else {
             let eval = self.cached_static_evaluation(board, hit);
             unrefined_eval = Some(eval);
-            let stand_pat = hit.map_or(eval, |hit| hit.refine(eval));
+            let corrected_eval = self.corrected_evaluation(board, eval);
+            let stand_pat = hit.map_or(corrected_eval, |hit| hit.refine(corrected_eval));
             if stand_pat >= beta {
                 if hit.is_none() {
                     self.table.store(Store {
@@ -668,9 +861,6 @@ impl Searcher {
         let mut legal_moves = 0;
         while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
             if !in_check && candidate.promotion().is_none() {
-                if legal_moves >= QUIESCENCE_MOVE_LIMIT {
-                    continue;
-                }
                 let victim_value = captured_piece(board, candidate).map_or(0, see_value);
                 if futility_base + victim_value <= alpha {
                     continue;

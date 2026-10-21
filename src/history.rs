@@ -6,6 +6,12 @@ const MAX_HISTORY: i32 = 16_384;
 const MAX_HISTORY_BONUS: i32 = 1_200;
 const PIECE_TO_SLOTS: usize = SIDES * PIECE_TYPES * SQUARES;
 const VICTIM_SLOTS: usize = PIECE_TYPES + 1;
+const CORRECTION_BITS: u32 = 14;
+const CORRECTION_SLOTS: usize = 1 << CORRECTION_BITS;
+const CORRECTION_GRAIN: i32 = 256;
+const CORRECTION_WEIGHT_SCALE: i32 = 256;
+const MAX_CORRECTION_WEIGHT: i32 = 16;
+const MAX_CORRECTION: i32 = 64 * CORRECTION_GRAIN;
 
 pub type Continuations = [Option<PieceTo>; CONTINUATION_PLIES];
 
@@ -26,6 +32,7 @@ pub struct History {
     butterfly: Vec<i32>,
     continuation: [Vec<i32>; CONTINUATION_PLIES],
     capture: Vec<i32>,
+    correction: Vec<i32>,
 }
 
 impl Default for History {
@@ -34,6 +41,7 @@ impl Default for History {
             butterfly: vec![0; SIDES * SQUARES * SQUARES],
             continuation: std::array::from_fn(|_| vec![0; PIECE_TO_SLOTS * PIECE_TO_SLOTS]),
             capture: vec![0; PIECE_TO_SLOTS * VICTIM_SLOTS],
+            correction: vec![0; SIDES * CORRECTION_SLOTS],
         }
     }
 }
@@ -58,6 +66,10 @@ fn capture_index(moved: PieceTo, victim: Option<Piece>) -> usize {
     moved.index() * VICTIM_SLOTS + victim.map_or(PIECE_TYPES, Piece::index)
 }
 
+fn correction_index(side: Color, pawn_key: u64) -> usize {
+    side.index() * CORRECTION_SLOTS + (pawn_key >> (u64::BITS - CORRECTION_BITS)) as usize
+}
+
 impl History {
     pub fn clear(&mut self) {
         self.butterfly.fill(0);
@@ -65,6 +77,7 @@ impl History {
             table.fill(0);
         }
         self.capture.fill(0);
+        self.correction.fill(0);
     }
 
     pub fn quiet_score(&self, quiet: Move, moved: PieceTo, continuations: &Continuations) -> i32 {
@@ -103,6 +116,18 @@ impl History {
 
     pub fn update_capture(&mut self, moved: PieceTo, victim: Option<Piece>, bonus: i32) {
         apply_gravity(&mut self.capture[capture_index(moved, victim)], bonus);
+    }
+
+    pub fn corrected_eval(&self, side: Color, pawn_key: u64, raw_eval: i32) -> i32 {
+        raw_eval + self.correction[correction_index(side, pawn_key)] / CORRECTION_GRAIN
+    }
+
+    pub fn update_correction(&mut self, side: Color, pawn_key: u64, depth: i32, error: i32) {
+        let weight = (depth + 1).min(MAX_CORRECTION_WEIGHT);
+        let entry = &mut self.correction[correction_index(side, pawn_key)];
+        let blended =
+            *entry * (CORRECTION_WEIGHT_SCALE - weight) + error * CORRECTION_GRAIN * weight;
+        *entry = (blended / CORRECTION_WEIGHT_SCALE).clamp(-MAX_CORRECTION, MAX_CORRECTION);
     }
 }
 
@@ -147,6 +172,30 @@ mod tests {
                 history.quiet_score(knight_move, KNIGHT_TO_F3, &probe_context),
                 expected,
                 "context {probe_context:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blends_eval_correction_toward_search_error() {
+        let pawn_key = 0xDEAD_BEEF_0123_4567;
+        let cases = [
+            (1, 15, 100, Color::White, 6..=6),
+            (1, 0, 100, Color::White, 0..=0),
+            (200, 15, 100, Color::White, 64..=64),
+            (200, 15, -30, Color::White, -30..=-29),
+            (200, 15, 100, Color::Black, 0..=0),
+        ];
+
+        for (repetitions, depth, error, probed_side, expected) in cases {
+            let mut history = History::default();
+            for _ in 0..repetitions {
+                history.update_correction(Color::White, pawn_key, depth, error);
+            }
+            let correction = history.corrected_eval(probed_side, pawn_key, 0);
+            assert!(
+                expected.contains(&correction),
+                "x{repetitions}, depth {depth}, error {error}, {probed_side:?}: {correction}"
             );
         }
     }
