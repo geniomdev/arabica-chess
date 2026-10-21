@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use crate::board::{Board, MoveList};
+use crate::board::{Board, MoveList, see_value};
 use crate::eval::{PawnCache, evaluate};
 use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::movepick::{MovePicker, captured_piece, is_noisy, moved_piece};
@@ -18,6 +18,8 @@ pub const MAX_DEPTH: u8 = 64;
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 const TIME_CHECK_INTERVAL: u64 = 2048;
 const QUIESCENCE_DEPTH: u8 = 0;
+const QUIESCENCE_FUTILITY_MARGIN: i32 = 200;
+const QUIESCENCE_MOVE_LIMIT: usize = 3;
 
 const TRACKED_QUIETS: usize = 64;
 const TRACKED_NOISY: usize = 32;
@@ -606,10 +608,23 @@ impl Searcher {
             MovePicker::good_noisy_only(hash_move)
         };
 
+        let futility_base = best_score + QUIESCENCE_FUTILITY_MARGIN;
         let continuations = self.continuations();
         let mut best_move = Move::NULL;
         let mut legal_moves = 0;
         while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
+            if !in_check && candidate.promotion().is_none() {
+                if legal_moves >= QUIESCENCE_MOVE_LIMIT {
+                    continue;
+                }
+                let victim_value = captured_piece(board, candidate).map_or(0, see_value);
+                if futility_base + victim_value <= alpha {
+                    continue;
+                }
+                if futility_base <= alpha && !board.see(candidate, 1) {
+                    continue;
+                }
+            }
             self.played[self.ply] = Some(moved_piece(board, candidate));
             if !board.make_move(candidate) {
                 continue;

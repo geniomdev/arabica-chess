@@ -82,6 +82,11 @@ pub fn run(arguments: &[&str]) {
     let mut total_nodes = 0;
     let mut total_time = Duration::ZERO;
 
+    println!(
+        "{:>2}  {:>10}  {:>7}  {:>8}  {}",
+        "#", "nodes", "time ms", "nps", "bestmove"
+    );
+    println!("{:-<2}  {:-<10}  {:-<7}  {:-<8}  {:-<8}", "", "", "", "", "");
     for (index, setup) in BENCH_POSITIONS.iter().enumerate() {
         let tokens: Vec<&str> = setup.split_whitespace().collect();
         let mut board = parse_position(&tokens).expect("bench position is valid");
@@ -99,9 +104,8 @@ pub fn run(arguments: &[&str]) {
 
         total_nodes += nodes;
         println!(
-            "position {:>2}/{} nodes {nodes:>10} time {:>6} nps {:>8} bestmove {best_move}",
+            "{:>2}  {nodes:>10}  {:>7}  {:>8}  {best_move}",
             index + 1,
-            BENCH_POSITIONS.len(),
             elapsed.as_millis(),
             nodes_per_second(nodes, elapsed),
         );
@@ -112,7 +116,6 @@ pub fn run(arguments: &[&str]) {
     println!("Total time (ms) : {}", total_time.as_millis());
     println!("Nodes searched  : {total_nodes}");
     println!("Nodes/second    : {nps}");
-    println!("{total_nodes} nodes {nps} nps");
 }
 
 fn nodes_per_second(nodes: u64, elapsed: Duration) -> u64 {
