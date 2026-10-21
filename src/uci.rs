@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::bench;
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::history::History;
 use crate::search::{Iteration, SearchLimits, Searcher, uci_score};
@@ -22,6 +23,7 @@ const DEFAULT_MOVES_TO_GO: u32 = 30;
 const HARD_LIMIT_SHARES: u32 = 3;
 
 pub fn run() {
+    println!("{ENGINE_NAME} {}", env!("CARGO_PKG_VERSION"));
     let mut engine = Engine::new();
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else {
@@ -118,6 +120,10 @@ impl Engine {
             ["go", arguments @ ..] => {
                 self.stop_search();
                 self.go(parse_go(arguments));
+            }
+            ["bench", arguments @ ..] => {
+                self.stop_search();
+                bench::run(arguments);
             }
             ["stop", ..] => self.stop_search(),
             ["d", ..] => println!(
@@ -250,7 +256,7 @@ fn start_position() -> Board {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum PositionError {
+pub(crate) enum PositionError {
     Setup(String),
     Fen(FenError),
     IllegalMove(String),
@@ -272,7 +278,7 @@ impl From<FenError> for PositionError {
     }
 }
 
-fn parse_position(arguments: &[&str]) -> Result<Board, PositionError> {
+pub(crate) fn parse_position(arguments: &[&str]) -> Result<Board, PositionError> {
     let moves_start = arguments
         .iter()
         .position(|&token| token == "moves")

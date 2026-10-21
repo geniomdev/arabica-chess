@@ -24,6 +24,7 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, 
 - `go depth 8` - starts a search with depth 8
 - `go nodes 5000` - stops the search after 5000 nodes (the first iteration always completes)
 - `go perft <depth>` - perft divide and the total node count
+- `bench [depth]` - searches the Stockfish bench positions to a fixed depth (default 13) and prints total nodes and nps
 - `stop` - stops the search
 - `quit` - stops the search and exits
 

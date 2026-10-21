@@ -1,4 +1,5 @@
 mod attacks;
+mod bench;
 mod board;
 mod eval;
 mod history;
