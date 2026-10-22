@@ -1,9 +1,11 @@
 mod attacks;
 mod bench;
 mod board;
+mod datagen;
 mod eval;
 mod history;
 mod movepick;
+mod nnue;
 mod search;
 mod strength;
 mod tt;
@@ -15,6 +17,7 @@ fn main() -> std::io::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.split_first() {
         Some((command, rest)) if command == "tune" => tune::run(rest),
+        Some((command, rest)) if command == "datagen" => datagen::run(rest),
         _ => {
             uci::run();
             Ok(())

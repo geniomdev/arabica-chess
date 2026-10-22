@@ -247,10 +247,66 @@ fn parse_en_passant(text: &str) -> Result<Option<Square>, FenError> {
         .map_err(|_| FenError::EnPassant(text.to_string()))
 }
 
+pub fn color_flipped_fen(fen: &str) -> String {
+    let fields: Vec<&str> = fen.split_whitespace().collect();
+    let swap_case = |text: &str| -> String {
+        text.chars()
+            .map(|symbol| {
+                if symbol.is_ascii_uppercase() {
+                    symbol.to_ascii_lowercase()
+                } else {
+                    symbol.to_ascii_uppercase()
+                }
+            })
+            .collect()
+    };
+    let placement: Vec<String> = fields[0].split('/').rev().map(swap_case).collect();
+    let side = if fields[1] == "w" { "b" } else { "w" };
+    let mut castling: Vec<char> = swap_case(fields[2]).chars().collect();
+    castling.sort_by_key(|&right| "KQkq-".find(right));
+    let en_passant = match fields[3].as_bytes() {
+        [file, b'3'] => format!("{}6", *file as char),
+        [file, b'6'] => format!("{}3", *file as char),
+        _ => fields[3].to_string(),
+    };
+    format!(
+        "{} {side} {} {en_passant} {}",
+        placement.join("/"),
+        castling.into_iter().collect::<String>(),
+        fields[4..].join(" ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::KIWIPETE;
     use crate::board::testing::board;
+
+    #[test]
+    fn color_flip_mirrors_every_field() {
+        let cases = [
+            (START_POSITION, START_POSITION.replace(" w ", " b ")),
+            (
+                KIWIPETE,
+                "r3k2r/pppbbppp/2n2q1P/1P2p3/3pn3/BN2PNP1/P1PPQPB1/R3K2R b KQkq - 0 1".to_string(),
+            ),
+            (
+                "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w Kq f6 0 3",
+                "rnbqkbnr/pppp1ppp/8/8/3PpP2/8/PPP1P1PP/RNBQKBNR b Qk f3 0 3".to_string(),
+            ),
+            (
+                "4k3/8/8/8/8/8/4P3/4K3 b - - 7 40",
+                "4k3/4p3/8/8/8/8/8/4K3 w - - 7 40".to_string(),
+            ),
+        ];
+
+        for (fen, expected) in cases {
+            let flipped = color_flipped_fen(fen);
+            assert_eq!(flipped, expected, "fen {fen:?}");
+            assert_eq!(color_flipped_fen(&flipped), fen, "fen {fen:?}");
+        }
+    }
 
     const EN_PASSANT: &str = "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3";
 

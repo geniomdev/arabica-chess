@@ -7,7 +7,7 @@ mod zobrist;
 
 #[cfg(test)]
 pub use fen::KIWIPETE;
-pub use fen::{FenError, START_POSITION};
+pub use fen::{FenError, START_POSITION, color_flipped_fen};
 pub use movegen::{MAX_MOVES, MoveList};
 pub use see::see_value;
 

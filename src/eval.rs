@@ -497,6 +497,7 @@ fn collect_pawn_structure(board: &Board, side: Color, terms: &mut impl Terms) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::color_flipped_fen;
     use crate::board::testing::board;
     use crate::board::{KIWIPETE, START_POSITION};
 
@@ -518,36 +519,6 @@ mod tests {
             let score = engine_eval(fen);
             assert!(range.contains(&score), "fen {fen:?}, score {score}");
         }
-    }
-
-    fn color_flipped_fen(fen: &str) -> String {
-        let fields: Vec<&str> = fen.split_whitespace().collect();
-        let swap_case = |text: &str| -> String {
-            text.chars()
-                .map(|symbol| {
-                    if symbol.is_ascii_uppercase() {
-                        symbol.to_ascii_lowercase()
-                    } else {
-                        symbol.to_ascii_uppercase()
-                    }
-                })
-                .collect()
-        };
-        let placement: Vec<String> = fields[0].split('/').rev().map(swap_case).collect();
-        let side = if fields[1] == "w" { "b" } else { "w" };
-        let mut castling: Vec<char> = swap_case(fields[2]).chars().collect();
-        castling.sort_by_key(|&right| "KQkq-".find(right));
-        let en_passant = match fields[3].as_bytes() {
-            [file, b'3'] => format!("{}6", *file as char),
-            [file, b'6'] => format!("{}3", *file as char),
-            _ => fields[3].to_string(),
-        };
-        format!(
-            "{} {side} {} {en_passant} {}",
-            placement.join("/"),
-            castling.into_iter().collect::<String>(),
-            fields[4..].join(" ")
-        )
     }
 
     #[test]
