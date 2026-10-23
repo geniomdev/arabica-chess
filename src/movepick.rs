@@ -108,7 +108,7 @@ impl MovePicker {
         &mut self,
         board: &Board,
         history: &History,
-        continuations: &Continuations,
+        continuations: Continuations,
     ) -> Option<Move> {
         loop {
             match self.stage {
@@ -240,7 +240,7 @@ mod tests {
         if skip_after == Some(0) {
             picker.skip_quiets();
         }
-        while let Some(candidate) = picker.next_move(board, &history, &[None; 2]) {
+        while let Some(candidate) = picker.next_move(board, &history, [None; 2]) {
             moves.push(candidate);
             if Some(moves.len()) == skip_after {
                 picker.skip_quiets();

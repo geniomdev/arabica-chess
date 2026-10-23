@@ -1,0 +1,31 @@
+# Search
+
+- Negamax
+- Iterative deepening
+- Aspiration windows
+- Principal variation search
+- Quiescence search
+- Check extension
+- Singular extensions with multi-cut
+- Repetition detection
+- Fifty-move and insufficient material draws
+- Transposition table
+- Static eval in transposition table
+- Killer moves
+- History heuristic
+- Continuation history
+- Capture history
+- Correction history
+- Improving heuristic
+- Null move pruning
+- ProbCut
+- Internal iterative reductions
+- Late move reductions
+- Reverse futility pruning
+- Futility pruning
+- Late move pruning
+- History pruning
+- Static exchange evaluation
+- SEE pruning
+- Quiescence futility pruning
+- Time management (soft and hard limits scaled by best move stability, score drop and best move node share)

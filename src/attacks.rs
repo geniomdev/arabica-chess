@@ -188,10 +188,6 @@ pub fn bishop_attacks(square: Square, occupancy: Bitboard) -> Bitboard {
     Bitboard(SLIDERS.attacks[SLIDERS.bishop[square.index()].index(occupancy.0)])
 }
 
-pub fn queen_attacks(square: Square, occupancy: Bitboard) -> Bitboard {
-    rook_attacks(square, occupancy) | bishop_attacks(square, occupancy)
-}
-
 #[derive(Clone, Copy)]
 struct Magic {
     mask: u64,

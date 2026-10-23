@@ -80,7 +80,7 @@ impl History {
         self.correction.fill(0);
     }
 
-    pub fn quiet_score(&self, quiet: Move, moved: PieceTo, continuations: &Continuations) -> i32 {
+    pub fn quiet_score(&self, quiet: Move, moved: PieceTo, continuations: Continuations) -> i32 {
         let continuation_score: i32 = self
             .continuation
             .iter()
@@ -100,7 +100,7 @@ impl History {
         &mut self,
         quiet: Move,
         moved: PieceTo,
-        continuations: &Continuations,
+        continuations: Continuations,
         bonus: i32,
     ) {
         apply_gravity(
@@ -108,7 +108,7 @@ impl History {
             bonus,
         );
         for (table, previous) in self.continuation.iter_mut().zip(continuations) {
-            if let Some(previous) = *previous {
+            if let Some(previous) = previous {
                 apply_gravity(&mut table[continuation_index(previous, moved)], bonus);
             }
         }
@@ -167,9 +167,9 @@ mod tests {
 
         for (probe_context, expected) in cases {
             let mut history = History::default();
-            history.update_quiet(knight_move, KNIGHT_TO_F3, &full_context, bonus);
+            history.update_quiet(knight_move, KNIGHT_TO_F3, full_context, bonus);
             assert_eq!(
-                history.quiet_score(knight_move, KNIGHT_TO_F3, &probe_context),
+                history.quiet_score(knight_move, KNIGHT_TO_F3, probe_context),
                 expected,
                 "context {probe_context:?}"
             );

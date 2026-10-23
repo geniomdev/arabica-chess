@@ -3,7 +3,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, MoveList, see_value};
-use crate::eval::{self, PawnCache};
 use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::movepick::{MovePicker, captured_piece, is_noisy, moved_piece};
 use crate::nnue;
@@ -77,13 +76,6 @@ static REDUCTIONS: LazyLock<[[i32; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE]>
     });
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Evaluator {
-    #[default]
-    Network,
-    Classical,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchLimits {
     pub depth: Option<u8>,
     pub time: Option<Duration>,
@@ -114,8 +106,6 @@ pub struct Searcher {
     stopped: bool,
     first_iteration_completed: bool,
     eval_noise: EvalNoise,
-    evaluator: Evaluator,
-    pawn_cache: PawnCache,
     pv: [[Move; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
@@ -207,8 +197,6 @@ impl Searcher {
             stopped: false,
             first_iteration_completed: false,
             eval_noise: EvalNoise::default(),
-            evaluator: Evaluator::default(),
-            pawn_cache: PawnCache::default(),
             pv: [[Move::NULL; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             eval_stack: [-INFINITY; MAX_PLY],
@@ -222,11 +210,6 @@ impl Searcher {
 
     pub fn with_eval_noise(mut self, eval_noise: EvalNoise) -> Self {
         self.eval_noise = eval_noise;
-        self
-    }
-
-    pub fn with_evaluator(mut self, evaluator: Evaluator) -> Self {
-        self.evaluator = evaluator;
         self
     }
 
@@ -397,15 +380,11 @@ impl Searcher {
         }
     }
 
-    fn static_evaluation(&mut self, board: &mut Board) -> i32 {
-        let raw = match self.evaluator {
-            Evaluator::Network => nnue::evaluate(board),
-            Evaluator::Classical => eval::evaluate(board, &mut self.pawn_cache),
-        };
-        raw + self.eval_noise.offset(board.state.zobrist_key)
+    fn static_evaluation(&self, board: &mut Board) -> i32 {
+        nnue::evaluate(board) + self.eval_noise.offset(board.state.zobrist_key)
     }
 
-    fn cached_static_evaluation(&mut self, board: &mut Board, hit: Option<Hit>) -> i32 {
+    fn cached_static_evaluation(&self, board: &mut Board, hit: Option<Hit>) -> i32 {
         hit.and_then(|hit| hit.static_eval)
             .unwrap_or_else(|| self.static_evaluation(board))
     }
@@ -469,10 +448,10 @@ impl Searcher {
             }
             let continuations = self.continuations();
             self.history
-                .update_quiet(cutoff, moved_piece(board, cutoff), &continuations, bonus);
+                .update_quiet(cutoff, moved_piece(board, cutoff), continuations, bonus);
             for &quiet in tried_quiets {
                 self.history
-                    .update_quiet(quiet, moved_piece(board, quiet), &continuations, -bonus);
+                    .update_quiet(quiet, moved_piece(board, quiet), continuations, -bonus);
             }
         }
         for &noisy in tried_noisy {
@@ -494,7 +473,7 @@ impl Searcher {
     ) -> Option<(Move, i32)> {
         let continuations = self.continuations();
         let mut picker = MovePicker::good_noisy_only(hash_move);
-        while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
+        while let Some(candidate) = picker.next_move(board, &self.history, continuations) {
             if !board.see(candidate, probcut_beta - static_eval) {
                 continue;
             }
@@ -665,14 +644,14 @@ impl Searcher {
         let mut tried_quiet_count = 0;
         let mut tried_noisy = [Move::NULL; TRACKED_NOISY];
         let mut tried_noisy_count = 0;
-        while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
+        while let Some(candidate) = picker.next_move(board, &self.history, continuations) {
             if candidate == excluded {
                 continue;
             }
             let is_quiet = !is_noisy(candidate);
             let moved = moved_piece(board, candidate);
             let move_history = if is_quiet {
-                self.history.quiet_score(candidate, moved, &continuations)
+                self.history.quiet_score(candidate, moved, continuations)
             } else {
                 self.history
                     .capture_score(moved, captured_piece(board, candidate))
@@ -878,7 +857,7 @@ impl Searcher {
         let continuations = self.continuations();
         let mut best_move = Move::NULL;
         let mut legal_moves = 0;
-        while let Some(candidate) = picker.next_move(board, &self.history, &continuations) {
+        while let Some(candidate) = picker.next_move(board, &self.history, continuations) {
             if !in_check && candidate.promotion().is_none() {
                 let victim_value = captured_piece(board, candidate).map_or(0, see_value);
                 if futility_base + victim_value <= alpha {

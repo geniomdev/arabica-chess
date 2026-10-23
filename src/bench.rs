@@ -83,10 +83,13 @@ pub fn run(arguments: &[&str]) {
     let mut total_time = Duration::ZERO;
 
     println!(
-        "{:>2}  {:>10}  {:>7}  {:>8}  {}",
-        "#", "nodes", "time ms", "nps", "bestmove"
+        "{:>2}  {:>10}  {:>7}  {:>8}  bestmove",
+        "#", "nodes", "time ms", "nps"
     );
-    println!("{:-<2}  {:-<10}  {:-<7}  {:-<8}  {:-<8}", "", "", "", "", "");
+    println!(
+        "{:-<2}  {:-<10}  {:-<7}  {:-<8}  {:-<8}",
+        "", "", "", "", ""
+    );
     for (index, setup) in BENCH_POSITIONS.iter().enumerate() {
         let tokens: Vec<&str> = setup.split_whitespace().collect();
         let mut board = parse_position(&tokens).expect("bench position is valid");
@@ -95,8 +98,8 @@ pub fn run(arguments: &[&str]) {
 
         let mut nodes = 0;
         let started = Instant::now();
-        let mut searcher = Searcher::new(limits, Arc::new(AtomicBool::new(false)), table)
-            .with_history(history);
+        let mut searcher =
+            Searcher::new(limits, Arc::new(AtomicBool::new(false)), table).with_history(history);
         let (best_move, _) = searcher.search(&mut board, |iteration| nodes = iteration.nodes);
         let elapsed = started.elapsed();
         total_time += elapsed;
