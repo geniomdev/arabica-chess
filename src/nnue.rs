@@ -2,7 +2,13 @@ pub mod data;
 mod simd;
 mod stack;
 
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::ptr;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::board::Board;
 use crate::search::MATE_BOUND;
@@ -41,12 +47,68 @@ const EMBEDDED_NETWORK: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/networks/net1.nnue"));
 const _: () = assert!(EMBEDDED_NETWORK.len() == NETWORK_BYTES);
 
-pub static NETWORK: LazyLock<Box<Network>> = LazyLock::new(|| {
-    Network::from_bytes(EMBEDDED_NETWORK).expect("embedded network matches the layout")
+struct ActiveNetwork {
+    network: Box<Network>,
+    madd_output: bool,
+}
+
+impl ActiveNetwork {
+    fn new(network: Box<Network>) -> Self {
+        let madd_output = *simd::AVX2 && simd::fits_madd(&network.output_weights);
+        Self {
+            network,
+            madd_output,
+        }
+    }
+}
+
+static EMBEDDED: LazyLock<ActiveNetwork> = LazyLock::new(|| {
+    ActiveNetwork::new(
+        Network::from_bytes(EMBEDDED_NETWORK).expect("embedded network matches the layout"),
+    )
 });
 
-static MADD_OUTPUT: LazyLock<bool> =
-    LazyLock::new(|| *simd::AVX2 && simd::fits_madd(&NETWORK.output_weights));
+static LOADED: AtomicPtr<ActiveNetwork> = AtomicPtr::new(ptr::null_mut());
+
+fn active() -> &'static ActiveNetwork {
+    let loaded = LOADED.load(Ordering::Acquire);
+    if loaded.is_null() {
+        &EMBEDDED
+    } else {
+        unsafe { &*loaded }
+    }
+}
+
+pub fn network() -> &'static Network {
+    &active().network
+}
+
+#[derive(Debug)]
+pub enum NetworkLoadError {
+    Io(io::Error),
+    Size(usize),
+}
+
+impl fmt::Display for NetworkLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Size(bytes) => write!(f, "expected {NETWORK_BYTES} bytes, got {bytes}"),
+        }
+    }
+}
+
+pub fn load_network(path: &Path) -> Result<(), NetworkLoadError> {
+    let bytes = fs::read(path).map_err(NetworkLoadError::Io)?;
+    let network = Network::from_bytes(&bytes).ok_or(NetworkLoadError::Size(bytes.len()))?;
+    let loaded = Box::leak(Box::new(ActiveNetwork::new(network)));
+    LOADED.store(loaded, Ordering::Release);
+    Ok(())
+}
+
+pub fn use_embedded_network() {
+    LOADED.store(ptr::null_mut(), Ordering::Release);
+}
 
 pub fn evaluate(board: &mut Board) -> i32 {
     if board.has_insufficient_material() {
@@ -54,11 +116,18 @@ pub fn evaluate(board: &mut Board) -> i32 {
     }
     let us = board.state.active_color;
     let accumulators = board.accumulators();
-    let (our_weights, their_weights) = NETWORK.output_weights.split_at(HIDDEN);
-    let madd = *MADD_OUTPUT;
-    let sum = simd::screlu_dot(madd, &accumulators[us.index()].0, our_weights)
-        + simd::screlu_dot(madd, &accumulators[us.opponent().index()].0, their_weights);
-    NETWORK.finish(sum).clamp(-MAX_EVALUATION, MAX_EVALUATION)
+    let ActiveNetwork {
+        network,
+        madd_output,
+    } = active();
+    let (our_weights, their_weights) = network.output_weights.split_at(HIDDEN);
+    let sum = simd::screlu_dot(*madd_output, &accumulators[us.index()].0, our_weights)
+        + simd::screlu_dot(
+            *madd_output,
+            &accumulators[us.opponent().index()].0,
+            their_weights,
+        );
+    network.finish(sum).clamp(-MAX_EVALUATION, MAX_EVALUATION)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,7 +419,7 @@ mod tests {
 
     fn assert_fresh_accumulators(position: &mut Board, context: &str) {
         let fresh =
-            Color::ALL.map(|perspective| NETWORK.refresh(active_features(position, perspective)));
+            Color::ALL.map(|perspective| network().refresh(active_features(position, perspective)));
         let fen = position.to_fen();
         assert_eq!(position.accumulators(), &fresh, "{context}, fen {fen:?}");
     }
@@ -360,9 +429,13 @@ mod tests {
         EveryNode,
         LeavesOnly,
         NullMoves,
+        Invalidations,
     }
 
     fn walk(position: &mut Board, depth: u32, probe: Probe, context: &str) -> u64 {
+        if matches!(probe, Probe::Invalidations) {
+            position.invalidate_accumulators();
+        }
         if depth == 0 || matches!(probe, Probe::EveryNode) {
             assert_fresh_accumulators(position, context);
         }
@@ -405,7 +478,12 @@ mod tests {
                 1_486,
             ),
         ];
-        let probes = [Probe::EveryNode, Probe::LeavesOnly, Probe::NullMoves];
+        let probes = [
+            Probe::EveryNode,
+            Probe::LeavesOnly,
+            Probe::NullMoves,
+            Probe::Invalidations,
+        ];
 
         for (fen, depth, expected_nodes) in cases {
             for probe in probes {
@@ -415,6 +493,45 @@ mod tests {
                 assert_eq!(nodes, expected_nodes, "{context}");
             }
         }
+    }
+
+    #[test]
+    fn loads_networks_from_files() {
+        let directory = std::env::temp_dir().join(format!("arabica-{}-load", std::process::id()));
+        fs::create_dir_all(&directory).expect("directory created");
+        let cases = [
+            ("embedded.nnue", Some(NETWORK_BYTES), Ok(())),
+            (
+                "truncated.nnue",
+                Some(NETWORK_BYTES - 1),
+                Err(Some(NETWORK_BYTES - 1)),
+            ),
+            ("empty.nnue", Some(0), Err(Some(0))),
+            ("missing.nnue", None, Err(None)),
+        ];
+        let position = START_POSITION;
+        let expected_score = evaluate(&mut board(position));
+
+        for (name, length, expected) in cases {
+            let path = directory.join(name);
+            if let Some(length) = length {
+                fs::write(&path, &EMBEDDED_NETWORK[..length]).expect("network written");
+            }
+            let outcome = load_network(&path).map_err(|error| match error {
+                NetworkLoadError::Size(bytes) => Some(bytes),
+                NetworkLoadError::Io(_) => None,
+            });
+            assert_eq!(outcome, expected, "file {name}");
+            assert_eq!(
+                evaluate(&mut board(position)),
+                expected_score,
+                "file {name}"
+            );
+        }
+        assert!(!ptr::eq(network(), &*EMBEDDED.network));
+        use_embedded_network();
+        assert!(ptr::eq(network(), &*EMBEDDED.network));
+        fs::remove_dir_all(&directory).expect("directory removed");
     }
 
     #[test]

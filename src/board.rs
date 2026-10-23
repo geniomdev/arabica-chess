@@ -12,7 +12,7 @@ pub use movegen::{MAX_MOVES, MoveList};
 pub use see::see_value;
 
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
-use crate::nnue::{Accumulator, AccumulatorStack, NETWORK};
+use crate::nnue::{self, Accumulator, AccumulatorStack};
 use crate::types::{
     Bitboard, CastlingRights, Color, EveryPiece, EverySide, EverySquare, FILES, Move, Piece, RANKS,
     SIDES, Square,
@@ -72,7 +72,11 @@ impl Board {
     pub fn accumulators(&mut self) -> &[Accumulator; SIDES] {
         let (pieces, colors) = (&self.pieces, &self.colors);
         self.nnue
-            .current(&NETWORK, |side, piece| pieces[piece] & colors[side])
+            .current(nnue::network(), |side, piece| pieces[piece] & colors[side])
+    }
+
+    pub fn invalidate_accumulators(&mut self) {
+        self.nnue.invalidate();
     }
 
     pub fn pieces(&self, piece: Piece) -> Bitboard {

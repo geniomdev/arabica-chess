@@ -153,6 +153,12 @@ impl AccumulatorStack {
         entry.status = Status::Pending;
     }
 
+    pub fn invalidate(&mut self) {
+        for entry in &mut self.entries {
+            entry.status = Status::Stale;
+        }
+    }
+
     pub fn pop(&mut self) {
         debug_assert!(self.top > 0, "accumulator stack underflow");
         self.top -= 1;

@@ -35,6 +35,7 @@ UCI chess engine in Rust powered by NNUE
 | `Ponder` | check | false | | Appends the expected reply to `bestmove` as `ponder <move>` |
 | `UCI_LimitStrength` | check | false | | Plays at the strength set by `UCI_Elo` |
 | `UCI_Elo` | spin | 1500 | 600-3000 | Target strength when `UCI_LimitStrength` is on |
+| `EvalFile` | string | `<embedded>` | | Loads a `.nnue` network from the given path and clears the transposition table; `<embedded>` restores the built-in network, a file that fails to load keeps the current one |
 
 Search techniques are listed in [docs/search.md](docs/search.md).
 

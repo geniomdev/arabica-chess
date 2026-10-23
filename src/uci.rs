@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io::{self, BufRead};
 use std::mem;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +11,7 @@ use std::time::Duration;
 use crate::bench;
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::history::History;
+use crate::nnue::{load_network, use_embedded_network};
 use crate::search::{Iteration, SearchLimits, Searcher, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
@@ -21,6 +23,7 @@ const DEFAULT_MOVE_OVERHEAD: Duration = Duration::from_millis(50);
 const MAX_MOVE_OVERHEAD_MS: u64 = 5000;
 const DEFAULT_MOVES_TO_GO: u32 = 30;
 const HARD_LIMIT_SHARES: u32 = 3;
+const EMBEDDED_NETWORK_NAME: &str = "<embedded>";
 
 pub fn run() {
     println!("{ENGINE_NAME} {}", env!("CARGO_PKG_VERSION"));
@@ -91,6 +94,7 @@ impl Engine {
                 println!(
                     "option name UCI_Elo type spin default {DEFAULT_ELO} min {MIN_ELO} max {MAX_ELO}"
                 );
+                println!("option name EvalFile type string default {EMBEDDED_NETWORK_NAME}");
                 println!("uciok");
             }
             ["isready", ..] => println!("readyok"),
@@ -111,6 +115,7 @@ impl Engine {
                     Some(EngineOption::Ponder(enabled)) => self.ponder = enabled,
                     Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
                     Some(EngineOption::Elo(elo)) => self.elo = elo,
+                    Some(EngineOption::EvalFile(path)) => self.set_network(path),
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
                 }
             }
@@ -177,6 +182,27 @@ impl Engine {
                 announce_ponder_move: self.ponder,
             },
         ));
+    }
+
+    fn set_network(&mut self, path: Option<PathBuf>) {
+        match path {
+            None => {
+                use_embedded_network();
+                println!("info string using embedded network");
+            }
+            Some(path) => match load_network(&path) {
+                Ok(()) => println!("info string loaded network {}", path.display()),
+                Err(error) => {
+                    println!(
+                        "info string failed to load network {}: {error}",
+                        path.display()
+                    );
+                    return;
+                }
+            },
+        }
+        self.board.invalidate_accumulators();
+        self.table.clear();
     }
 
     fn stop_search(&mut self) {
@@ -403,6 +429,7 @@ enum EngineOption {
     Ponder(bool),
     LimitStrength(bool),
     Elo(u32),
+    EvalFile(Option<PathBuf>),
 }
 
 fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
@@ -410,9 +437,11 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
         return None;
     };
     let value_index = rest.iter().position(|&token| token == "value")?;
-    let [value] = rest[value_index + 1..] else {
+    let value = rest[value_index + 1..].join(" ");
+    let value = value.as_str();
+    if value.is_empty() {
         return None;
-    };
+    }
     match rest[..value_index].join(" ").to_ascii_lowercase().as_str() {
         "hash" => value.parse().ok().map(EngineOption::Hash),
         "move overhead" => {
@@ -426,6 +455,9 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
             let elo: u32 = value.parse().ok()?;
             Some(EngineOption::Elo(elo.clamp(MIN_ELO, MAX_ELO)))
         }
+        "evalfile" => Some(EngineOption::EvalFile(
+            (!value.eq_ignore_ascii_case(EMBEDDED_NETWORK_NAME)).then(|| PathBuf::from(value)),
+        )),
         _ => None,
     }
 }
@@ -641,6 +673,25 @@ mod tests {
             ("name UCI_Elo value 100", Some(EngineOption::Elo(MIN_ELO))),
             ("name UCI_Elo value 99999", Some(EngineOption::Elo(MAX_ELO))),
             ("name UCI_Elo value -5", None),
+            (
+                "name EvalFile value nets/a.nnue",
+                Some(EngineOption::EvalFile(Some(PathBuf::from("nets/a.nnue")))),
+            ),
+            (
+                "name evalfile value my nets/b c.nnue",
+                Some(EngineOption::EvalFile(Some(PathBuf::from(
+                    "my nets/b c.nnue",
+                )))),
+            ),
+            (
+                "name EvalFile value <embedded>",
+                Some(EngineOption::EvalFile(None)),
+            ),
+            (
+                "name EvalFile value <EMBEDDED>",
+                Some(EngineOption::EvalFile(None)),
+            ),
+            ("name EvalFile value", None),
         ];
 
         for (command, expected) in cases {

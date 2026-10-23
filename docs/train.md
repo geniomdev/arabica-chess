@@ -6,7 +6,7 @@ Evaluation uses a SCReLU NNUE with a lazily updated accumulator stack and an AVX
 
 | Property | Value |
 |---|---|
-| File | `networks/net1.nnue`, embedded into the binary at build time |
+| File | `networks/net1.nnue`, embedded into the binary at build time; the `EvalFile` UCI option swaps in another `.nnue` at runtime (e.g. `option.EvalFile=data/nets/net2.nnue` in fastchess) without rebuilding |
 | Architecture | `768 -> 128 x2 -> 1`, perspective network |
 | Inputs | 768 = 2 sides (own / opponent) x 6 piece types x 64 squares, squares flipped vertically for Black |
 | Hidden layer | 128 neurons per perspective, shared feature weights, accumulator updated incrementally on a lazy stack |
