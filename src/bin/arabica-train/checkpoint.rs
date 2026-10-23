@@ -106,7 +106,7 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::random::Random;
+    use arabica::random::Random;
 
     fn scratch_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("arabica-{}-{name}", std::process::id()))

@@ -43,6 +43,12 @@ pub struct Ticker {
     last: Instant,
 }
 
+impl Default for Ticker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ticker {
     pub fn new() -> Self {
         let interactive = io::stderr().is_terminal();

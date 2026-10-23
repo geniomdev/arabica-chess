@@ -1,7 +1,7 @@
-use crate::nnue::data::Record;
-use crate::nnue::{HIDDEN, INPUTS, SCALE};
-use crate::random::Random;
-use crate::types::{Color, SIDES};
+use arabica::nnue::data::Record;
+use arabica::nnue::{HIDDEN, INPUTS, SCALE};
+use arabica::random::Random;
+use arabica::types::{Color, SIDES};
 
 pub const FEATURE_BIAS: usize = INPUTS * HIDDEN;
 pub const OUTPUT_WEIGHTS: usize = FEATURE_BIAS + HIDDEN;
@@ -199,11 +199,11 @@ impl Adam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::testing::board;
-    use crate::board::{KIWIPETE, START_POSITION};
-    use crate::nnue::data::Outcome;
-    use crate::nnue::feature_index;
-    use crate::types::{Piece, Square};
+    use crate::testing::board;
+    use arabica::board::{KIWIPETE, START_POSITION};
+    use arabica::nnue::data::Outcome;
+    use arabica::nnue::feature_index;
+    use arabica::types::{Piece, Square};
 
     fn records() -> Vec<Record> {
         let cases = [

@@ -7,7 +7,7 @@ impl Random {
         Self(seed | 1)
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
@@ -15,11 +15,11 @@ impl Random {
     }
 
     pub fn below(&mut self, bound: usize) -> usize {
-        (self.next() % bound as u64) as usize
+        (self.next_u64() % bound as u64) as usize
     }
 
     pub fn unit(&mut self) -> f32 {
-        (self.next() >> (u64::BITS - UNIT_BITS)) as f32 / (1u32 << UNIT_BITS) as f32
+        (self.next_u64() >> (u64::BITS - UNIT_BITS)) as f32 / (1u32 << UNIT_BITS) as f32
     }
 
     pub fn shuffle<T>(&mut self, items: &mut [T]) {

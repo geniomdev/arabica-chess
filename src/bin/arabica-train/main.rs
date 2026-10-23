@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Instant;
 
-use crate::cli::{default_threads, parse_argument, usage_error};
-use crate::nnue::data::{RECORD_BYTES, Record};
-use crate::progress::{Ticker, bar, eta, format_duration, percent};
-use crate::random::Random;
+use arabica::cli::{default_threads, parse_argument, usage_error};
+use arabica::nnue::data::{RECORD_BYTES, Record};
+use arabica::progress::{Ticker, bar, eta, format_duration, percent};
+use arabica::random::Random;
 use checkpoint::Checkpoint;
 use model::{Adam, Model, PARAMETERS};
 use quantize::{NETWORK_EXTENSION, QuantizationError, export, network_path, quantization_error};
@@ -30,6 +30,27 @@ const SPLIT_SEED: u64 = 0x5EED_0002;
 const SHUFFLE_SEED: u64 = 0x5EED_0003;
 
 type RawRecord = [u8; RECORD_BYTES];
+
+const USAGE: &str = "arabica-train <train|export> ...";
+
+fn main() -> io::Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match arguments.split_first() {
+        Some((command, rest)) if command == "train" => run(rest),
+        Some((command, rest)) if command == "export" => export_command(rest),
+        _ => Err(usage_error(USAGE)),
+    }
+}
+
+#[cfg(test)]
+mod testing {
+    use arabica::board::Board;
+
+    pub fn board(fen: &str) -> Board {
+        fen.parse()
+            .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"))
+    }
+}
 
 fn invalid_data(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -253,9 +274,9 @@ fn reject_network_extension(checkpoint_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn export_command(arguments: &[String]) -> io::Result<()> {
+fn export_command(arguments: &[String]) -> io::Result<()> {
     let [checkpoint_path, rest @ ..] = arguments else {
-        return Err(usage_error("arabica export <checkpoint> [network]"));
+        return Err(usage_error("arabica-train export <checkpoint> [network]"));
     };
     let checkpoint_path = PathBuf::from(checkpoint_path);
     reject_network_extension(&checkpoint_path)?;
@@ -273,10 +294,10 @@ pub fn export_command(arguments: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn run(arguments: &[String]) -> io::Result<()> {
+fn run(arguments: &[String]) -> io::Result<()> {
     let [data, checkpoint_path, rest @ ..] = arguments else {
         return Err(usage_error(
-            "arabica train <data> <checkpoint> [epochs] [threads]",
+            "arabica-train train <data> <checkpoint> [epochs] [threads]",
         ));
     };
     let epochs: usize = parse_argument(rest.first(), "epochs", DEFAULT_EPOCHS)?.max(1);
@@ -342,9 +363,9 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::testing::board;
-    use crate::board::{KIWIPETE, START_POSITION};
-    use crate::nnue::data::Outcome;
+    use crate::testing::board;
+    use arabica::board::{KIWIPETE, START_POSITION};
+    use arabica::nnue::data::Outcome;
 
     #[test]
     fn learning_rate_decays_along_a_cosine() {

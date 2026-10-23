@@ -328,7 +328,7 @@ mod tests {
     struct XorShift(u64);
 
     impl XorShift {
-        fn next(&mut self) -> u64 {
+        fn next_u64(&mut self) -> u64 {
             self.0 ^= self.0 >> 12;
             self.0 ^= self.0 << 25;
             self.0 ^= self.0 >> 27;
@@ -342,7 +342,7 @@ mod tests {
         for index in 0..SQUARES as u8 {
             let square = Square::from_index(index);
             for _ in 0..1000 {
-                let occupancy = random.next() & random.next();
+                let occupancy = random.next_u64() & random.next_u64();
                 let board = Bitboard(occupancy);
                 assert_eq!(
                     rook_attacks(square, board).0,

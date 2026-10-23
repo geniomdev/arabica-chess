@@ -39,6 +39,12 @@ pub struct MoveList {
     len: usize,
 }
 
+impl Default for MoveList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MoveList {
     pub fn new() -> Self {
         Self {
@@ -55,6 +61,10 @@ impl MoveList {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn as_slice(&self) -> &[Move] {

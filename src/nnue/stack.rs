@@ -134,6 +134,12 @@ fn apply(
     }
 }
 
+impl Default for AccumulatorStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AccumulatorStack {
     pub fn new() -> Self {
         Self {

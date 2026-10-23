@@ -20,6 +20,8 @@ Evaluation uses a SCReLU NNUE with a lazily updated accumulator stack and an AVX
 
 ## Train commands
 
+`cargo build --release` builds two binaries from the shared `arabica` library: the engine `arabica`, which also generates training data, and the trainer `arabica-train`, which is kept out of the engine binary.
+
 - `./target/release/arabica datagen <positions> [threads] [nodes] [output]` - generates training positions from self-play (all cores, 5000 nodes per move by default) and appends them to `<output>` (default `data/arabica-<version>-n<nodes>.bin`) in bullet's `ChessBoard` format; rerunning with the same settings resumes the same file
-- `./target/release/arabica train <data> <checkpoint> [epochs] [threads]` - trains the network on a `datagen` file (40 epochs, all cores by default), resumes an existing checkpoint and exports a `.nnue` network next to it after every epoch
-- `./target/release/arabica export <checkpoint> [network]` - quantizes a checkpoint into the engine's `.nnue` format (default: the checkpoint path with the `.nnue` extension)
+- `./target/release/arabica-train train <data> <checkpoint> [epochs] [threads]` - trains the network on a `datagen` file (40 epochs, all cores by default), resumes an existing checkpoint and exports a `.nnue` network next to it after every epoch
+- `./target/release/arabica-train export <checkpoint> [network]` - quantizes a checkpoint into the engine's `.nnue` format (default: the checkpoint path with the `.nnue` extension)

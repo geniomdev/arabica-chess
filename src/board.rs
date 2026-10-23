@@ -5,7 +5,6 @@ mod perft;
 mod see;
 mod zobrist;
 
-#[cfg(test)]
 pub use fen::KIWIPETE;
 pub use fen::{FenError, START_POSITION, color_flipped_fen};
 pub use movegen::{MAX_MOVES, MoveList};
@@ -32,6 +31,12 @@ pub struct GameState {
     pub played_move: Move,
 }
 
+impl Default for GameState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GameState {
     pub const fn new() -> Self {
         Self {
@@ -55,6 +60,12 @@ pub struct Board {
     nnue: AccumulatorStack,
     pub state: GameState,
     pub history: Vec<GameState>,
+}
+
+impl Default for Board {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Board {

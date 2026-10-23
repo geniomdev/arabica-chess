@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::replace_file;
 use super::model::{Model, OUTPUT_BIAS, OUTPUT_WEIGHTS};
-use crate::nnue::data::Record;
-use crate::nnue::{Network, QA, QB, SCALE};
-use crate::types::Color;
+use arabica::nnue::data::Record;
+use arabica::nnue::{Network, QA, QB, SCALE};
+use arabica::types::Color;
 
 pub const NETWORK_EXTENSION: &str = "nnue";
 
@@ -69,12 +69,12 @@ pub fn export(model: &Model, path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::testing::board;
-    use crate::board::{KIWIPETE, START_POSITION};
-    use crate::nnue::NETWORK_BYTES;
-    use crate::nnue::data::Outcome;
-    use crate::random::Random;
-    use crate::train::model::{FEATURE_BIAS, PARAMETERS, WEIGHT_LIMIT};
+    use crate::model::{FEATURE_BIAS, PARAMETERS, WEIGHT_LIMIT};
+    use crate::testing::board;
+    use arabica::board::{KIWIPETE, START_POSITION};
+    use arabica::nnue::NETWORK_BYTES;
+    use arabica::nnue::data::Outcome;
+    use arabica::random::Random;
 
     #[test]
     fn quantizes_with_rounding_and_saturation() {
