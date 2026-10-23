@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,8 +22,15 @@ const DEFAULT_NODES: u64 = 5_000;
 const DEFAULT_DATA_DIRECTORY: &str = "data";
 const RANDOM_PLIES: usize = 8;
 const OPENING_SCORE_LIMIT: i32 = 500;
-const WIN_ADJUDICATION_SCORE: i32 = 2_500;
+const WIN_ADJUDICATION_SCORE: i32 = 1_000;
 const WIN_ADJUDICATION_PLIES: usize = 4;
+const DRAW_ADJUDICATION_MOVE: u16 = 32;
+const DRAW_ADJUDICATION_SCORE: i32 = 20;
+const DRAW_ADJUDICATION_PLIES: usize = 12;
+const SKIPPED_PLIES: u64 = 6;
+const RANDOM_MOVE_WINDOW: Range<u64> = SKIPPED_PLIES..60;
+const RANDOM_MOVE_CHANCE: usize = 10;
+const RANDOM_MOVE_MARGIN: i32 = 50;
 const FIFTY_MOVE_PLIES: u8 = 100;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const THREAD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -66,6 +74,44 @@ fn is_quiet_sample(board: &Board, best_move: Move, score: i32) -> bool {
         && !is_mate_score(score)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    Rules,
+    AdjudicatedWin,
+    AdjudicatedDraw,
+}
+
+#[derive(Default)]
+struct Adjudication {
+    winning_streak: Option<(Color, usize)>,
+    drawn_plies: usize,
+}
+
+impl Adjudication {
+    fn observe(&mut self, move_number: u16, side: Color, score: i32) -> Option<(Outcome, Ending)> {
+        if score.abs() >= WIN_ADJUDICATION_SCORE {
+            let leader = if score > 0 { side } else { side.opponent() };
+            let streak = match self.winning_streak {
+                Some((previous, plies)) if previous == leader => plies + 1,
+                _ => 1,
+            };
+            if streak >= WIN_ADJUDICATION_PLIES {
+                return Some((Outcome::Win.for_side(leader), Ending::AdjudicatedWin));
+            }
+            self.winning_streak = Some((leader, streak));
+        } else {
+            self.winning_streak = None;
+        }
+        if move_number >= DRAW_ADJUDICATION_MOVE && score.abs() <= DRAW_ADJUDICATION_SCORE {
+            self.drawn_plies += 1;
+        } else {
+            self.drawn_plies = 0;
+        }
+        (self.drawn_plies >= DRAW_ADJUDICATION_PLIES)
+            .then_some((Outcome::Draw, Ending::AdjudicatedDraw))
+    }
+}
+
 struct Sample {
     record: Record,
     side: Color,
@@ -74,7 +120,9 @@ struct Sample {
 struct Game {
     samples: Vec<Sample>,
     searched_plies: u64,
+    random_moves: u64,
     white_outcome: Outcome,
+    ending: Ending,
 }
 
 impl Game {
@@ -104,6 +152,31 @@ fn random_opening(random: &mut Random) -> Option<Board> {
     Some(flipped.parse().expect("flipped opening is valid"))
 }
 
+fn play_random_move(
+    searcher: &mut Searcher,
+    board: &mut Board,
+    random: &mut Random,
+    best_move: Move,
+    score: i32,
+) -> bool {
+    let alternatives: Vec<Move> = legal_moves(board)
+        .into_iter()
+        .filter(|&candidate| candidate != best_move)
+        .collect();
+    if alternatives.is_empty() {
+        return false;
+    }
+    board.make_move(alternatives[random.below(alternatives.len())]);
+    if rules_outcome(board).is_none() {
+        let (_, reply) = searcher.search(board, |_| {});
+        if -reply >= score - RANDOM_MOVE_MARGIN {
+            return true;
+        }
+    }
+    board.unmake_move();
+    false
+}
+
 fn play_game(
     random: &mut Random,
     table: TranspositionTable,
@@ -117,42 +190,46 @@ fn play_game(
     let game = random_opening(random).and_then(|mut board| {
         let mut samples = Vec::new();
         let mut searched_plies = 0;
-        let mut winning_streak: Option<(Color, usize)> = None;
-        let white_outcome = loop {
+        let mut random_moves = 0;
+        let mut adjudication = Adjudication::default();
+        let (white_outcome, ending) = loop {
             if let Some(outcome) = rules_outcome(&mut board) {
-                break outcome;
+                break (outcome, Ending::Rules);
             }
             let (best_move, score) = searcher.search(&mut board, |_| {});
             if searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
                 return None;
             }
+            let ply = searched_plies;
             searched_plies += 1;
             let side = board.state.active_color;
-            if score.abs() >= WIN_ADJUDICATION_SCORE {
-                let leader = if score > 0 { side } else { side.opponent() };
-                let streak = match winning_streak {
-                    Some((previous, plies)) if previous == leader => plies + 1,
-                    _ => 1,
-                };
-                if streak >= WIN_ADJUDICATION_PLIES {
-                    break Outcome::Win.for_side(leader);
-                }
-                winning_streak = Some((leader, streak));
-            } else {
-                winning_streak = None;
+            if let Some(adjudicated) =
+                adjudication.observe(board.state.fullmove_number, side, score)
+            {
+                break adjudicated;
             }
-            if is_quiet_sample(&board, best_move, score) {
+            if ply >= SKIPPED_PLIES && is_quiet_sample(&board, best_move, score) {
                 samples.push(Sample {
                     record: Record::new(&board, score as i16, Outcome::Draw),
                     side,
                 });
+            }
+            if RANDOM_MOVE_WINDOW.contains(&ply)
+                && !is_mate_score(score)
+                && random.below(RANDOM_MOVE_CHANCE) == 0
+                && play_random_move(&mut searcher, &mut board, random, best_move, score)
+            {
+                random_moves += 1;
+                continue;
             }
             board.make_move(best_move);
         };
         Some(Game {
             samples,
             searched_plies,
+            random_moves,
             white_outcome,
+            ending,
         })
     });
     let (mut table, _) = searcher.into_parts();
@@ -168,6 +245,9 @@ struct Totals {
     draws: u64,
     black_wins: u64,
     searched_plies: u64,
+    random_moves: u64,
+    adjudicated_wins: u64,
+    adjudicated_draws: u64,
     discarded_openings: u64,
 }
 
@@ -175,6 +255,12 @@ impl Totals {
     fn count(&mut self, game: &Game) {
         self.games += 1;
         self.searched_plies += game.searched_plies;
+        self.random_moves += game.random_moves;
+        match game.ending {
+            Ending::Rules => {}
+            Ending::AdjudicatedWin => self.adjudicated_wins += 1,
+            Ending::AdjudicatedDraw => self.adjudicated_draws += 1,
+        }
         match game.white_outcome {
             Outcome::Win => self.white_wins += 1,
             Outcome::Draw => self.draws += 1,
@@ -277,6 +363,20 @@ fn print_summary(summary: &Summary) {
         percent(totals.draws, totals.games),
         totals.black_wins,
         percent(totals.black_wins, totals.games)
+    );
+    let by_rules = totals.games - totals.adjudicated_wins - totals.adjudicated_draws;
+    eprintln!(
+        "  endings            rules {by_rules} ({:.1}%), adjudicated win {} ({:.1}%), adjudicated draw {} ({:.1}%)",
+        percent(by_rules, totals.games),
+        totals.adjudicated_wins,
+        percent(totals.adjudicated_wins, totals.games),
+        totals.adjudicated_draws,
+        percent(totals.adjudicated_draws, totals.games)
+    );
+    eprintln!(
+        "  random moves       {} ({:.2} per game)",
+        totals.random_moves,
+        ratio(totals.random_moves, totals.games)
     );
     eprintln!(
         "  kept positions     {:.1}% of searched plies",
@@ -394,6 +494,66 @@ mod tests {
     }
 
     #[test]
+    fn adjudicates_decided_and_dead_drawn_games() {
+        let quiet = [0; 24];
+        type Verdict = Option<(usize, Outcome, Ending)>;
+        let cases: [(u16, &[i32], Verdict); 9] = [
+            (
+                10,
+                &[1_000, -1_000, 1_100, -1_200],
+                Some((3, Outcome::Win, Ending::AdjudicatedWin)),
+            ),
+            (
+                10,
+                &[-1_500, 1_500, -1_500, 1_500],
+                Some((3, Outcome::Loss, Ending::AdjudicatedWin)),
+            ),
+            (10, &[1_000, -1_000, 999, -1_000, 1_000, -1_000], None),
+            (10, &[1_000, 1_000, 1_000, 1_000], None),
+            (
+                32,
+                &quiet[..12],
+                Some((11, Outcome::Draw, Ending::AdjudicatedDraw)),
+            ),
+            (
+                32,
+                &[20, -20, 20, -20, 20, -20, 20, -20, 20, -20, 20, -20],
+                Some((11, Outcome::Draw, Ending::AdjudicatedDraw)),
+            ),
+            (25, &quiet[..12], None),
+            (
+                28,
+                &quiet,
+                Some((19, Outcome::Draw, Ending::AdjudicatedDraw)),
+            ),
+            (
+                32,
+                &[0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                None,
+            ),
+        ];
+
+        for (first_move, scores, expected) in cases {
+            let mut adjudication = Adjudication::default();
+            let verdict = scores.iter().enumerate().find_map(|(step, &score)| {
+                let side = if step % 2 == 0 {
+                    Color::White
+                } else {
+                    Color::Black
+                };
+                let move_number = first_move + (step / 2) as u16;
+                adjudication
+                    .observe(move_number, side, score)
+                    .map(|(outcome, ending)| (step, outcome, ending))
+            });
+            assert_eq!(
+                verdict, expected,
+                "first move {first_move}, scores {scores:?}"
+            );
+        }
+    }
+
+    #[test]
     fn renders_progress_lines() {
         let cases = [
             (
@@ -476,6 +636,10 @@ mod tests {
             let Some(game) = game else { continue };
             played += 1;
             assert!(!game.samples.is_empty(), "seed {seed}");
+            assert!(
+                game.samples.len() as u64 <= game.searched_plies.saturating_sub(SKIPPED_PLIES),
+                "seed {seed}"
+            );
             let outcome = game.white_outcome;
             let sides: Vec<Color> = game.samples.iter().map(|sample| sample.side).collect();
             for (record, side) in game.into_records().zip(sides) {
