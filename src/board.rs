@@ -12,9 +12,10 @@ pub use movegen::{MAX_MOVES, MoveList};
 pub use see::see_value;
 
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::nnue::{Accumulator, AccumulatorStack, NETWORK};
 use crate::types::{
     Bitboard, CastlingRights, Color, EveryPiece, EverySide, EverySquare, FILES, Move, Piece, RANKS,
-    Square,
+    SIDES, Square,
 };
 
 pub const MAX_GAME_MOVES: usize = 2048;
@@ -46,11 +47,12 @@ impl GameState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Board {
     pieces: EveryPiece<Bitboard>,
     colors: EverySide<Bitboard>,
     mailbox: EverySquare<Option<Piece>>,
+    nnue: AccumulatorStack,
     pub state: GameState,
     pub history: Vec<GameState>,
 }
@@ -61,9 +63,16 @@ impl Board {
             pieces: EveryPiece::new(Bitboard::empty()),
             colors: EverySide::new(Bitboard::empty()),
             mailbox: EverySquare::new(None),
+            nnue: AccumulatorStack::new(),
             state: GameState::new(),
             history: Vec::with_capacity(MAX_GAME_MOVES),
         }
+    }
+
+    pub fn accumulators(&mut self) -> &[Accumulator; SIDES] {
+        let (pieces, colors) = (&self.pieces, &self.colors);
+        self.nnue
+            .current(&NETWORK, |side, piece| pieces[piece] & colors[side])
     }
 
     pub fn pieces(&self, piece: Piece) -> Bitboard {
@@ -135,6 +144,12 @@ impl Board {
         self.is_king_attacked(self.state.active_color)
     }
 
+    pub fn has_insufficient_material(&self) -> bool {
+        let heavy = self.pieces[Piece::Pawn] | self.pieces[Piece::Rook] | self.pieces[Piece::Queen];
+        let minors = self.pieces[Piece::Knight] | self.pieces[Piece::Bishop];
+        heavy.is_empty() && minors.count() <= 1
+    }
+
     fn put_piece(&mut self, side: Color, piece: Piece, square: Square) {
         debug_assert!(self.mailbox[square].is_none());
         let bit = Bitboard::from_square(square);
@@ -167,6 +182,18 @@ impl Board {
             zobrist::piece_key(side, piece, from) ^ zobrist::piece_key(side, piece, to);
     }
 }
+
+impl PartialEq for Board {
+    fn eq(&self, other: &Self) -> bool {
+        self.pieces == other.pieces
+            && self.colors == other.colors
+            && self.mailbox == other.mailbox
+            && self.state == other.state
+            && self.history == other.history
+    }
+}
+
+impl Eq for Board {}
 
 impl std::fmt::Display for Board {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

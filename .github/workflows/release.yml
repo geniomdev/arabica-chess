@@ -11,7 +11,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Tag matches Cargo.toml version
         run: |
@@ -37,7 +37,7 @@ jobs:
     env:
       RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -51,7 +51,7 @@ jobs:
           mkdir dist
           cp "target/${{ matrix.target }}/release/arabica${{ matrix.ext }}" \
              "dist/arabica-${GITHUB_REF_NAME}-${{ matrix.suffix }}${{ matrix.ext }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: arabica-${{ matrix.suffix }}
           path: dist/*
@@ -62,7 +62,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

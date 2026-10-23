@@ -23,15 +23,18 @@ impl Board {
         let (from, to) = (played.from(), played.to());
         let moving = self.mailbox[from].expect("piece on origin square");
         self.history.push(self.state);
+        self.nnue.push();
 
         let captured = match played.kind() {
             MoveKind::EnPassant => {
                 self.remove_piece(them, Piece::Pawn, en_passant_victim(to));
+                self.nnue.remove(them, Piece::Pawn, en_passant_victim(to));
                 Some(Piece::Pawn)
             }
             _ if played.is_capture() => {
                 let victim = self.mailbox[to].expect("piece on captured square");
                 self.remove_piece(them, victim, to);
+                self.nnue.remove(them, victim, to);
                 Some(victim)
             }
             _ => None,
@@ -40,11 +43,17 @@ impl Board {
             Some(promoted) => {
                 self.remove_piece(us, Piece::Pawn, from);
                 self.put_piece(us, promoted, to);
+                self.nnue.remove(us, Piece::Pawn, from);
+                self.nnue.add(us, promoted, to);
             }
-            None => self.move_piece(us, moving, from, to),
+            None => {
+                self.move_piece(us, moving, from, to);
+                self.nnue.shift(us, moving, from, to);
+            }
         }
         if let Some((rook_from, rook_to)) = castling_rook_path(played) {
             self.move_piece(us, Piece::Rook, rook_from, rook_to);
+            self.nnue.shift(us, Piece::Rook, rook_from, rook_to);
         }
 
         let passed = Square::from_index((from.raw() + to.raw()) / 2);
@@ -80,6 +89,7 @@ impl Board {
         let us = self.state.active_color;
         let them = us.opponent();
         self.history.push(self.state);
+        self.nnue.push();
         let state = &mut self.state;
         state.zobrist_key ^= en_passant_key(state.en_passant) ^ side_key(us) ^ side_key(them);
         state.en_passant = None;
@@ -90,12 +100,14 @@ impl Board {
     }
 
     pub fn unmake_null_move(&mut self) {
+        self.nnue.pop();
         self.state = self.history.pop().expect("null move to unmake");
     }
 
     pub fn unmake_move(&mut self) {
         let undone = self.state;
         let restored = self.history.pop().expect("move to unmake");
+        self.nnue.pop();
         let us = restored.active_color;
         let them = us.opponent();
         let played = undone.played_move;

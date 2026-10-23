@@ -3,9 +3,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, MoveList, see_value};
-use crate::eval::{PawnCache, evaluate};
+use crate::eval::{self, PawnCache};
 use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::movepick::{MovePicker, captured_piece, is_noisy, moved_piece};
+use crate::nnue;
 use crate::strength::EvalNoise;
 use crate::tt::{Bound, Hit, Store, TranspositionTable};
 use crate::types::{Color, Move, Piece, SQUARES};
@@ -76,6 +77,13 @@ static REDUCTIONS: LazyLock<[[i32; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE]>
     });
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Evaluator {
+    #[default]
+    Network,
+    Classical,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchLimits {
     pub depth: Option<u8>,
     pub time: Option<Duration>,
@@ -106,13 +114,14 @@ pub struct Searcher {
     stopped: bool,
     first_iteration_completed: bool,
     eval_noise: EvalNoise,
+    evaluator: Evaluator,
+    pawn_cache: PawnCache,
     pv: [[Move; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
     excluded: [Move; MAX_PLY],
     killers: [[Move; 2]; MAX_PLY],
     history: History,
-    pawn_cache: PawnCache,
     played: [Option<PieceTo>; MAX_PLY],
     root_move_nodes: Box<RootMoveNodes>,
 }
@@ -198,13 +207,14 @@ impl Searcher {
             stopped: false,
             first_iteration_completed: false,
             eval_noise: EvalNoise::default(),
+            evaluator: Evaluator::default(),
+            pawn_cache: PawnCache::default(),
             pv: [[Move::NULL; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             eval_stack: [-INFINITY; MAX_PLY],
             excluded: [Move::NULL; MAX_PLY],
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: History::default(),
-            pawn_cache: PawnCache::default(),
             played: [None; MAX_PLY],
             root_move_nodes: Box::new([[0; SQUARES]; SQUARES]),
         }
@@ -212,6 +222,11 @@ impl Searcher {
 
     pub fn with_eval_noise(mut self, eval_noise: EvalNoise) -> Self {
         self.eval_noise = eval_noise;
+        self
+    }
+
+    pub fn with_evaluator(mut self, evaluator: Evaluator) -> Self {
+        self.evaluator = evaluator;
         self
     }
 
@@ -382,11 +397,15 @@ impl Searcher {
         }
     }
 
-    fn static_evaluation(&mut self, board: &Board) -> i32 {
-        evaluate(board, &mut self.pawn_cache) + self.eval_noise.offset(board.state.zobrist_key)
+    fn static_evaluation(&mut self, board: &mut Board) -> i32 {
+        let raw = match self.evaluator {
+            Evaluator::Network => nnue::evaluate(board),
+            Evaluator::Classical => eval::evaluate(board, &mut self.pawn_cache),
+        };
+        raw + self.eval_noise.offset(board.state.zobrist_key)
     }
 
-    fn cached_static_evaluation(&mut self, board: &Board, hit: Option<Hit>) -> i32 {
+    fn cached_static_evaluation(&mut self, board: &mut Board, hit: Option<Hit>) -> i32 {
         hit.and_then(|hit| hit.static_eval)
             .unwrap_or_else(|| self.static_evaluation(board))
     }
@@ -931,7 +950,7 @@ mod tests {
                 Some("a8a1"),
                 Some(MATE - 1),
             ),
-            ("4k3/8/8/8/8/8/8/RR4K1 w - - 0 1", 4, None, Some(MATE - 3)),
+            ("4k3/8/8/8/8/8/8/RR4K1 w - - 0 1", 5, None, Some(MATE - 3)),
             ("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1", 3, Some("d1d5"), None),
             ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", 3, Some("0000"), Some(0)),
             (
@@ -966,14 +985,14 @@ mod tests {
         let cases = [
             (
                 "4k3/8/8/8/8/8/8/RR4K1 w - - 0 1",
-                4,
+                5,
                 0,
                 MATE - 3..=MATE - 3,
                 None,
             ),
             (
                 "4k3/8/8/8/8/8/8/RR4K1 w - - 0 1",
-                4,
+                5,
                 3_000,
                 MATE - 3..=MATE - 3,
                 None,
@@ -1003,14 +1022,14 @@ mod tests {
                 "3qk3/8/8/8/8/8/8/3QK3 w - - 0 1",
                 6,
                 2_000,
-                -100..=100,
+                -300..=300,
                 None,
             ),
             (
                 "3qk3/8/8/8/8/8/8/3QK3 w - - 0 1",
                 6,
                 -2_000,
-                -100..=100,
+                -300..=300,
                 None,
             ),
         ];

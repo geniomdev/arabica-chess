@@ -2,7 +2,7 @@
 
 A chess engine written in Rust, built on bitboards.
 
-UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, Quiescence search, Check extension, Zobrist hashing, Repetition detection, Transposition table, Staged move generation, Killer moves, History heuristic, Continuation history, Capture history, Null move pruning, Late move reductions, Reverse futility pruning, Futility pruning, Late move pruning, Static exchange evaluation, Tapered evaluation, Threat evaluation, Nonlinear king danger, Pawn structure evaluation, Endgame scaling, Pawn hash table, Texel tuning
+UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, Quiescence search, Check extension, Zobrist hashing, Repetition detection, Transposition table, Staged move generation, Killer moves, History heuristic, Continuation history, Capture history, Null move pruning, Late move reductions, Reverse futility pruning, Futility pruning, Late move pruning, Static exchange evaluation, Tapered evaluation, Threat evaluation, Nonlinear king danger, Pawn structure evaluation, Endgame scaling, Pawn hash table, Texel tuning, NNUE evaluation (768 -> 128 x2 -> 1 SCReLU, lazily updated accumulator stack, AVX2 output layer, self-play data, own CPU trainer)
 
 ## Use
 
@@ -14,6 +14,7 @@ UCI, Magic bitboards, Negamax, Iterative deepening, Principal variation search, 
 - `isready` - readyok
 - `setoption name Hash value <mb>` - resizes the transposition table (1-4096 MB, default 16)
 - `setoption name Move Overhead value <ms>` - time reserved per move for GUI and network latency (0-5000 ms, default 50)
+- `setoption name Use NNUE value <true|false>` - evaluates positions with the embedded network `networks/net1.nnue` (default true) or with the classical hand-crafted evaluation; positions without enough material to mate always evaluate to 0 under the network
 - `setoption name Ponder value <true|false>` - appends the expected reply to `bestmove` as `ponder <move>` (default false)
 - `setoption name UCI_LimitStrength value <true|false>` - plays at the strength set by `UCI_Elo` (default false)
 - `setoption name UCI_Elo value <elo>` - target strength when `UCI_LimitStrength` is on (600-3000, default 1500); weakened by a per-move node limit and deterministic Zobrist-keyed noise in the static evaluation, both interpolated from Elo anchors in `src/strength.rs`

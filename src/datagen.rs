@@ -15,7 +15,7 @@ use crate::random::Random;
 use crate::search::{SearchLimits, Searcher, is_mate_score};
 use crate::strength::fresh_noise_seed;
 use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
-use crate::types::{Color, Move, Piece};
+use crate::types::{Color, Move};
 
 const DEFAULT_NODES: u64 = 5_000;
 const DEFAULT_DATA_DIRECTORY: &str = "data";
@@ -44,12 +44,6 @@ fn legal_moves(board: &mut Board) -> Vec<Move> {
         .collect()
 }
 
-fn has_insufficient_material(board: &Board) -> bool {
-    let heavy = board.pieces(Piece::Pawn) | board.pieces(Piece::Rook) | board.pieces(Piece::Queen);
-    let minors = board.pieces(Piece::Knight) | board.pieces(Piece::Bishop);
-    heavy.is_empty() && minors.count() <= 1
-}
-
 fn rules_outcome(board: &mut Board) -> Option<Outcome> {
     if legal_moves(board).is_empty() {
         let winner = board.state.active_color.opponent();
@@ -61,7 +55,7 @@ fn rules_outcome(board: &mut Board) -> Option<Outcome> {
     }
     let drawn = board.state.halfmove_clock >= FIFTY_MOVE_PLIES
         || board.is_repetition(0)
-        || has_insufficient_material(board);
+        || board.has_insufficient_material();
     drawn.then_some(Outcome::Draw)
 }
 
@@ -379,6 +373,7 @@ mod tests {
     use super::*;
     use crate::board::testing::board;
     use crate::search::MATE_BOUND;
+    use crate::types::Piece;
 
     #[test]
     fn detects_game_end_by_rules() {

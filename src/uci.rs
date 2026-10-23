@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::bench;
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::history::History;
-use crate::search::{Iteration, SearchLimits, Searcher, uci_score};
+use crate::search::{Evaluator, Iteration, SearchLimits, Searcher, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
 use crate::types::{Color, EverySide};
@@ -52,6 +52,7 @@ struct Engine {
     limit_strength: bool,
     elo: u32,
     noise_seed: u64,
+    evaluator: Evaluator,
     search: Option<RunningSearch>,
 }
 
@@ -66,6 +67,7 @@ impl Engine {
             limit_strength: false,
             elo: DEFAULT_ELO,
             noise_seed: fresh_noise_seed(),
+            evaluator: Evaluator::default(),
             search: None,
         }
     }
@@ -86,6 +88,7 @@ impl Engine {
                     "option name Move Overhead type spin default {} min 0 max {MAX_MOVE_OVERHEAD_MS}",
                     DEFAULT_MOVE_OVERHEAD.as_millis()
                 );
+                println!("option name Use NNUE type check default true");
                 println!("option name Ponder type check default false");
                 println!("option name UCI_LimitStrength type check default false");
                 println!(
@@ -111,6 +114,13 @@ impl Engine {
                     Some(EngineOption::Ponder(enabled)) => self.ponder = enabled,
                     Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
                     Some(EngineOption::Elo(elo)) => self.elo = elo,
+                    Some(EngineOption::UseNnue(enabled)) => {
+                        self.evaluator = if enabled {
+                            Evaluator::Network
+                        } else {
+                            Evaluator::Classical
+                        };
+                    }
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
                 }
             }
@@ -169,6 +179,7 @@ impl Engine {
             self.board.clone(),
             limits,
             eval_noise,
+            self.evaluator,
             mem::take(&mut self.table),
             mem::take(&mut self.history),
             SearchMode {
@@ -203,6 +214,7 @@ impl RunningSearch {
         mut board: Board,
         limits: SearchLimits,
         eval_noise: EvalNoise,
+        evaluator: Evaluator,
         table: TranspositionTable,
         history: History,
         mode: SearchMode,
@@ -215,6 +227,7 @@ impl RunningSearch {
             let mut searcher = Searcher::new(limits, Arc::clone(&searcher_stop), table)
                 .with_ponder_signal(Arc::clone(&searcher_ponder))
                 .with_eval_noise(eval_noise)
+                .with_evaluator(evaluator)
                 .with_history(history);
             let (best_move, _) = searcher.search(&mut board, print_iteration);
             while !searcher_stop.load(Ordering::Acquire)
@@ -403,6 +416,7 @@ enum EngineOption {
     Ponder(bool),
     LimitStrength(bool),
     Elo(u32),
+    UseNnue(bool),
 }
 
 fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
@@ -422,6 +436,7 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
         }
         "ponder" => parse_check(value).map(EngineOption::Ponder),
         "uci_limitstrength" => parse_check(value).map(EngineOption::LimitStrength),
+        "use nnue" => parse_check(value).map(EngineOption::UseNnue),
         "uci_elo" => {
             let elo: u32 = value.parse().ok()?;
             Some(EngineOption::Elo(elo.clamp(MIN_ELO, MAX_ELO)))
@@ -641,6 +656,15 @@ mod tests {
             ("name UCI_Elo value 100", Some(EngineOption::Elo(MIN_ELO))),
             ("name UCI_Elo value 99999", Some(EngineOption::Elo(MAX_ELO))),
             ("name UCI_Elo value -5", None),
+            (
+                "name Use NNUE value false",
+                Some(EngineOption::UseNnue(false)),
+            ),
+            (
+                "name use nnue value TRUE",
+                Some(EngineOption::UseNnue(true)),
+            ),
+            ("name Use NNUE value off", None),
         ];
 
         for (command, expected) in cases {

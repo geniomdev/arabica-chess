@@ -1,9 +1,13 @@
-#![allow(dead_code)]
-
 pub mod data;
+mod simd;
+mod stack;
+
+use std::sync::LazyLock;
 
 use crate::board::Board;
+use crate::search::MATE_BOUND;
 use crate::types::{Color, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
+pub use stack::AccumulatorStack;
 
 pub const INPUTS: usize = SIDES * PIECE_TYPES * SQUARES;
 pub const HIDDEN: usize = 128;
@@ -31,10 +35,30 @@ pub struct Network {
 pub const NETWORK_BYTES: usize = std::mem::size_of::<Network>();
 
 const VALUE_BYTES: usize = std::mem::size_of::<i16>();
+const MAX_EVALUATION: i32 = MATE_BOUND - 1;
 
-fn screlu(value: i16) -> i32 {
-    let clipped = i32::from(value).clamp(0, QA);
-    clipped * clipped
+const EMBEDDED_NETWORK: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/networks/net1.nnue"));
+const _: () = assert!(EMBEDDED_NETWORK.len() == NETWORK_BYTES);
+
+pub static NETWORK: LazyLock<Box<Network>> = LazyLock::new(|| {
+    Network::from_bytes(EMBEDDED_NETWORK).expect("embedded network matches the layout")
+});
+
+static MADD_OUTPUT: LazyLock<bool> =
+    LazyLock::new(|| *simd::AVX2 && simd::fits_madd(&NETWORK.output_weights));
+
+pub fn evaluate(board: &mut Board) -> i32 {
+    if board.has_insufficient_material() {
+        return 0;
+    }
+    let us = board.state.active_color;
+    let accumulators = board.accumulators();
+    let (our_weights, their_weights) = NETWORK.output_weights.split_at(HIDDEN);
+    let madd = *MADD_OUTPUT;
+    let sum = simd::screlu_dot(madd, &accumulators[us.index()].0, our_weights)
+        + simd::screlu_dot(madd, &accumulators[us.opponent().index()].0, their_weights);
+    NETWORK.finish(sum).clamp(-MAX_EVALUATION, MAX_EVALUATION)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +71,7 @@ impl Accumulator {
         }
     }
 
+    #[cfg(test)]
     pub fn remove(&mut self, network: &Network, feature: usize) {
         for (value, weight) in self.0.iter_mut().zip(&network.feature_weights[feature]) {
             *value -= weight;
@@ -108,12 +133,13 @@ impl Network {
 
     pub fn evaluate(&self, us: &Accumulator, them: &Accumulator) -> i32 {
         let (our_weights, their_weights) = self.output_weights.split_at(HIDDEN);
-        let sum: i32 =
-            us.0.iter()
-                .zip(our_weights)
-                .chain(them.0.iter().zip(their_weights))
-                .map(|(&value, &weight)| screlu(value) * i32::from(weight))
-                .sum();
+        self.finish(
+            simd::screlu_dot_portable(&us.0, our_weights)
+                + simd::screlu_dot_portable(&them.0, their_weights),
+        )
+    }
+
+    fn finish(&self, sum: i32) -> i32 {
         let output = i64::from(sum / QA + i32::from(self.output_bias));
         (output * i64::from(SCALE) / i64::from(QA * QB)) as i32
     }
@@ -125,6 +151,7 @@ pub fn feature_index(perspective: Color, side: Color, piece: Piece, square: Squa
         + relative_square(perspective, square).index()
 }
 
+#[cfg(test)]
 pub fn active_features(board: &Board, perspective: Color) -> impl Iterator<Item = usize> + '_ {
     Color::ALL.into_iter().flat_map(move |side| {
         Piece::ALL.into_iter().flat_map(move |piece| {
@@ -141,7 +168,7 @@ mod tests {
     use super::*;
     use crate::board::color_flipped_fen;
     use crate::board::testing::board;
-    use crate::board::{KIWIPETE, START_POSITION};
+    use crate::board::{KIWIPETE, MoveList, START_POSITION};
 
     #[test]
     fn feature_indices_cover_inputs_exactly_once() {
@@ -319,5 +346,123 @@ mod tests {
             incremental.remove(&network, feature);
         }
         assert_eq!(incremental, network.refresh([]));
+    }
+
+    fn assert_fresh_accumulators(position: &mut Board, context: &str) {
+        let fresh =
+            Color::ALL.map(|perspective| NETWORK.refresh(active_features(position, perspective)));
+        let fen = position.to_fen();
+        assert_eq!(position.accumulators(), &fresh, "{context}, fen {fen:?}");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Probe {
+        EveryNode,
+        LeavesOnly,
+        NullMoves,
+    }
+
+    fn walk(position: &mut Board, depth: u32, probe: Probe, context: &str) -> u64 {
+        if depth == 0 || matches!(probe, Probe::EveryNode) {
+            assert_fresh_accumulators(position, context);
+        }
+        if depth == 0 {
+            return 1;
+        }
+        if matches!(probe, Probe::NullMoves) && !position.in_check() {
+            position.make_null_move();
+            assert_fresh_accumulators(position, context);
+            position.unmake_null_move();
+        }
+        let mut moves = MoveList::new();
+        position.generate_pseudo_legal(&mut moves);
+        let mut nodes = 0;
+        for &candidate in moves.as_slice() {
+            let before = position.clone();
+            if position.make_move(candidate) {
+                nodes += walk(position, depth - 1, probe, context);
+                position.unmake_move();
+            }
+            assert_eq!(*position, before, "{context}, move {candidate} not undone");
+        }
+        nodes
+    }
+
+    #[test]
+    fn incremental_accumulators_match_refreshes() {
+        let cases = [
+            (START_POSITION, 3, 8_902),
+            (KIWIPETE, 2, 2_039),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 3, 2_812),
+            (
+                "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+                2,
+                264,
+            ),
+            (
+                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+                2,
+                1_486,
+            ),
+        ];
+        let probes = [Probe::EveryNode, Probe::LeavesOnly, Probe::NullMoves];
+
+        for (fen, depth, expected_nodes) in cases {
+            for probe in probes {
+                let mut position = board(fen);
+                let context = format!("{fen} with {probe:?}");
+                let nodes = walk(&mut position, depth, probe, &context);
+                assert_eq!(nodes, expected_nodes, "{context}");
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_network_evaluates_symmetrically() {
+        let cases = [
+            START_POSITION,
+            KIWIPETE,
+            "4k3/8/8/8/4P3/8/8/4K3 w - - 0 1",
+            "6k1/5p1p/4N3/8/8/8/8/4K1Q1 b - - 0 1",
+            "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        ];
+
+        for fen in cases {
+            let score = evaluate(&mut board(fen));
+            let mirrored = evaluate(&mut board(&color_flipped_fen(fen)));
+            assert_eq!(score, mirrored, "fen {fen:?}");
+            assert!(score.abs() < MAX_EVALUATION, "fen {fen:?}, score {score}");
+        }
+    }
+
+    #[test]
+    fn embedded_network_values_material() {
+        let cases = [
+            (
+                "rnbqkbnr/ppp1pppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                50..=300,
+            ),
+            (
+                "r1bqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                250..=800,
+            ),
+            (
+                "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                800..=2500,
+            ),
+            (
+                "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
+                -2500..=-800,
+            ),
+            (START_POSITION, -60..=60),
+            ("8/8/8/8/8/8/8/k6K w - - 0 1", 0..=0),
+            ("8/8/8/8/8/8/8/k5NK b - - 0 1", 0..=0),
+            ("8/8/3b4/8/8/8/8/k6K w - - 0 1", 0..=0),
+        ];
+
+        for (fen, expected) in cases {
+            let score = evaluate(&mut board(fen));
+            assert!(expected.contains(&score), "fen {fen:?}, score {score}");
+        }
     }
 }
