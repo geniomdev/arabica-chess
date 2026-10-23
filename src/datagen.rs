@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -8,7 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, MoveList, START_POSITION, color_flipped_fen};
+use crate::cli::{default_threads, parse_argument, usage_error};
 use crate::nnue::data::{Outcome, RECORD_BYTES, Record};
+use crate::progress::{Ticker, bar, eta, format_duration, percent};
+use crate::random::Random;
 use crate::search::{SearchLimits, Searcher, is_mate_score};
 use crate::strength::fresh_noise_seed;
 use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
@@ -21,31 +24,8 @@ const OPENING_SCORE_LIMIT: i32 = 500;
 const WIN_ADJUDICATION_SCORE: i32 = 2_500;
 const WIN_ADJUDICATION_PLIES: usize = 4;
 const FIFTY_MOVE_PLIES: u8 = 100;
-const TERMINAL_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
-const LOG_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
-const PROGRESS_BAR_WIDTH: usize = 30;
-const CLEAR_TO_LINE_END: &str = "\x1b[K";
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const THREAD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
-
-struct Random(u64);
-
-impl Random {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, bound: usize) -> usize {
-        (self.next() % bound as u64) as usize
-    }
-}
 
 fn legal_moves(board: &mut Board) -> Vec<Move> {
     let mut moves = MoveList::new();
@@ -251,42 +231,15 @@ fn generate(output: &Mutex<Output>, seed: u64, nodes: u64) {
     }
 }
 
-fn percent(part: u64, whole: u64) -> f64 {
-    if whole == 0 {
-        0.0
-    } else {
-        100.0 * part as f64 / whole as f64
-    }
-}
-
 fn progress_line(positions: u64, target: u64, elapsed: Duration) -> String {
     let done = positions.min(target);
-    let filled = (PROGRESS_BAR_WIDTH as u64 * done / target.max(1)) as usize;
-    let bar = format!(
-        "{}{}",
-        "#".repeat(filled),
-        "-".repeat(PROGRESS_BAR_WIDTH - filled)
-    );
     let rate = positions as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
-    let eta = if positions == 0 {
-        String::from("-:--:--")
-    } else {
-        format_duration(Duration::from_secs_f64((target - done) as f64 / rate))
-    };
     format!(
-        "[{bar}] {:5.1}%  {done}/{target}  elapsed {}  eta {eta}  {rate:.0}/s",
+        "{} {:5.1}%  {done}/{target}  elapsed {}  eta {}  {rate:.0}/s",
+        bar(done, target),
         percent(done, target),
-        format_duration(elapsed)
-    )
-}
-
-fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    format!(
-        "{}:{:02}:{:02}",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
+        format_duration(elapsed),
+        eta(done, target, elapsed)
     )
 }
 
@@ -352,21 +305,6 @@ fn print_summary(summary: &Summary) {
     );
 }
 
-fn parse_argument<T: std::str::FromStr>(
-    value: Option<&String>,
-    name: &str,
-    default: T,
-) -> io::Result<T> {
-    value.map_or(Ok(default), |text| {
-        text.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid {name}: {text}"),
-            )
-        })
-    })
-}
-
 fn default_output(nodes: u64) -> PathBuf {
     let version = env!("CARGO_PKG_VERSION");
     PathBuf::from(DEFAULT_DATA_DIRECTORY).join(format!("arabica-{version}-n{nodes}.bin"))
@@ -374,15 +312,12 @@ fn default_output(nodes: u64) -> PathBuf {
 
 pub fn run(arguments: &[String]) -> io::Result<()> {
     let [positions, rest @ ..] = arguments else {
-        eprintln!("usage: arabica datagen <positions> [threads] [nodes] [output]");
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing arguments",
+        return Err(usage_error(
+            "arabica datagen <positions> [threads] [nodes] [output]",
         ));
     };
     let target: u64 = parse_argument(Some(positions), "positions", 0)?;
-    let default_threads = thread::available_parallelism().map_or(1, usize::from);
-    let threads: usize = parse_argument(rest.first(), "threads", default_threads)?.max(1);
+    let threads: usize = parse_argument(rest.first(), "threads", default_threads())?.max(1);
     let nodes: u64 = parse_argument(rest.get(1), "nodes", DEFAULT_NODES)?.max(1);
     let path = rest
         .get(2)
@@ -411,32 +346,15 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
             let seed = base_seed.wrapping_add(index.wrapping_mul(THREAD_SEED_STRIDE));
             scope.spawn(move || generate(output, seed, nodes));
         }
-        let interactive = io::stderr().is_terminal();
-        let interval = if interactive {
-            TERMINAL_PROGRESS_INTERVAL
-        } else {
-            LOG_PROGRESS_INTERVAL
-        };
         let positions = || output.lock().expect("output lock").totals.positions;
-        let mut last_report = Instant::now();
+        let mut ticker = Ticker::new();
         while !output.lock().expect("output lock").is_done() {
             thread::sleep(POLL_INTERVAL);
-            if last_report.elapsed() >= interval {
-                let line = progress_line(positions(), target, started.elapsed());
-                if interactive {
-                    eprint!("\r{line}{CLEAR_TO_LINE_END}");
-                } else {
-                    eprintln!("{line}");
-                }
-                last_report = Instant::now();
+            if ticker.due() {
+                ticker.show(&progress_line(positions(), target, started.elapsed()));
             }
         }
-        let line = progress_line(positions(), target, started.elapsed());
-        if interactive {
-            eprintln!("\r{line}{CLEAR_TO_LINE_END}");
-        } else {
-            eprintln!("{line}");
-        }
+        ticker.finish(&progress_line(positions(), target, started.elapsed()));
     });
 
     let elapsed = started.elapsed();
@@ -513,26 +431,6 @@ mod tests {
     }
 
     #[test]
-    fn formats_durations() {
-        let cases = [
-            (0, "0:00:00"),
-            (59, "0:00:59"),
-            (61, "0:01:01"),
-            (3_600, "1:00:00"),
-            (45_296, "12:34:56"),
-            (100 * 3_600, "100:00:00"),
-        ];
-
-        for (seconds, expected) in cases {
-            assert_eq!(
-                format_duration(Duration::from_secs(seconds)),
-                expected,
-                "{seconds} s"
-            );
-        }
-    }
-
-    #[test]
     fn default_output_names_version_and_nodes() {
         let version = env!("CARGO_PKG_VERSION");
         let cases = [
@@ -541,7 +439,11 @@ mod tests {
         ];
 
         for (nodes, expected) in cases {
-            assert_eq!(default_output(nodes), PathBuf::from(expected), "nodes {nodes}");
+            assert_eq!(
+                default_output(nodes),
+                PathBuf::from(expected),
+                "nodes {nodes}"
+            );
         }
     }
 
