@@ -19,8 +19,6 @@ Evaluation uses a SCReLU NNUE with a lazily updated accumulator stack and an AVX
 | Memory layout | Network rows and accumulators aligned to 64 bytes, so every 1 KB row starts on a cache line |
 | Special cases | Positions without enough material to mate evaluate to 0 |
 
-Networks of a different hidden size are rejected by size: `net1.nnue` (128 neurons) no longer loads into this build.
-
 ## Network history
 
 | Network | Data | Training | Result |

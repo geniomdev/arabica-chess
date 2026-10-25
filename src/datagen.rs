@@ -1,6 +1,5 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,15 +21,12 @@ const DEFAULT_NODES: u64 = 5_000;
 const DEFAULT_DATA_DIRECTORY: &str = "data";
 const RANDOM_PLIES: usize = 8;
 const OPENING_SCORE_LIMIT: i32 = 500;
-const WIN_ADJUDICATION_SCORE: i32 = 2_500;
+const WIN_ADJUDICATION_SCORE: i32 = 2_000;
 const WIN_ADJUDICATION_PLIES: usize = 4;
 const DRAW_ADJUDICATION_MOVE: u16 = 32;
 const DRAW_ADJUDICATION_SCORE: i32 = 20;
 const DRAW_ADJUDICATION_PLIES: usize = 12;
 const SKIPPED_PLIES: u64 = 6;
-const RANDOM_MOVE_WINDOW: Range<u64> = SKIPPED_PLIES..60;
-const RANDOM_MOVE_CHANCE: usize = 10;
-const RANDOM_MOVE_MARGIN: i32 = 50;
 const FIFTY_MOVE_PLIES: u8 = 100;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const THREAD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -120,7 +116,6 @@ struct Sample {
 struct Game {
     samples: Vec<Sample>,
     searched_plies: u64,
-    random_moves: u64,
     white_outcome: Outcome,
     ending: Ending,
 }
@@ -152,31 +147,6 @@ fn random_opening(random: &mut Random) -> Option<Board> {
     Some(flipped.parse().expect("flipped opening is valid"))
 }
 
-fn play_random_move(
-    searcher: &mut Searcher,
-    board: &mut Board,
-    random: &mut Random,
-    best_move: Move,
-    score: i32,
-) -> bool {
-    let alternatives: Vec<Move> = legal_moves(board)
-        .into_iter()
-        .filter(|&candidate| candidate != best_move)
-        .collect();
-    if alternatives.is_empty() {
-        return false;
-    }
-    board.make_move(alternatives[random.below(alternatives.len())]);
-    if rules_outcome(board).is_none() {
-        let (_, reply) = searcher.search(board, |_| {});
-        if -reply >= score - RANDOM_MOVE_MARGIN {
-            return true;
-        }
-    }
-    board.unmake_move();
-    false
-}
-
 fn play_game(
     random: &mut Random,
     table: TranspositionTable,
@@ -190,7 +160,6 @@ fn play_game(
     let game = random_opening(random).and_then(|mut board| {
         let mut samples = Vec::new();
         let mut searched_plies = 0;
-        let mut random_moves = 0;
         let mut adjudication = Adjudication::default();
         let (white_outcome, ending) = loop {
             if let Some(outcome) = rules_outcome(&mut board) {
@@ -214,20 +183,11 @@ fn play_game(
                     side,
                 });
             }
-            if RANDOM_MOVE_WINDOW.contains(&ply)
-                && !is_mate_score(score)
-                && random.below(RANDOM_MOVE_CHANCE) == 0
-                && play_random_move(&mut searcher, &mut board, random, best_move, score)
-            {
-                random_moves += 1;
-                continue;
-            }
             board.make_move(best_move);
         };
         Some(Game {
             samples,
             searched_plies,
-            random_moves,
             white_outcome,
             ending,
         })
@@ -245,7 +205,6 @@ struct Totals {
     draws: u64,
     black_wins: u64,
     searched_plies: u64,
-    random_moves: u64,
     adjudicated_wins: u64,
     adjudicated_draws: u64,
     discarded_openings: u64,
@@ -255,7 +214,6 @@ impl Totals {
     fn count(&mut self, game: &Game) {
         self.games += 1;
         self.searched_plies += game.searched_plies;
-        self.random_moves += game.random_moves;
         match game.ending {
             Ending::Rules => {}
             Ending::AdjudicatedWin => self.adjudicated_wins += 1,
@@ -372,11 +330,6 @@ fn print_summary(summary: &Summary) {
         percent(totals.adjudicated_wins, totals.games),
         totals.adjudicated_draws,
         percent(totals.adjudicated_draws, totals.games)
-    );
-    eprintln!(
-        "  random moves       {} ({:.2} per game)",
-        totals.random_moves,
-        ratio(totals.random_moves, totals.games)
     );
     eprintln!(
         "  kept positions     {:.1}% of searched plies",
@@ -500,7 +453,7 @@ mod tests {
         let cases: [(u16, &[i32], Verdict); 10] = [
             (
                 10,
-                &[2_500, -2_500, 2_600, -2_700],
+                &[2_000, -2_000, 2_100, -2_200],
                 Some((3, Outcome::Win, Ending::AdjudicatedWin)),
             ),
             (
@@ -508,8 +461,8 @@ mod tests {
                 &[-3_000, 3_000, -3_000, 3_000],
                 Some((3, Outcome::Loss, Ending::AdjudicatedWin)),
             ),
-            (10, &[2_500, -2_500, 2_499, -2_500, 2_500, -2_500], None),
-            (10, &[2_500, 2_500, 2_500, 2_500], None),
+            (10, &[2_000, -2_000, 1_999, -2_000, 2_000, -2_000], None),
+            (10, &[2_000, 2_000, 2_000, 2_000], None),
             (10, &[1_500, -1_500, 1_500, -1_500, 1_500, -1_500], None),
             (
                 32,
