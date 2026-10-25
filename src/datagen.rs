@@ -22,7 +22,7 @@ const DEFAULT_NODES: u64 = 5_000;
 const DEFAULT_DATA_DIRECTORY: &str = "data";
 const RANDOM_PLIES: usize = 8;
 const OPENING_SCORE_LIMIT: i32 = 500;
-const WIN_ADJUDICATION_SCORE: i32 = 1_000;
+const WIN_ADJUDICATION_SCORE: i32 = 2_500;
 const WIN_ADJUDICATION_PLIES: usize = 4;
 const DRAW_ADJUDICATION_MOVE: u16 = 32;
 const DRAW_ADJUDICATION_SCORE: i32 = 20;
@@ -497,19 +497,20 @@ mod tests {
     fn adjudicates_decided_and_dead_drawn_games() {
         let quiet = [0; 24];
         type Verdict = Option<(usize, Outcome, Ending)>;
-        let cases: [(u16, &[i32], Verdict); 9] = [
+        let cases: [(u16, &[i32], Verdict); 10] = [
             (
                 10,
-                &[1_000, -1_000, 1_100, -1_200],
+                &[2_500, -2_500, 2_600, -2_700],
                 Some((3, Outcome::Win, Ending::AdjudicatedWin)),
             ),
             (
                 10,
-                &[-1_500, 1_500, -1_500, 1_500],
+                &[-3_000, 3_000, -3_000, 3_000],
                 Some((3, Outcome::Loss, Ending::AdjudicatedWin)),
             ),
-            (10, &[1_000, -1_000, 999, -1_000, 1_000, -1_000], None),
-            (10, &[1_000, 1_000, 1_000, 1_000], None),
+            (10, &[2_500, -2_500, 2_499, -2_500, 2_500, -2_500], None),
+            (10, &[2_500, 2_500, 2_500, 2_500], None),
+            (10, &[1_500, -1_500, 1_500, -1_500, 1_500, -1_500], None),
             (
                 32,
                 &quiet[..12],
