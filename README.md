@@ -41,4 +41,4 @@ Board representation and move generation are summarized in [docs/board.md](docs/
 
 Search techniques are listed in [docs/search.md](docs/search.md).
 
-Network details and the training pipeline are described in [docs/train.md](docs/train.md).
+Network details and the training pipeline are described in [docs/nnue.md](docs/nnue.md).
