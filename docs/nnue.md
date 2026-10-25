@@ -26,6 +26,7 @@ Networks of a different hidden size are rejected by size: `net1.nnue` (128 neuro
 | Network | Data | Training | Result |
 |---|---|---|---|
 | `net1` (0.2.0), `768 -> 128 x2 -> 1` | 100M positions from 964 632 self-play games of arabica 0.1.3 (HCE), 5000 nodes per move, 12 threads, 12 h | 40 epochs, ~25 s each; final loss 0.005618 train, 0.005643 validation | +219.9 ± 58.3 Elo vs 0.1.3 (HCE), 100 games, 10+0.1, `8moves_v3.pgn`: +61 -5 =34 |
+| `net2` (0.3.0), `768 -> 512 x2 -> 1` | 200M positions from self-play of arabica 0.2.0 (`net1`), 5000 nodes per move, 12 threads, 21 h | 40 epochs, ~2:49 each, 1:52:38 total; final loss 0.006827 train, 0.006873 validation | +74.1 ± 46.6 Elo vs 0.2.0 (`net1`), 100 games, 10+0.1, `8moves_v3.pgn`: +34 -13 =53 |
 
 ## Trainer
 
