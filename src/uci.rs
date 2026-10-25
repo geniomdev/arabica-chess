@@ -791,6 +791,7 @@ mod tests {
                 time,
                 soft_time,
                 nodes: None,
+                soft_nodes: None,
             };
             let limits = parse_go(&tokens(command)).limits(side, Duration::from_millis(overhead));
             assert_eq!(

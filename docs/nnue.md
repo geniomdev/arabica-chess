@@ -64,6 +64,6 @@ The trainer replays each game from its start position, checks every move for leg
 
 ## Train commands
 
-- `./target/release/arabica datagen <positions> [threads] [nodes] [output]` - plays self-play games (all cores, 5000 nodes per move by default) until `<positions>` positions pass the default filter and appends the games to `<output>` (default `data/arabica-<version>-n<nodes>.games`); rerunning with the same settings resumes the same file, and a file without the games header is refused
+- `./target/release/arabica datagen <positions> [threads] [nodes] [output]` - plays self-play games (all cores, a soft limit of 2000 nodes per move by default: an iteration that reaches the limit is the last one, and a hard limit of 10x the soft one cuts runaway iterations; this averages about 5000 nodes per move) until `<positions>` positions pass the default filter and appends the games to `<output>` (default `data/arabica-<version>-n<nodes>.games`); rerunning with the same settings resumes the same file, and a file without the games header is refused
 - `./target/release/arabica-train train <data> <checkpoint> [epochs] [threads]` - trains the network on a games file or a position file (40 epochs, all cores by default), resumes an existing checkpoint and exports a `.nnue` network next to it after every epoch; the kept positions are held in memory at 32 bytes each
 - `./target/release/arabica-train export <checkpoint> [network]` - quantizes a checkpoint into the engine's `.nnue` format (default: the checkpoint path with the `.nnue` extension)

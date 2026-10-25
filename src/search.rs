@@ -81,6 +81,7 @@ pub struct SearchLimits {
     pub time: Option<Duration>,
     pub soft_time: Option<Duration>,
     pub nodes: Option<u64>,
+    pub soft_nodes: Option<u64>,
 }
 
 pub struct Iteration<'a> {
@@ -265,6 +266,7 @@ impl Searcher {
             self.first_iteration_completed = true;
             if self.stopped
                 || self.node_limit_reached()
+                || self.soft_node_limit_reached()
                 || is_mate_score(score)
                 || best.0 == Move::NULL
                 || self.soft_time_expired(time_scale)
@@ -301,6 +303,10 @@ impl Searcher {
     pub fn with_history(mut self, history: History) -> Self {
         self.history = history;
         self
+    }
+
+    pub fn nodes(&self) -> u64 {
+        self.nodes
     }
 
     pub fn into_parts(self) -> (TranspositionTable, History) {
@@ -369,6 +375,12 @@ impl Searcher {
 
     fn node_limit_reached(&self) -> bool {
         self.first_iteration_completed && self.limits.nodes.is_some_and(|limit| self.nodes >= limit)
+    }
+
+    fn soft_node_limit_reached(&self) -> bool {
+        self.limits
+            .soft_nodes
+            .is_some_and(|limit| self.nodes >= limit)
     }
 
     fn visit_node(&mut self) {
@@ -911,8 +923,8 @@ impl Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::START_POSITION;
     use crate::board::testing::board;
+    use crate::board::{KIWIPETE, START_POSITION};
 
     #[test]
     fn finds_best_move() {
@@ -1149,6 +1161,47 @@ mod tests {
             assert_ne!(best_move, Move::NULL, "fen {fen:?}");
             assert_eq!(best_move, pv_head, "fen {fen:?}");
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
+        }
+    }
+
+    #[test]
+    fn stops_after_the_iteration_that_reaches_soft_nodes() {
+        let cases = [
+            (START_POSITION, 5_000, None),
+            (KIWIPETE, 5_000, None),
+            (START_POSITION, 20_000, None),
+            (KIWIPETE, 5_000, Some(50_000)),
+            (KIWIPETE, 50_000, Some(5_000)),
+        ];
+
+        for (fen, soft_limit, hard_limit) in cases {
+            let mut board = board(fen);
+            let limits = SearchLimits {
+                nodes: hard_limit,
+                soft_nodes: Some(soft_limit),
+                ..SearchLimits::default()
+            };
+            let mut reports = Vec::new();
+            Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+                .search(&mut board, |iteration| {
+                    reports.push((iteration.depth, iteration.nodes))
+                });
+            let context = format!("fen {fen:?}, soft {soft_limit}, hard {hard_limit:?}");
+            let depths: Vec<u8> = reports.iter().map(|&(depth, _)| depth).collect();
+            let expected_depths: Vec<u8> = (1..=reports.len() as u8).collect();
+            assert_eq!(depths, expected_depths, "{context}");
+            let &(_, last_nodes) = reports.last().expect("an iteration reported");
+            match hard_limit {
+                Some(hard) if hard < soft_limit => {
+                    assert!(last_nodes <= hard.max(reports[0].1), "{context}")
+                }
+                _ => {
+                    assert!(last_nodes >= soft_limit, "{context}");
+                    if let [.., (_, before_last), _] = reports.as_slice() {
+                        assert!(*before_last < soft_limit, "{context}");
+                    }
+                }
+            }
         }
     }
 

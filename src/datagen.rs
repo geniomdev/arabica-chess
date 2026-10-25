@@ -18,7 +18,8 @@ use crate::strength::fresh_noise_seed;
 use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
 use crate::types::{Color, Move};
 
-const DEFAULT_NODES: u64 = 5_000;
+const DEFAULT_NODES: u64 = 2_000;
+const HARD_NODE_FACTOR: u64 = 10;
 const DEFAULT_DATA_DIRECTORY: &str = "data";
 const RANDOM_PLIES: usize = 8;
 const OPENING_SCORE_LIMIT: i32 = 500;
@@ -105,6 +106,7 @@ struct PlayedGame {
     game: games::Game,
     positions: u64,
     searched_plies: u64,
+    searched_nodes: u64,
     ending: Ending,
 }
 
@@ -130,7 +132,8 @@ fn play_game(
     nodes: u64,
 ) -> (Option<PlayedGame>, TranspositionTable) {
     let limits = SearchLimits {
-        nodes: Some(nodes),
+        nodes: Some(nodes.saturating_mul(HARD_NODE_FACTOR)),
+        soft_nodes: Some(nodes),
         ..SearchLimits::default()
     };
     let mut searcher = Searcher::new(limits, Arc::new(AtomicBool::new(false)), table);
@@ -139,12 +142,14 @@ fn play_game(
         let mut plies = Vec::new();
         let mut positions = 0;
         let mut searched_plies = 0;
+        let mut searched_nodes = 0;
         let mut adjudication = Adjudication::default();
         let (white_outcome, ending) = loop {
             if let Some(outcome) = rules_outcome(&mut board) {
                 break (outcome, Ending::Rules);
             }
             let (best_move, score) = searcher.search(&mut board, |_| {});
+            searched_nodes += searcher.nodes();
             if searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
                 return None;
             }
@@ -174,6 +179,7 @@ fn play_game(
             },
             positions,
             searched_plies: searched_plies as u64,
+            searched_nodes,
             ending,
         })
     });
@@ -190,6 +196,7 @@ struct Totals {
     draws: u64,
     black_wins: u64,
     searched_plies: u64,
+    searched_nodes: u64,
     adjudicated_wins: u64,
     adjudicated_draws: u64,
     discarded_openings: u64,
@@ -200,6 +207,7 @@ impl Totals {
         self.games += 1;
         self.positions += played.positions;
         self.searched_plies += played.searched_plies;
+        self.searched_nodes += played.searched_nodes;
         match played.ending {
             Ending::Rules => {}
             Ending::AdjudicatedWin => self.adjudicated_wins += 1,
@@ -323,8 +331,14 @@ fn print_summary(summary: &Summary) {
         percent(totals.discarded_openings, attempted)
     );
     eprintln!(
-        "  settings           {} threads, {} nodes per move",
-        summary.threads, summary.nodes
+        "  settings           {} threads, {} soft nodes per move, {} hard",
+        summary.threads,
+        summary.nodes,
+        summary.nodes.saturating_mul(HARD_NODE_FACTOR)
+    );
+    eprintln!(
+        "  search             {:.0} nodes per move",
+        ratio(totals.searched_nodes, totals.searched_plies)
     );
     eprintln!(
         "  file               {}: {} games, {} plies, {:.1} MB",
