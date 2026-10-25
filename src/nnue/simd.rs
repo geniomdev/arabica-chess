@@ -2,16 +2,17 @@ use super::{HIDDEN, QA};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm256_add_epi32,
-    _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-    _mm256_max_epi16, _mm256_min_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
-    _mm256_setzero_si256,
+    __m256i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_max_epi16,
+    _mm256_min_epi16, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_setzero_si256,
+    _mm256_storeu_si256,
 };
 
 pub const MADD_WEIGHT_LIMIT: i16 = 128;
 
 #[cfg(target_arch = "x86_64")]
 const AVX2_LANES: usize = 16;
+#[cfg(target_arch = "x86_64")]
+const AVX2_SUMS: usize = 8;
 
 pub static AVX2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(has_avx2);
 
@@ -26,20 +27,20 @@ pub fn has_avx2() -> bool {
     }
 }
 
-pub fn screlu_dot_portable(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i32 {
+pub fn screlu_dot_portable(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
     accumulator
         .iter()
         .zip(weights)
         .map(|(&value, &weight)| {
-            let clipped = i32::from(value).clamp(0, QA);
-            clipped * clipped * i32::from(weight)
+            let clipped = i64::from(value).clamp(0, i64::from(QA));
+            clipped * clipped * i64::from(weight)
         })
         .sum()
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-fn screlu_dot_avx2(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i32 {
+fn screlu_dot_avx2(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
     assert_eq!(weights.len(), HIDDEN);
     let zero = _mm256_setzero_si256();
     let ceiling = _mm256_set1_epi16(QA as i16);
@@ -55,16 +56,12 @@ fn screlu_dot_avx2(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i32 {
         let weighted = _mm256_mullo_epi16(clipped, row);
         sum = _mm256_add_epi32(sum, _mm256_madd_epi16(weighted, clipped));
     }
-    let halves = _mm_add_epi32(
-        _mm256_castsi256_si128(sum),
-        _mm256_extracti128_si256::<1>(sum),
-    );
-    let pairs = _mm_add_epi32(halves, _mm_shuffle_epi32::<0b01_00_11_10>(halves));
-    let total = _mm_add_epi32(pairs, _mm_shuffle_epi32::<0b10_11_00_01>(pairs));
-    _mm_cvtsi128_si32(total)
+    let mut lanes = [0i32; AVX2_SUMS];
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sum) };
+    lanes.iter().map(|&lane| i64::from(lane)).sum()
 }
 
-pub fn screlu_dot(madd: bool, accumulator: &[i16; HIDDEN], weights: &[i16]) -> i32 {
+pub fn screlu_dot(madd: bool, accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
     #[cfg(target_arch = "x86_64")]
     if madd {
         return unsafe { screlu_dot_avx2(accumulator, weights) };
@@ -100,6 +97,7 @@ mod tests {
             (3, -32_768, 32_767, -128, 128),
             (4, 200, 400, 128, 128),
             (5, 255, 255, -128, -128),
+            (6, 255, 255, 128, 128),
         ];
 
         for (seed, low, high, weight_low, weight_high) in cases {
@@ -110,6 +108,21 @@ mod tests {
                 screlu_dot(true, &accumulator, &weights),
                 screlu_dot(false, &accumulator, &weights),
                 "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn saturated_dot_products_exceed_i32() {
+        let accumulator = [QA as i16; HIDDEN];
+        let weights = [MADD_WEIGHT_LIMIT; HIDDEN];
+        let expected = i64::from(QA * QA) * i64::from(MADD_WEIGHT_LIMIT) * HIDDEN as i64;
+        assert!(expected > i64::from(i32::MAX));
+        for madd in [false, has_avx2()] {
+            assert_eq!(
+                screlu_dot(madd, &accumulator, &weights),
+                expected,
+                "madd {madd}"
             );
         }
     }

@@ -9,7 +9,7 @@ pub const OUTPUT_BIAS: usize = OUTPUT_WEIGHTS + SIDES * HIDDEN;
 pub const PARAMETERS: usize = OUTPUT_BIAS + 1;
 pub const WEIGHT_LIMIT: f32 = 1.98;
 
-const MAX_ACTIVE_FEATURES: usize = 32;
+pub const MAX_ACTIVE_FEATURES: usize = 32;
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.999;
 const EPSILON: f32 = 1e-8;
@@ -24,12 +24,12 @@ pub fn target(record: &Record, wdl_weight: f32) -> f32 {
     wdl_weight * wdl + (1.0 - wdl_weight) * score
 }
 
-fn screlu(value: f32) -> f32 {
+pub fn screlu(value: f32) -> f32 {
     let clipped = value.clamp(0.0, 1.0);
     clipped * clipped
 }
 
-fn screlu_slope(value: f32) -> f32 {
+pub fn screlu_slope(value: f32) -> f32 {
     if value > 0.0 && value < 1.0 {
         2.0 * value
     } else {
@@ -60,6 +60,7 @@ impl Features {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct Activations {
     features: [Features; SIDES],
     accumulators: [[f32; HIDDEN]; SIDES],
@@ -126,6 +127,7 @@ impl Model {
         error * error
     }
 
+    #[cfg(test)]
     pub fn backpropagate(&self, record: &Record, wdl_weight: f32, gradient: &mut [f32]) -> f32 {
         let activations = self.forward(record);
         let prediction = sigmoid(activations.output);
@@ -175,22 +177,54 @@ impl Adam {
         }
     }
 
+    #[cfg(test)]
     pub fn update(&mut self, model: &mut Model, gradient: &[f32], learning_rate: f32, scale: f32) {
         self.step += 1;
-        let correction1 = 1.0 - BETA1.powi(self.step.min(i32::MAX as u64) as i32);
-        let correction2 = 1.0 - BETA2.powi(self.step.min(i32::MAX as u64) as i32);
-        for (((parameter, &raw), first), second) in model
-            .parameters
+        AdamStep::new(self.step, learning_rate, scale).apply(
+            &mut model.parameters,
+            gradient,
+            &mut self.first_moments,
+            &mut self.second_moments,
+        );
+    }
+}
+
+pub struct AdamStep {
+    learning_rate: f32,
+    scale: f32,
+    correction1: f32,
+    correction2: f32,
+}
+
+impl AdamStep {
+    pub fn new(step: u64, learning_rate: f32, scale: f32) -> Self {
+        let exponent = step.min(i32::MAX as u64) as i32;
+        Self {
+            learning_rate,
+            scale,
+            correction1: 1.0 - BETA1.powi(exponent),
+            correction2: 1.0 - BETA2.powi(exponent),
+        }
+    }
+
+    pub fn apply(
+        &self,
+        parameters: &mut [f32],
+        gradient: &[f32],
+        first_moments: &mut [f32],
+        second_moments: &mut [f32],
+    ) {
+        for (((parameter, &raw), first), second) in parameters
             .iter_mut()
             .zip(gradient)
-            .zip(&mut self.first_moments)
-            .zip(&mut self.second_moments)
+            .zip(first_moments)
+            .zip(second_moments)
         {
-            let grad = raw * scale;
+            let grad = raw * self.scale;
             *first = BETA1 * *first + (1.0 - BETA1) * grad;
             *second = BETA2 * *second + (1.0 - BETA2) * grad * grad;
-            let step =
-                learning_rate * (*first / correction1) / ((*second / correction2).sqrt() + EPSILON);
+            let step = self.learning_rate * (*first / self.correction1)
+                / ((*second / self.correction2).sqrt() + EPSILON);
             *parameter = (*parameter - step).clamp(-WEIGHT_LIMIT, WEIGHT_LIMIT);
         }
     }
@@ -284,7 +318,7 @@ mod tests {
             for record in &records {
                 model.backpropagate(record, 0.25, &mut gradient);
             }
-            adam.update(&mut model, &gradient, 0.01, 1.0 / records.len() as f32);
+            adam.update(&mut model, &gradient, 0.003, 1.0 / records.len() as f32);
         }
         let fitted = total_loss(&model, &records);
         assert!(

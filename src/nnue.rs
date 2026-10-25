@@ -16,7 +16,7 @@ use crate::types::{Color, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
 pub use stack::AccumulatorStack;
 
 pub const INPUTS: usize = SIDES * PIECE_TYPES * SQUARES;
-pub const HIDDEN: usize = 128;
+pub const HIDDEN: usize = 512;
 pub const QA: i32 = 255;
 pub const QB: i32 = 64;
 pub const SCALE: i32 = 400;
@@ -30,7 +30,7 @@ pub const fn relative_square(perspective: Color, square: Square) -> Square {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct Network {
     pub feature_weights: [[i16; HIDDEN]; INPUTS],
     pub feature_bias: [i16; HIDDEN],
@@ -38,13 +38,14 @@ pub struct Network {
     pub output_bias: i16,
 }
 
-pub const NETWORK_BYTES: usize = std::mem::size_of::<Network>();
-
 const VALUE_BYTES: usize = std::mem::size_of::<i16>();
 const MAX_EVALUATION: i32 = MATE_BOUND - 1;
 
+pub const NETWORK_VALUES: usize = INPUTS * HIDDEN + HIDDEN + SIDES * HIDDEN + 1;
+pub const NETWORK_BYTES: usize = NETWORK_VALUES * VALUE_BYTES;
+
 const EMBEDDED_NETWORK: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/networks/net1.nnue"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/networks/net2.nnue"));
 const _: () = assert!(EMBEDDED_NETWORK.len() == NETWORK_BYTES);
 
 struct ActiveNetwork {
@@ -131,6 +132,7 @@ pub fn evaluate(board: &mut Board) -> i32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
 pub struct Accumulator(pub [i16; HIDDEN]);
 
 impl Accumulator {
@@ -150,12 +152,7 @@ impl Accumulator {
 
 impl Network {
     pub fn zeroed() -> Box<Self> {
-        Box::new(Self {
-            feature_weights: [[0; HIDDEN]; INPUTS],
-            feature_bias: [0; HIDDEN],
-            output_weights: [0; SIDES * HIDDEN],
-            output_bias: 0,
-        })
+        unsafe { Box::<Self>::new_zeroed().assume_init() }
     }
 
     pub fn values(&self) -> impl Iterator<Item = i16> + '_ {
@@ -208,8 +205,8 @@ impl Network {
         )
     }
 
-    fn finish(&self, sum: i32) -> i32 {
-        let output = i64::from(sum / QA + i32::from(self.output_bias));
+    fn finish(&self, sum: i64) -> i32 {
+        let output = sum / i64::from(QA) + i64::from(self.output_bias);
         (output * i64::from(SCALE) / i64::from(QA * QB)) as i32
     }
 }
@@ -340,10 +337,20 @@ mod tests {
     }
 
     #[test]
-    fn network_layout_has_no_padding() {
-        let parameters = INPUTS * HIDDEN + HIDDEN + SIDES * HIDDEN + 1;
-        assert_eq!(NETWORK_BYTES, parameters * std::mem::size_of::<i16>());
-        assert_eq!(Network::zeroed().values().count(), parameters);
+    fn network_rows_are_cache_aligned() {
+        let network = Network::zeroed();
+        assert_eq!(network.values().count(), NETWORK_VALUES);
+        assert_eq!(network.to_bytes().len(), NETWORK_BYTES);
+        let rows = [
+            ("first feature", network.feature_weights[0].as_ptr()),
+            ("last feature", network.feature_weights[INPUTS - 1].as_ptr()),
+            ("feature bias", network.feature_bias.as_ptr()),
+            ("output weights", network.output_weights.as_ptr()),
+        ];
+
+        for (name, row) in rows {
+            assert_eq!(row.addr() % 64, 0, "{name}");
+        }
     }
 
     #[test]
@@ -372,13 +379,13 @@ mod tests {
     fn evaluates_hand_built_networks() {
         let full = (QA * QB) as i16;
         let cases = [
-            (255, 64, 0, 0, 51_200),
-            (255, 0, -64, 0, -51_200),
+            (255, 64, 0, 0, 204_800),
+            (255, 0, -64, 0, -204_800),
             (0, 64, 64, full, SCALE),
             (-100, 64, 64, 0, 0),
-            (510, 1, 0, 0, 800),
-            (255, 64, 64, -full, 102_400 - SCALE),
-            (255, 127, 127, full, 203_600),
+            (510, 1, 0, 0, 3_200),
+            (255, 64, 64, -full, 409_600 - SCALE),
+            (255, 127, 127, full, 813_200),
         ];
 
         for (bias, our_weight, their_weight, output_bias, expected) in cases {

@@ -1,6 +1,7 @@
 mod checkpoint;
 mod model;
 mod quantize;
+mod shard;
 
 use std::f64::consts::PI;
 use std::fs::File;
@@ -14,8 +15,9 @@ use arabica::nnue::data::{RECORD_BYTES, Record};
 use arabica::progress::{Ticker, bar, eta, format_duration, percent};
 use arabica::random::Random;
 use checkpoint::Checkpoint;
-use model::{Adam, Model, PARAMETERS};
+use model::{Adam, Model};
 use quantize::{NETWORK_EXTENSION, QuantizationError, export, network_path, quantization_error};
+use shard::{Epoch, RawRecord, Shard, batches, train_epoch};
 
 const DEFAULT_EPOCHS: usize = 40;
 const BATCH_SIZE: usize = 16_384;
@@ -28,8 +30,6 @@ const QUANTIZATION_SAMPLE: usize = 100_000;
 const INITIAL_SEED: u64 = 0x5EED_0001;
 const SPLIT_SEED: u64 = 0x5EED_0002;
 const SHUFFLE_SEED: u64 = 0x5EED_0003;
-
-type RawRecord = [u8; RECORD_BYTES];
 
 const USAGE: &str = "arabica-train <train|export> ...";
 
@@ -97,38 +97,13 @@ fn chunk_size(items: usize, threads: usize) -> usize {
     items.div_ceil(threads).max(1)
 }
 
-fn train_batch(model: &Model, batch: &[RawRecord], gradients: &mut [Vec<f32>]) -> f64 {
-    let chunks: Vec<&[RawRecord]> = batch
-        .chunks(chunk_size(batch.len(), gradients.len()))
-        .collect();
-    let loss = thread::scope(|scope| {
-        let workers: Vec<_> = chunks
-            .iter()
-            .zip(gradients.iter_mut())
-            .map(|(&records, gradient)| {
-                scope.spawn(move || {
-                    gradient.fill(0.0);
-                    records
-                        .iter()
-                        .map(|bytes| {
-                            f64::from(model.backpropagate(&decode(bytes), WDL_WEIGHT, gradient))
-                        })
-                        .sum::<f64>()
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .map(|worker| worker.join().expect("training worker finished"))
-            .sum::<f64>()
-    });
-    let (total, others) = gradients.split_first_mut().expect("at least one thread");
-    for other in &others[..chunks.len() - 1] {
-        for (slot, value) in total.iter_mut().zip(other) {
-            *slot += value;
+fn shuffle_segments(records: &mut [RawRecord], seed: u64, threads: usize) {
+    let size = chunk_size(records.len(), threads);
+    thread::scope(|scope| {
+        for (index, segment) in records.chunks_mut(size).enumerate() {
+            scope.spawn(move || Random::new(seed ^ ((index as u64) << 32)).shuffle(segment));
         }
-    }
-    loss
+    });
 }
 
 fn mean_loss(model: &Model, records: &[RawRecord], threads: usize) -> f64 {
@@ -187,29 +162,28 @@ fn train(
     training: &mut [RawRecord],
     validation: &[RawRecord],
 ) -> io::Result<(f64, f64)> {
-    let mut gradients = vec![vec![0.0; PARAMETERS]; run.threads];
+    let mut shards = Shard::split(&checkpoint.model, &checkpoint.adam, run.threads);
     let mut ticker = Ticker::new();
     let mut losses = (0.0, mean_loss(&checkpoint.model, validation, run.threads));
     for epoch in run.first_epoch..run.epochs {
         let epoch_started = Instant::now();
         let rate = learning_rate(epoch, run.epochs);
-        Random::new(SHUFFLE_SEED ^ epoch as u64).shuffle(training);
-        let mut loss_sum = 0.0;
-        let mut done = 0;
-        for batch in training.chunks(BATCH_SIZE) {
-            loss_sum += train_batch(&checkpoint.model, batch, &mut gradients);
-            checkpoint.adam.update(
-                &mut checkpoint.model,
-                &gradients[0],
-                rate,
-                1.0 / batch.len() as f32,
-            );
-            done += batch.len();
+        shuffle_segments(training, SHUFFLE_SEED ^ epoch as u64, run.threads);
+        let plan = Epoch {
+            records: training,
+            batch_size: BATCH_SIZE,
+            learning_rate: rate,
+            first_step: checkpoint.adam.step,
+            wdl_weight: WDL_WEIGHT,
+        };
+        let loss_sum = train_epoch(&plan, &mut shards, |done, loss_sum| {
             if ticker.due() {
                 let line = run.progress_line(epoch, done, training.len(), loss_sum / done as f64);
                 ticker.show(&line);
             }
-        }
+        });
+        checkpoint.adam.step += batches(training.len(), BATCH_SIZE);
+        Shard::merge(&shards, &mut checkpoint.model, &mut checkpoint.adam);
         let training_loss = loss_sum / training.len().max(1) as f64;
         let validation_loss = mean_loss(&checkpoint.model, validation, run.threads);
         checkpoint.epoch = epoch + 1;
@@ -364,7 +338,7 @@ fn run(arguments: &[String]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::testing::board;
-    use arabica::board::{KIWIPETE, START_POSITION};
+    use arabica::board::START_POSITION;
     use arabica::nnue::data::Outcome;
 
     #[test]
@@ -386,6 +360,37 @@ mod tests {
     }
 
     #[test]
+    fn segment_shuffles_permute_within_segments() {
+        let cases = [(0, 3), (1, 1), (10, 3), (1_000, 1), (1_000, 7), (5, 12)];
+
+        for (len, threads) in cases {
+            let records: Vec<RawRecord> = (0..len as u32)
+                .map(|index| {
+                    let mut record = [0; RECORD_BYTES];
+                    record[..4].copy_from_slice(&index.to_le_bytes());
+                    record
+                })
+                .collect();
+            let mut shuffled = records.clone();
+            shuffle_segments(&mut shuffled, 17, threads);
+            let mut repeated = records.clone();
+            shuffle_segments(&mut repeated, 17, threads);
+            assert_eq!(shuffled, repeated, "{len} records, {threads} threads");
+            let size = chunk_size(len, threads);
+            for (original, segment) in records.chunks(size).zip(shuffled.chunks(size)) {
+                let mut sorted = segment.to_vec();
+                sorted.sort_unstable();
+                let mut expected = original.to_vec();
+                expected.sort_unstable();
+                assert_eq!(sorted, expected, "{len} records, {threads} threads");
+            }
+            if len >= 1_000 {
+                assert_ne!(shuffled, records, "{len} records, {threads} threads");
+            }
+        }
+    }
+
+    #[test]
     fn validation_takes_a_capped_share() {
         let cases = [
             (0, 0),
@@ -397,44 +402,6 @@ mod tests {
 
         for (records, expected) in cases {
             assert_eq!(validation_size(records), expected, "{records} records");
-        }
-    }
-
-    #[test]
-    fn threaded_batches_match_single_thread_gradients() {
-        let fens = [
-            (START_POSITION, 20, Outcome::Draw),
-            (KIWIPETE, -90, Outcome::Loss),
-            ("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1", 150, Outcome::Win),
-            ("6k1/5p1p/4N3/8/8/8/8/4K1Q1 b - - 0 1", -800, Outcome::Loss),
-            (
-                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-                40,
-                Outcome::Draw,
-            ),
-        ];
-        let batch: Vec<RawRecord> = fens
-            .iter()
-            .map(|&(fen, score, outcome)| Record::new(&board(fen), score, outcome).to_bytes())
-            .collect();
-        let model = Model::random(&mut Random::new(5));
-        let mut single = vec![vec![0.0; PARAMETERS]];
-        let single_loss = train_batch(&model, &batch, &mut single);
-        let thread_counts = [2, 3, 8];
-
-        for threads in thread_counts {
-            let mut gradients = vec![vec![1.0; PARAMETERS]; threads];
-            let loss = train_batch(&model, &batch, &mut gradients);
-            assert!((loss - single_loss).abs() < 1e-6, "{threads} threads");
-            let largest_difference = gradients[0]
-                .iter()
-                .zip(&single[0])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f32::max);
-            assert!(
-                largest_difference < 1e-6,
-                "{threads} threads, difference {largest_difference}"
-            );
         }
     }
 
