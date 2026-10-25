@@ -37,6 +37,8 @@ UCI chess engine in Rust powered by NNUE
 | `UCI_Elo` | spin | 1500 | 600-3000 | Target strength when `UCI_LimitStrength` is on |
 | `EvalFile` | string | `<embedded>` | | Loads a `.nnue` network from the given path and clears the transposition table; `<embedded>` restores the built-in network, a file that fails to load keeps the current one |
 
+Board representation and move generation are summarized in [docs/board.md](docs/board.md).
+
 Search techniques are listed in [docs/search.md](docs/search.md).
 
 Network details and the training pipeline are described in [docs/train.md](docs/train.md).
