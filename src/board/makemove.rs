@@ -7,7 +7,7 @@ pub(super) fn en_passant_victim(target: Square) -> Square {
     Square::from_index(target.raw() ^ 8)
 }
 
-fn castling_rook_path(played: Move) -> Option<(Square, Square)> {
+pub(super) fn castling_rook_path(played: Move) -> Option<(Square, Square)> {
     let king = played.from().raw();
     match played.kind() {
         MoveKind::KingCastle => Some((Square::from_index(king + 3), Square::from_index(king + 1))),

@@ -673,20 +673,26 @@ impl Searcher {
                     let late_move = !is_pv
                         && depth <= LATE_MOVE_PRUNING_DEPTH
                         && legal_moves >= (3 + depth * depth) / (2 - i32::from(improving));
-                    let futile = depth <= FUTILITY_DEPTH
-                        && static_eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha;
-                    if late_move || futile {
+                    if late_move {
                         picker.skip_quiets();
                         continue;
                     }
-                    if depth <= HISTORY_PRUNING_DEPTH
-                        && move_history < -HISTORY_PRUNING_MARGIN * depth
-                    {
-                        continue;
-                    }
-                    if depth <= QUIET_SEE_DEPTH && !board.see(candidate, -QUIET_SEE_MARGIN * depth)
-                    {
-                        continue;
+                    if !board.gives_check(candidate) {
+                        let futile = depth <= FUTILITY_DEPTH
+                            && static_eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha;
+                        if futile {
+                            continue;
+                        }
+                        if depth <= HISTORY_PRUNING_DEPTH
+                            && move_history < -HISTORY_PRUNING_MARGIN * depth
+                        {
+                            continue;
+                        }
+                        if depth <= QUIET_SEE_DEPTH
+                            && !board.see(candidate, -QUIET_SEE_MARGIN * depth)
+                        {
+                            continue;
+                        }
                     }
                 } else if depth <= NOISY_SEE_DEPTH
                     && !board.see(candidate, -NOISY_SEE_MARGIN * depth)
@@ -985,8 +991,36 @@ mod tests {
                 "4k3/8/8/8/8/8/8/RR4K1 w - - 0 1",
                 5,
                 3_000,
-                1_000..=INFINITY,
+                MATE - 3..=MATE - 3,
                 None,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/RR4K1 w - - 0 1",
+                5,
+                -3_000,
+                MATE - 3..=MATE - 3,
+                None,
+            ),
+            (
+                "7k/8/6K1/8/8/8/8/1Q6 w - - 0 1",
+                5,
+                3_000,
+                MATE - 1..=MATE - 1,
+                Some("b1b8"),
+            ),
+            (
+                "6k1/8/6K1/8/8/8/8/R7 w - - 0 1",
+                5,
+                5_000,
+                MATE - 1..=MATE - 1,
+                Some("a1a8"),
+            ),
+            (
+                "6k1/8/6K1/8/8/8/8/R7 w - - 0 1",
+                5,
+                -5_000,
+                MATE - 1..=MATE - 1,
+                Some("a1a8"),
             ),
             (
                 "4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1",
@@ -1024,7 +1058,6 @@ mod tests {
                 None,
             ),
         ];
-        // TODO: futility pruning skips quiet checks and mates when the window is far above the static eval, so a stale previous score hides the mate; cover more such cases
 
         for (fen, depth, previous_score, expected_score, expected_move) in cases {
             let mut board = board(fen);
