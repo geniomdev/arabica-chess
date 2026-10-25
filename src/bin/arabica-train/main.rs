@@ -1,17 +1,18 @@
 mod checkpoint;
+mod dataset;
 mod model;
 mod quantize;
 mod shard;
 
 use std::f64::consts::PI;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Instant;
 
 use arabica::cli::{default_threads, parse_argument, usage_error};
-use arabica::nnue::data::{RECORD_BYTES, Record};
+use arabica::nnue::data::Record;
+use arabica::nnue::games::Filter;
 use arabica::progress::{Ticker, bar, eta, format_duration, percent};
 use arabica::random::Random;
 use checkpoint::Checkpoint;
@@ -52,31 +53,19 @@ mod testing {
     }
 }
 
-fn invalid_data(message: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn load_records(path: &Path) -> io::Result<Vec<RawRecord>> {
-    let mut file = File::open(path)?;
-    let bytes = file.metadata()?.len() as usize;
-    if !bytes.is_multiple_of(RECORD_BYTES) {
-        return Err(invalid_data(format!(
-            "{} is {bytes} bytes, not a whole number of {RECORD_BYTES}-byte records",
-            path.display()
-        )));
+fn load_dataset(path: &Path, threads: usize) -> io::Result<Vec<RawRecord>> {
+    let dataset = dataset::load(path, &Filter::DEFAULT, threads)?;
+    if let Some(counts) = dataset.games {
+        eprintln!(
+            "train: {} games, {} plies, {} positions ({:.1}%) pass the filter {:?}",
+            counts.games,
+            counts.plies,
+            dataset.records.len(),
+            percent(dataset.records.len() as u64, counts.plies),
+            Filter::DEFAULT
+        );
     }
-    let mut records = vec![[0; RECORD_BYTES]; bytes / RECORD_BYTES];
-    file.read_exact(records.as_flattened_mut())?;
-    if let Some(index) = records
-        .iter()
-        .position(|bytes| Record::from_bytes(bytes).is_none())
-    {
-        return Err(invalid_data(format!(
-            "{}: record {index} is malformed",
-            path.display()
-        )));
-    }
-    Ok(records)
+    Ok(dataset.records)
 }
 
 fn decode(bytes: &RawRecord) -> Record {
@@ -304,7 +293,7 @@ fn run(arguments: &[String]) -> io::Result<()> {
     }
 
     let loading = Instant::now();
-    let mut records = load_records(Path::new(data))?;
+    let mut records = load_dataset(Path::new(data), threads)?;
     Random::new(SPLIT_SEED).shuffle(&mut records);
     let training_len = records.len() - validation_size(records.len());
     let (training, validation) = records.split_at_mut(training_len);
@@ -337,9 +326,7 @@ fn run(arguments: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::board;
-    use arabica::board::START_POSITION;
-    use arabica::nnue::data::Outcome;
+    use arabica::nnue::data::RECORD_BYTES;
 
     #[test]
     fn learning_rate_decays_along_a_cosine() {
@@ -402,28 +389,6 @@ mod tests {
 
         for (records, expected) in cases {
             assert_eq!(validation_size(records), expected, "{records} records");
-        }
-    }
-
-    #[test]
-    fn loads_only_whole_valid_record_files() {
-        let valid = Record::new(&board(START_POSITION), 0, Outcome::Draw).to_bytes();
-        let mut broken = valid;
-        broken[26] = 9;
-        let cases: [(&str, Vec<u8>, Option<usize>); 4] = [
-            ("empty", Vec::new(), Some(0)),
-            ("two", [valid, valid].concat(), Some(2)),
-            ("partial", valid[..31].to_vec(), None),
-            ("broken", [valid, broken].concat(), None),
-        ];
-
-        for (name, bytes, expected) in cases {
-            let path =
-                std::env::temp_dir().join(format!("arabica-{}-{name}.bin", std::process::id()));
-            std::fs::write(&path, bytes).expect("file written");
-            let loaded = load_records(&path).ok().map(|records| records.len());
-            std::fs::remove_file(&path).expect("file removed");
-            assert_eq!(loaded, expected, "{name}");
         }
     }
 }

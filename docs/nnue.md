@@ -39,8 +39,31 @@ Evaluation uses a SCReLU NNUE with a lazily updated accumulator stack and an AVX
 | Partial outputs | Each shard publishes its partial output per position; after a spin barrier every shard sums them in the same order, so all shards see bit-identical predictions and the result does not depend on the thread count |
 | Segment shuffles | Records are shuffled once globally at load time; each epoch then shuffles per-thread segments in parallel instead of one single-threaded pass over the whole file |
 
+## Training data
+
+`datagen` stores whole games, and `arabica-train` decides which positions to train on when it loads them, so the filter can change without regenerating data.
+
+| Part | Layout |
+|---|---|
+| File header | 8 bytes, `ARBGAME1` |
+| Game | outcome for White (1 byte: 0 loss, 1 draw, 2 win), start FEN length (1 byte), start FEN, ply count (`u16`), then 4 bytes per ply |
+| Ply | played move (`u16`, the engine's move encoding) and the search score of the position before it from the side to move (`i16`, centipawns or mate score) |
+
+The start FEN is the position after the random opening. Every played move is the search's best move; a game adjudicated as decided ends before the ply that triggered the adjudication. A ply takes 4 bytes, about 5.5 bytes per position kept by the default filter, against 32 bytes in the position format.
+
+| Filter (default) | Value |
+|---|---|
+| Skipped plies | first 6 plies after the random opening |
+| Side to move in check | dropped |
+| Best move a capture or a promotion | dropped |
+| Score | \|score\| up to `max_score`, by default every non-mate score |
+
+The default lives in `Filter::DEFAULT` (`src/nnue/games.rs`); `datagen` counts its target positions with it and `arabica-train` applies it when loading.
+
+The trainer replays each game from its start position, checks every move for legality, and turns the kept positions into the same 32-byte records the position format stores, with the game outcome from the side to move. Loading runs in two passes over the file (count, then fill an exactly sized buffer), so memory peaks at the records themselves; 30M positions load in about 17 s on 12 threads. Files in the older position format (bullet's `ChessBoard`, 32 bytes per position, no header) still load as they are.
+
 ## Train commands
 
-- `./target/release/arabica datagen <positions> [threads] [nodes] [output]` - generates training positions from self-play (all cores, 5000 nodes per move by default) and appends them to `<output>` (default `data/arabica-<version>-n<nodes>.bin`) in bullet's `ChessBoard` format; rerunning with the same settings resumes the same file
-- `./target/release/arabica-train train <data> <checkpoint> [epochs] [threads]` - trains the network on a `datagen` file (40 epochs, all cores by default), resumes an existing checkpoint and exports a `.nnue` network next to it after every epoch; the whole file is loaded into memory (32 bytes per position)
+- `./target/release/arabica datagen <positions> [threads] [nodes] [output]` - plays self-play games (all cores, 5000 nodes per move by default) until `<positions>` positions pass the default filter and appends the games to `<output>` (default `data/arabica-<version>-n<nodes>.games`); rerunning with the same settings resumes the same file, and a file without the games header is refused
+- `./target/release/arabica-train train <data> <checkpoint> [epochs] [threads]` - trains the network on a games file or a position file (40 epochs, all cores by default), resumes an existing checkpoint and exports a `.nnue` network next to it after every epoch; the kept positions are held in memory at 32 bytes each
 - `./target/release/arabica-train export <checkpoint> [network]` - quantizes a checkpoint into the engine's `.nnue` format (default: the checkpoint path with the `.nnue` extension)

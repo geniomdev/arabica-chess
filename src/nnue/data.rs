@@ -43,7 +43,7 @@ impl Outcome {
         }
     }
 
-    const fn from_byte(byte: u8) -> Option<Self> {
+    pub const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Loss),
             1 => Some(Self::Draw),

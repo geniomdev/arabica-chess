@@ -98,6 +98,14 @@ impl Move {
         Self(from.raw() as u16 | (to.raw() as u16) << 6 | (kind as u16) << 12)
     }
 
+    pub const fn from_raw(raw: u16) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+
     pub const fn from(self) -> Square {
         Square::from_index((self.0 & 0x3F) as u8)
     }

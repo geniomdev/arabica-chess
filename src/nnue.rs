@@ -1,4 +1,5 @@
 pub mod data;
+pub mod games;
 mod simd;
 mod stack;
 

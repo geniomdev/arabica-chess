@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use crate::board::{Board, MoveList, START_POSITION, color_flipped_fen};
 use crate::cli::{default_threads, parse_argument, usage_error};
-use crate::nnue::data::{Outcome, RECORD_BYTES, Record};
+use crate::nnue::data::Outcome;
+use crate::nnue::games::{self, Filter, Ply, read_header, write_header};
 use crate::progress::{Ticker, bar, eta, format_duration, percent};
 use crate::random::Random;
-use crate::search::{SearchLimits, Searcher, is_mate_score};
+use crate::search::{SearchLimits, Searcher};
 use crate::strength::fresh_noise_seed;
 use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
 use crate::types::{Color, Move};
@@ -26,7 +27,6 @@ const WIN_ADJUDICATION_PLIES: usize = 4;
 const DRAW_ADJUDICATION_MOVE: u16 = 32;
 const DRAW_ADJUDICATION_SCORE: i32 = 20;
 const DRAW_ADJUDICATION_PLIES: usize = 12;
-const SKIPPED_PLIES: u64 = 6;
 const FIFTY_MOVE_PLIES: u8 = 100;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const THREAD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -61,13 +61,6 @@ fn rules_outcome(board: &mut Board) -> Option<Outcome> {
         || board.is_repetition(0)
         || board.has_insufficient_material();
     drawn.then_some(Outcome::Draw)
-}
-
-fn is_quiet_sample(board: &Board, best_move: Move, score: i32) -> bool {
-    !board.in_check()
-        && !best_move.is_capture()
-        && !best_move.is_promotion()
-        && !is_mate_score(score)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,27 +101,11 @@ impl Adjudication {
     }
 }
 
-struct Sample {
-    record: Record,
-    side: Color,
-}
-
-struct Game {
-    samples: Vec<Sample>,
+struct PlayedGame {
+    game: games::Game,
+    positions: u64,
     searched_plies: u64,
-    white_outcome: Outcome,
     ending: Ending,
-}
-
-impl Game {
-    fn into_records(self) -> impl Iterator<Item = Record> {
-        let white_outcome = self.white_outcome;
-        self.samples.into_iter().map(move |sample| {
-            sample
-                .record
-                .with_outcome(white_outcome.for_side(sample.side))
-        })
-    }
 }
 
 fn random_opening(random: &mut Random) -> Option<Board> {
@@ -151,14 +128,16 @@ fn play_game(
     random: &mut Random,
     table: TranspositionTable,
     nodes: u64,
-) -> (Option<Game>, TranspositionTable) {
+) -> (Option<PlayedGame>, TranspositionTable) {
     let limits = SearchLimits {
         nodes: Some(nodes),
         ..SearchLimits::default()
     };
     let mut searcher = Searcher::new(limits, Arc::new(AtomicBool::new(false)), table);
     let game = random_opening(random).and_then(|mut board| {
-        let mut samples = Vec::new();
+        let start = board.to_fen();
+        let mut plies = Vec::new();
+        let mut positions = 0;
         let mut searched_plies = 0;
         let mut adjudication = Adjudication::default();
         let (white_outcome, ending) = loop {
@@ -169,7 +148,7 @@ fn play_game(
             if searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
                 return None;
             }
-            let ply = searched_plies;
+            let index = searched_plies;
             searched_plies += 1;
             let side = board.state.active_color;
             if let Some(adjudicated) =
@@ -177,18 +156,24 @@ fn play_game(
             {
                 break adjudicated;
             }
-            if ply >= SKIPPED_PLIES && is_quiet_sample(&board, best_move, score) {
-                samples.push(Sample {
-                    record: Record::new(&board, score as i16, Outcome::Draw),
-                    side,
-                });
+            let ply = Ply {
+                best_move,
+                score: score as i16,
+            };
+            if Filter::DEFAULT.accepts(index, &board, ply) {
+                positions += 1;
             }
+            plies.push(ply);
             board.make_move(best_move);
         };
-        Some(Game {
-            samples,
-            searched_plies,
-            white_outcome,
+        Some(PlayedGame {
+            game: games::Game {
+                start,
+                white_outcome,
+                plies,
+            },
+            positions,
+            searched_plies: searched_plies as u64,
             ending,
         })
     });
@@ -211,15 +196,16 @@ struct Totals {
 }
 
 impl Totals {
-    fn count(&mut self, game: &Game) {
+    fn count(&mut self, played: &PlayedGame) {
         self.games += 1;
-        self.searched_plies += game.searched_plies;
-        match game.ending {
+        self.positions += played.positions;
+        self.searched_plies += played.searched_plies;
+        match played.ending {
             Ending::Rules => {}
             Ending::AdjudicatedWin => self.adjudicated_wins += 1,
             Ending::AdjudicatedDraw => self.adjudicated_draws += 1,
         }
-        match game.white_outcome {
+        match played.game.white_outcome {
             Outcome::Win => self.white_wins += 1,
             Outcome::Draw => self.draws += 1,
             Outcome::Loss => self.black_wins += 1,
@@ -239,18 +225,13 @@ impl Output {
         self.totals.positions >= self.target || self.error.is_some()
     }
 
-    fn write_game(&mut self, game: Game) {
+    fn write_game(&mut self, played: PlayedGame) {
         if self.is_done() {
             return;
         }
-        self.totals.count(&game);
-        let remaining = self.target - self.totals.positions;
-        for record in game.into_records().take(remaining as usize) {
-            if let Err(error) = self.writer.write_all(&record.to_bytes()) {
-                self.error = Some(error);
-                return;
-            }
-            self.totals.positions += 1;
+        match played.game.write(&mut self.writer) {
+            Ok(()) => self.totals.count(&played),
+            Err(error) => self.error = Some(error),
         }
     }
 }
@@ -291,7 +272,8 @@ struct Summary<'a> {
     threads: usize,
     nodes: u64,
     path: &'a Path,
-    file_positions: u64,
+    file: games::Contents,
+    file_bytes: u64,
 }
 
 fn print_summary(summary: &Summary) {
@@ -345,16 +327,38 @@ fn print_summary(summary: &Summary) {
         summary.threads, summary.nodes
     );
     eprintln!(
-        "  file               {}: {} positions, {:.1} MB",
+        "  file               {}: {} games, {} plies, {:.1} MB",
         summary.path.display(),
-        summary.file_positions,
-        (summary.file_positions * RECORD_BYTES as u64) as f64 / 1e6
+        summary.file.games,
+        summary.file.plies,
+        summary.file_bytes as f64 / 1e6
     );
 }
 
 fn default_output(nodes: u64) -> PathBuf {
     let version = env!("CARGO_PKG_VERSION");
-    PathBuf::from(DEFAULT_DATA_DIRECTORY).join(format!("arabica-{version}-n{nodes}.bin"))
+    PathBuf::from(DEFAULT_DATA_DIRECTORY)
+        .join(format!("arabica-{version}-n{nodes}.{}", games::EXTENSION))
+}
+
+fn open_games_file(path: &Path) -> io::Result<File> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    if file.metadata()?.len() == 0 {
+        write_header(&mut file)?;
+        return Ok(file);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    if !read_header(&mut file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} exists and is not an arabica games file", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 pub fn run(arguments: &[String]) -> io::Result<()> {
@@ -373,7 +377,7 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)?;
     }
-    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let file = open_games_file(&path)?;
     let output = Mutex::new(Output {
         writer: BufWriter::new(file),
         totals: Totals::default(),
@@ -416,7 +420,8 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
         threads,
         nodes,
         path: &path,
-        file_positions: fs::metadata(&path)?.len() / RECORD_BYTES as u64,
+        file: games::contents(&path)?,
+        file_bytes: fs::metadata(&path)?.len(),
     });
     Ok(())
 }
@@ -543,8 +548,8 @@ mod tests {
     fn default_output_names_version_and_nodes() {
         let version = env!("CARGO_PKG_VERSION");
         let cases = [
-            (5_000, format!("data/arabica-{version}-n5000.bin")),
-            (20_000, format!("data/arabica-{version}-n20000.bin")),
+            (5_000, format!("data/arabica-{version}-n5000.games")),
+            (20_000, format!("data/arabica-{version}-n20000.games")),
         ];
 
         for (nodes, expected) in cases {
@@ -580,24 +585,29 @@ mod tests {
     }
 
     #[test]
-    fn plays_games_into_valid_samples() {
+    fn plays_games_that_replay_into_counted_positions() {
         let seeds = [1, 2, 3, 4];
 
         let mut played = 0;
         for seed in seeds {
             let mut random = Random::new(seed);
             let (game, _) = play_game(&mut random, TranspositionTable::new(1), 200);
-            let Some(game) = game else { continue };
+            let Some(played_game) = game else { continue };
             played += 1;
-            assert!(!game.samples.is_empty(), "seed {seed}");
+            let mut bytes = Vec::new();
+            played_game.game.write(&mut bytes).expect("game written");
+            let read = games::Game::read(&mut bytes.as_slice())
+                .expect("game read")
+                .expect("one game");
+            assert_eq!(read, played_game.game, "seed {seed}");
             assert!(
-                game.samples.len() as u64 <= game.searched_plies.saturating_sub(SKIPPED_PLIES),
+                read.plies.len() as u64 <= played_game.searched_plies,
                 "seed {seed}"
             );
-            let outcome = game.white_outcome;
-            let sides: Vec<Color> = game.samples.iter().map(|sample| sample.side).collect();
-            for (record, side) in game.into_records().zip(sides) {
-                assert_eq!(record.outcome, outcome.for_side(side), "seed {seed}");
+            let records = read.records(&Filter::DEFAULT).expect("legal game");
+            assert!(!records.is_empty(), "seed {seed}");
+            assert_eq!(records.len() as u64, played_game.positions, "seed {seed}");
+            for record in records {
                 assert!(i32::from(record.score).abs() < MATE_BOUND, "seed {seed}");
                 let kings = record
                     .pieces()
@@ -606,5 +616,30 @@ mod tests {
             }
         }
         assert!(played > 0, "every opening was discarded");
+    }
+
+    #[test]
+    fn appends_only_to_games_files() {
+        let directory =
+            std::env::temp_dir().join(format!("arabica-{}-datagen-files", std::process::id()));
+        fs::create_dir_all(&directory).expect("directory created");
+        let cases: [(&str, Option<&[u8]>, bool); 4] = [
+            ("fresh.games", None, true),
+            ("empty.games", Some(b""), true),
+            ("existing.games", Some(games::MAGIC), true),
+            ("positions.bin", Some(&[0; 32]), false),
+        ];
+
+        for (name, contents, accepted) in cases {
+            let path = directory.join(name);
+            if let Some(contents) = contents {
+                fs::write(&path, contents).expect("file written");
+            }
+            assert_eq!(open_games_file(&path).is_ok(), accepted, "{name}");
+            if accepted {
+                assert_eq!(fs::read(&path).expect("file read"), games::MAGIC, "{name}");
+            }
+        }
+        fs::remove_dir_all(&directory).expect("directory removed");
     }
 }
