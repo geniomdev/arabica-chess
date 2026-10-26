@@ -1,5 +1,12 @@
 # Arabica Chess
 
+<p align="left">
+  <a href="https://github.com/geniomdev/arabica-chess/releases/latest"><img src="https://img.shields.io/github/v/release/geniomdev/arabica-chess?logo=github&label=Release&color=green" alt="Release"></a>
+  <a href="https://lichess.org/@/ArabicaNNUE/perf/bullet"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FArabicaNNUE&query=%24.perfs.bullet.rating&label=Bullet&logo=lichess&logoColor=white&color=blue" alt="Bullet"></a>
+  <a href="https://lichess.org/@/ArabicaNNUE/perf/blitz"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FArabicaNNUE&query=%24.perfs.blitz.rating&label=Blitz&logo=lichess&logoColor=white&color=blue" alt="Blitz"></a>
+  <a href="https://lichess.org/@/ArabicaNNUE/perf/rapid"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FArabicaNNUE&query=%24.perfs.rapid.rating&label=Rapid&logo=lichess&logoColor=white&color=blue" alt="Rapid"></a>
+</p>
+
 UCI chess engine in Rust powered by NNUE
 
 ## UCI commands
