@@ -128,7 +128,8 @@ impl Board {
                         continue;
                     }
                     let unpinned = occupancy & !pinned;
-                    let pin_line = slider_attacks(king, unpinned) & slider_attacks(pinner, unpinned);
+                    let pin_line =
+                        slider_attacks(king, unpinned) & slider_attacks(pinner, unpinned);
                     if pinner == to || pin_line.contains(to) {
                         continue;
                     }

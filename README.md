@@ -19,6 +19,7 @@ UCI chess engine in Rust powered by NNUE
 | `position startpos [moves e2e4 e7e5]` | Sets up the initial position |
 | `position fen <fen> [moves g1f3 d7d5]` | Sets up a custom position |
 | `d` | Prints the board, its FEN and Zobrist key |
+| `eval` | Prints the static NNUE evaluation of the current position in centipawns from the side to move's point of view |
 | `ucinewgame` | Resets the board to the start position, clears the transposition table and move histories and reseeds the evaluation noise |
 | `go` | Starts a search |
 | `go depth 8` | Starts a search with depth 8 |
@@ -38,7 +39,7 @@ UCI chess engine in Rust powered by NNUE
 | Option | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `Hash` | spin | 16 | 1-4096 | Transposition table size in MB; setting it reallocates and clears the table |
-| `Threads` | spin | 1 | 1-256 | Number of search threads (Lazy SMP: all threads search the same position and share the transposition table); |
+| `Threads` | spin | 1 | 1-256 | Number of search threads (Lazy SMP: all threads search the same position and share the transposition table) |
 | `Move Overhead` | spin | 50 | 0-5000 | Time in ms reserved per move for GUI and network latency |
 | `Ponder` | check | false | | Appends the expected reply to `bestmove` as `ponder <move>` |
 | `UCI_LimitStrength` | check | false | | Plays at the strength set by `UCI_Elo` |

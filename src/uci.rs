@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::bench::{self, nodes_per_second};
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::history::History;
-use crate::nnue::{load_network, use_embedded_network};
+use crate::nnue::{evaluate, load_network, use_embedded_network};
 use crate::search::{Iteration, SearchLimits, Searcher, SharedSearch, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
@@ -158,6 +158,7 @@ impl Engine {
                 self.board.to_fen(),
                 self.board.state.zobrist_key
             ),
+            ["eval", ..] => print_evaluation(&mut self.board),
             ["quit", ..] => return Flow::Quit,
             _ => {}
         }
@@ -325,6 +326,10 @@ fn print_iteration(iteration: &Iteration) {
         iteration.elapsed.as_millis(),
         iteration.hashfull,
     );
+}
+
+fn print_evaluation(board: &mut Board) {
+    println!("NNUE evaluation: {:+} cp (side to move)", evaluate(board));
 }
 
 fn print_perft_divide(board: &mut Board, depth: u32) {
