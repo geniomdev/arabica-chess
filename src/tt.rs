@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
 use crate::search::{MATE_BOUND, is_mate_score};
 use crate::types::Move;
 
@@ -74,11 +76,56 @@ impl Entry {
         }
         i32::from(self.depth) - AGE_PENALTY * i32::from(self.age(generation))
     }
+
+    fn pack(self) -> u64 {
+        u64::from(self.best_move.raw())
+            | u64::from(self.score as u16) << 16
+            | u64::from(self.static_eval as u16) << 32
+            | u64::from(self.depth) << 48
+            | u64::from(self.generation_and_bound) << 56
+    }
+
+    fn unpack(key: u64, data: u64) -> Self {
+        Self {
+            key,
+            best_move: Move::from_raw(data as u16),
+            score: (data >> 16) as u16 as i16,
+            static_eval: (data >> 32) as u16 as i16,
+            depth: (data >> 48) as u8,
+            generation_and_bound: (data >> 56) as u8,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Default)]
+struct Slot {
+    verification: AtomicU64,
+    data: AtomicU64,
+}
+
+impl Slot {
+    fn load(&self) -> Entry {
+        let data = self.data.load(Ordering::Relaxed);
+        let verification = self.verification.load(Ordering::Relaxed);
+        Entry::unpack(verification ^ data, data)
+    }
+
+    fn save(&self, entry: Entry) {
+        let data = entry.pack();
+        self.verification.store(entry.key ^ data, Ordering::Relaxed);
+        self.data.store(data, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
 #[repr(align(64))]
-struct Bucket([Entry; BUCKET_SIZE]);
+struct Bucket([Slot; BUCKET_SIZE]);
+
+impl Bucket {
+    fn entries(&self) -> [Entry; BUCKET_SIZE] {
+        self.0.each_ref().map(Slot::load)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit {
@@ -128,7 +175,7 @@ pub struct Store {
 #[derive(Default)]
 pub struct TranspositionTable {
     buckets: Vec<Bucket>,
-    generation: u8,
+    generation: AtomicU8,
 }
 
 impl TranspositionTable {
@@ -136,23 +183,29 @@ impl TranspositionTable {
         let bytes = megabytes.clamp(MIN_HASH_MB, MAX_HASH_MB) << 20;
         let capacity = bytes / size_of::<Bucket>();
         Self {
-            buckets: vec![Bucket::default(); capacity],
-            generation: 0,
+            buckets: std::iter::repeat_with(Bucket::default)
+                .take(capacity)
+                .collect(),
+            generation: AtomicU8::new(0),
         }
     }
 
     pub fn clear(&mut self) {
-        self.buckets.fill(Bucket::default());
-        self.generation = 0;
+        self.buckets.fill_with(Bucket::default);
+        *self.generation.get_mut() = 0;
     }
 
-    pub fn new_search(&mut self) {
-        self.generation = (self.generation + 1) % GENERATION_CYCLE;
+    pub fn new_search(&self) {
+        let next = (self.generation() + 1) % GENERATION_CYCLE;
+        self.generation.store(next, Ordering::Relaxed);
     }
 
     pub fn probe(&self, key: u64, ply: usize) -> Option<Hit> {
         let bucket = self.buckets.get(self.index(key))?;
-        let entry = bucket.0.iter().find(|entry| entry.holds(key))?;
+        let entry = bucket
+            .entries()
+            .into_iter()
+            .find(|entry| entry.holds(key))?;
         Some(Hit {
             best_move: (entry.best_move != Move::NULL).then_some(entry.best_move),
             static_eval: (entry.static_eval != MISSING_EVAL).then_some(entry.static_eval.into()),
@@ -162,21 +215,20 @@ impl TranspositionTable {
         })
     }
 
-    pub fn store(&mut self, store: Store) {
-        let index = self.index(store.key);
-        let generation = self.generation;
-        let Some(bucket) = self.buckets.get_mut(index) else {
+    pub fn store(&self, store: Store) {
+        let generation = self.generation();
+        let Some(bucket) = self.buckets.get(self.index(store.key)) else {
             return;
         };
-        let slot = bucket
-            .0
+        let entries = bucket.entries();
+        let slot = entries
             .iter()
             .position(|entry| entry.holds(store.key))
             .or_else(|| {
-                (0..BUCKET_SIZE).min_by_key(|&slot| bucket.0[slot].replacement_priority(generation))
+                (0..BUCKET_SIZE).min_by_key(|&slot| entries[slot].replacement_priority(generation))
             })
             .expect("bucket has slots");
-        let entry = &mut bucket.0[slot];
+        let entry = entries[slot];
         let same_position = entry.holds(store.key);
         let keeps_deeper_entry = same_position
             && store.bound != Bound::Exact
@@ -190,7 +242,7 @@ impl TranspositionTable {
         } else {
             store.best_move
         };
-        *entry = Entry {
+        bucket.0[slot].save(Entry {
             key: store.key,
             best_move,
             score: score_to_table(store.score, store.ply),
@@ -199,14 +251,15 @@ impl TranspositionTable {
                 .map_or(MISSING_EVAL, |static_eval| static_eval as i16),
             depth: store.depth,
             generation_and_bound: generation << BOUND_BITS | store.bound.code(),
-        };
+        });
     }
 
     pub fn hashfull(&self) -> usize {
+        let generation = self.generation();
         let sample: Vec<Entry> = self
             .buckets
             .iter()
-            .flat_map(|bucket| bucket.0)
+            .flat_map(Bucket::entries)
             .take(HASHFULL_SAMPLE)
             .collect();
         if sample.is_empty() {
@@ -214,9 +267,13 @@ impl TranspositionTable {
         }
         let current = sample
             .iter()
-            .filter(|entry| entry.bound().is_some() && entry.age(self.generation) == 0)
+            .filter(|entry| entry.bound().is_some() && entry.age(generation) == 0)
             .count();
         current * 1000 / sample.len()
+    }
+
+    fn generation(&self) -> u8 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     fn index(&self, key: u64) -> usize {
@@ -293,7 +350,7 @@ mod tests {
         ];
 
         for (score, depth, bound, store_ply, probe_ply, probe_depth, expected) in cases {
-            let mut table = TranspositionTable::new(1);
+            let table = TranspositionTable::new(1);
             table.store(Store {
                 score,
                 ply: store_ply,
@@ -319,6 +376,70 @@ mod tests {
     }
 
     #[test]
+    fn packs_entries_losslessly() {
+        let cases = [
+            (sample_move(), 0, 0, 0, 0),
+            (sample_move(), -1, MISSING_EVAL, 1, 0b0000_0001),
+            (Move::NULL, i16::MAX, i16::MIN, u8::MAX, u8::MAX),
+            (sample_move(), i16::MIN, -17, 42, 0b1010_1011),
+        ];
+
+        for (best_move, score, static_eval, depth, generation_and_bound) in cases {
+            let entry = Entry {
+                key: SAMPLE_KEY,
+                best_move,
+                score,
+                static_eval,
+                depth,
+                generation_and_bound,
+            };
+            let slot = Slot::default();
+            slot.save(entry);
+            let loaded = slot.load();
+            assert_eq!(
+                (
+                    loaded.key,
+                    loaded.best_move,
+                    loaded.score,
+                    loaded.static_eval,
+                    loaded.depth,
+                    loaded.generation_and_bound,
+                ),
+                (
+                    SAMPLE_KEY,
+                    best_move,
+                    score,
+                    static_eval,
+                    depth,
+                    generation_and_bound
+                ),
+                "score {score}, eval {static_eval}, depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_torn_entries() {
+        let cases = [(5, 9, None), (5, 5, Some(5))];
+
+        for (first_depth, torn_depth, expected_depth) in cases {
+            let table = TranspositionTable::new(1);
+            table.store(entry(SAMPLE_KEY, first_depth, Bound::Exact));
+            let slot = &table.buckets[table.index(SAMPLE_KEY)].0[0];
+            let torn = Entry {
+                depth: torn_depth,
+                ..slot.load()
+            };
+            slot.data.store(torn.pack(), Ordering::Relaxed);
+            assert_eq!(
+                table.probe(SAMPLE_KEY, 0).map(|hit| hit.depth),
+                expected_depth,
+                "stored depth {first_depth}, torn depth {torn_depth}"
+            );
+        }
+    }
+
+    #[test]
     fn refines_static_eval_with_bounded_score() {
         let cases = [
             (Bound::Exact, 40, 10, 40),
@@ -330,7 +451,7 @@ mod tests {
         ];
 
         for (bound, score, static_eval, expected) in cases {
-            let mut table = TranspositionTable::new(1);
+            let table = TranspositionTable::new(1);
             table.store(Store {
                 score,
                 ..entry(SAMPLE_KEY, 3, bound)
@@ -355,7 +476,7 @@ mod tests {
         ];
 
         for (depths_and_ages, expected_evicted) in cases {
-            let mut table = TranspositionTable::new(1);
+            let table = TranspositionTable::new(1);
             let keys = same_bucket_keys(&table, depths_and_ages.len() + 1);
             let oldest = depths_and_ages
                 .iter()
@@ -397,7 +518,7 @@ mod tests {
 
         for (old_depth, old_bound, searches_between, new_depth, new_bound, expected_depth) in cases
         {
-            let mut table = TranspositionTable::new(1);
+            let table = TranspositionTable::new(1);
             table.store(entry(SAMPLE_KEY, old_depth, old_bound));
             for _ in 0..searches_between {
                 table.new_search();

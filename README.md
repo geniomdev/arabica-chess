@@ -38,7 +38,7 @@ UCI chess engine in Rust powered by NNUE
 | Option | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `Hash` | spin | 16 | 1-4096 | Transposition table size in MB; setting it reallocates and clears the table |
-| `Threads` | spin | 1 | 1-1 | Number of search threads; the search is single-threaded, so only 1 is accepted |
+| `Threads` | spin | 1 | 1-256 | Number of search threads (Lazy SMP: all threads search the same position and share the transposition table); |
 | `Move Overhead` | spin | 50 | 0-5000 | Time in ms reserved per move for GUI and network latency |
 | `Ponder` | check | false | | Appends the expected reply to `bestmove` as `ponder <move>` |
 | `UCI_LimitStrength` | check | false | | Plays at the strength set by `UCI_Elo` |

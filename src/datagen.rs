@@ -13,7 +13,7 @@ use crate::nnue::data::Outcome;
 use crate::nnue::games::{self, Filter, Ply, read_header, write_header};
 use crate::progress::{Ticker, bar, eta, format_duration, percent};
 use crate::random::Random;
-use crate::search::{SearchLimits, Searcher};
+use crate::search::{SearchLimits, Searcher, SharedSearch};
 use crate::strength::fresh_noise_seed;
 use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
 use crate::types::{Color, Move};
@@ -126,18 +126,14 @@ fn random_opening(random: &mut Random) -> Option<Board> {
     Some(flipped.parse().expect("flipped opening is valid"))
 }
 
-fn play_game(
-    random: &mut Random,
-    table: TranspositionTable,
-    nodes: u64,
-) -> (Option<PlayedGame>, TranspositionTable) {
+fn play_game(random: &mut Random, shared: &Arc<SharedSearch>, nodes: u64) -> Option<PlayedGame> {
     let limits = SearchLimits {
         nodes: Some(nodes.saturating_mul(HARD_NODE_FACTOR)),
         soft_nodes: Some(nodes),
         ..SearchLimits::default()
     };
-    let mut searcher = Searcher::new(limits, Arc::new(AtomicBool::new(false)), table);
-    let game = random_opening(random).and_then(|mut board| {
+    let mut searcher = Searcher::new(limits, Arc::new(AtomicBool::new(false)), Arc::clone(shared));
+    random_opening(random).and_then(|mut board| {
         let start = board.to_fen();
         let mut plies = Vec::new();
         let mut positions = 0;
@@ -182,10 +178,7 @@ fn play_game(
             searched_nodes,
             ending,
         })
-    });
-    let (mut table, _) = searcher.into_parts();
-    table.clear();
-    (game, table)
+    })
 }
 
 #[derive(Default)]
@@ -246,10 +239,10 @@ impl Output {
 
 fn generate(output: &Mutex<Output>, seed: u64, nodes: u64) {
     let mut random = Random::new(seed);
-    let mut table = TranspositionTable::new(DEFAULT_HASH_MB);
+    let mut shared = Arc::new(SharedSearch::new(TranspositionTable::new(DEFAULT_HASH_MB)));
     while !output.lock().expect("output lock").is_done() {
-        let (game, returned) = play_game(&mut random, table, nodes);
-        table = returned;
+        let game = play_game(&mut random, &shared, nodes);
+        SharedSearch::exclusive_table(&mut shared).clear();
         let mut output = output.lock().expect("output lock");
         match game {
             Some(game) => output.write_game(game),
@@ -605,7 +598,8 @@ mod tests {
         let mut played = 0;
         for seed in seeds {
             let mut random = Random::new(seed);
-            let (game, _) = play_game(&mut random, TranspositionTable::new(1), 200);
+            let shared = Arc::new(SharedSearch::new(TranspositionTable::new(1)));
+            let game = play_game(&mut random, &shared, 200);
             let Some(played_game) = game else { continue };
             played += 1;
             let mut bytes = Vec::new();

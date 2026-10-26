@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::{self, BufRead};
+use std::iter;
 use std::mem;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -8,11 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::bench;
+use crate::bench::{self, nodes_per_second};
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::history::History;
 use crate::nnue::{load_network, use_embedded_network};
-use crate::search::{Iteration, SearchLimits, Searcher, uci_score};
+use crate::search::{Iteration, SearchLimits, Searcher, SharedSearch, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
 use crate::types::{Color, EverySide};
@@ -21,7 +22,8 @@ const ENGINE_NAME: &str = "Arabica";
 const ENGINE_AUTHOR: &str = "Geniomdev";
 const DEFAULT_MOVE_OVERHEAD: Duration = Duration::from_millis(50);
 const MAX_MOVE_OVERHEAD_MS: u64 = 5000;
-const SEARCH_THREADS: u32 = 1;
+const DEFAULT_THREADS: usize = 1;
+const MAX_THREADS: usize = 256;
 const DEFAULT_MOVES_TO_GO: u32 = 30;
 const HARD_LIMIT_SHARES: u32 = 3;
 const EMBEDDED_NETWORK_NAME: &str = "<embedded>";
@@ -49,8 +51,8 @@ enum Flow {
 
 struct Engine {
     board: Board,
-    table: TranspositionTable,
-    history: History,
+    shared: Arc<SharedSearch>,
+    histories: Vec<History>,
     move_overhead: Duration,
     ponder: bool,
     limit_strength: bool,
@@ -63,8 +65,10 @@ impl Engine {
     fn new() -> Self {
         Self {
             board: start_position(),
-            table: TranspositionTable::new(DEFAULT_HASH_MB),
-            history: History::default(),
+            shared: Arc::new(SharedSearch::new(TranspositionTable::new(DEFAULT_HASH_MB))),
+            histories: iter::repeat_with(History::default)
+                .take(DEFAULT_THREADS)
+                .collect(),
             move_overhead: DEFAULT_MOVE_OVERHEAD,
             ponder: false,
             limit_strength: false,
@@ -87,7 +91,7 @@ impl Engine {
                     "option name Hash type spin default {DEFAULT_HASH_MB} min {MIN_HASH_MB} max {MAX_HASH_MB}"
                 );
                 println!(
-                    "option name Threads type spin default {SEARCH_THREADS} min {SEARCH_THREADS} max {SEARCH_THREADS}"
+                    "option name Threads type spin default {DEFAULT_THREADS} min 1 max {MAX_THREADS}"
                 );
                 println!(
                     "option name Move Overhead type spin default {} min 0 max {MAX_MOVE_OVERHEAD_MS}",
@@ -105,17 +109,20 @@ impl Engine {
             ["ucinewgame", ..] => {
                 self.stop_search();
                 self.board = start_position();
-                self.table.clear();
-                self.history.clear();
+                SharedSearch::exclusive_table(&mut self.shared).clear();
+                self.histories.iter_mut().for_each(History::clear);
                 self.noise_seed = fresh_noise_seed();
             }
             ["setoption", arguments @ ..] => {
                 self.stop_search();
                 match parse_option(arguments) {
                     Some(EngineOption::Hash(megabytes)) => {
-                        self.table = TranspositionTable::new(megabytes);
+                        self.shared =
+                            Arc::new(SharedSearch::new(TranspositionTable::new(megabytes)));
                     }
-                    Some(EngineOption::Threads) => {}
+                    Some(EngineOption::Threads(threads)) => {
+                        self.histories.resize_with(threads, History::default);
+                    }
                     Some(EngineOption::MoveOverhead(overhead)) => self.move_overhead = overhead,
                     Some(EngineOption::Ponder(enabled)) => self.ponder = enabled,
                     Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
@@ -175,12 +182,19 @@ impl Engine {
                 seed: self.noise_seed,
             };
         }
+        let threads = if self.limit_strength {
+            1
+        } else {
+            self.histories.len()
+        };
+        let idle_histories = self.histories.split_off(threads);
+        let active_histories = mem::replace(&mut self.histories, idle_histories);
         self.search = Some(RunningSearch::start(
             self.board.clone(),
             limits,
             eval_noise,
-            mem::take(&mut self.table),
-            mem::take(&mut self.history),
+            Arc::clone(&self.shared),
+            active_histories,
             SearchMode {
                 infinite: params.infinite,
                 pondering: params.ponder,
@@ -207,12 +221,14 @@ impl Engine {
             },
         }
         self.board.invalidate_accumulators();
-        self.table.clear();
+        SharedSearch::exclusive_table(&mut self.shared).clear();
     }
 
     fn stop_search(&mut self) {
         if let Some(search) = self.search.take() {
-            (self.table, self.history) = search.stop();
+            let mut histories = search.stop();
+            histories.append(&mut self.histories);
+            self.histories = histories;
         }
     }
 }
@@ -226,7 +242,7 @@ struct SearchMode {
 struct RunningSearch {
     stop_signal: Arc<AtomicBool>,
     ponder_signal: Arc<AtomicBool>,
-    thread: JoinHandle<(TranspositionTable, History)>,
+    thread: JoinHandle<Vec<History>>,
 }
 
 impl RunningSearch {
@@ -234,8 +250,8 @@ impl RunningSearch {
         mut board: Board,
         limits: SearchLimits,
         eval_noise: EvalNoise,
-        table: TranspositionTable,
-        history: History,
+        shared: Arc<SharedSearch>,
+        histories: Vec<History>,
         mode: SearchMode,
     ) -> Self {
         let stop_signal = Arc::new(AtomicBool::new(false));
@@ -243,11 +259,19 @@ impl RunningSearch {
         let searcher_stop = Arc::clone(&stop_signal);
         let searcher_ponder = Arc::clone(&ponder_signal);
         let thread = thread::spawn(move || {
-            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_stop), table)
+            let mut histories = histories.into_iter();
+            let main_history = histories.next().unwrap_or_default();
+            let mut helpers: Vec<Searcher> = histories
+                .map(|history| {
+                    Searcher::new(limits, Arc::default(), Arc::clone(&shared)).with_history(history)
+                })
+                .collect();
+            let mut searcher = Searcher::new(limits, Arc::clone(&searcher_stop), shared)
                 .with_ponder_signal(Arc::clone(&searcher_ponder))
                 .with_eval_noise(eval_noise)
-                .with_history(history);
-            let (best_move, _) = searcher.search(&mut board, print_iteration);
+                .with_history(main_history);
+            let (best_move, _) =
+                searcher.search_with_helpers(&mut board, &mut helpers, print_iteration);
             while !searcher_stop.load(Ordering::Acquire)
                 && (mode.infinite || searcher_ponder.load(Ordering::Acquire))
             {
@@ -257,7 +281,10 @@ impl RunningSearch {
                 Some(reply) => println!("bestmove {best_move} ponder {reply}"),
                 None => println!("bestmove {best_move}"),
             }
-            searcher.into_parts()
+            iter::once(searcher)
+                .chain(helpers)
+                .map(Searcher::into_history)
+                .collect()
         });
         Self {
             stop_signal,
@@ -271,7 +298,7 @@ impl RunningSearch {
         self.thread.thread().unpark();
     }
 
-    fn stop(self) -> (TranspositionTable, History) {
+    fn stop(self) -> Vec<History> {
         self.stop_signal.store(true, Ordering::Release);
         self.thread.thread().unpark();
         self.thread.join().expect("search thread finished cleanly")
@@ -290,10 +317,11 @@ fn print_iteration(iteration: &Iteration) {
         format!(" pv{pv}")
     };
     println!(
-        "info depth {} score {} nodes {} time {} hashfull {}{pv_section}",
+        "info depth {} score {} nodes {} nps {} time {} hashfull {}{pv_section}",
         iteration.depth,
         uci_score(iteration.score),
         iteration.nodes,
+        nodes_per_second(iteration.nodes, iteration.elapsed),
         iteration.elapsed.as_millis(),
         iteration.hashfull,
     );
@@ -430,7 +458,7 @@ fn clock_budget(
 #[derive(Debug, PartialEq, Eq)]
 enum EngineOption {
     Hash(usize),
-    Threads,
+    Threads(usize),
     MoveOverhead(Duration),
     Ponder(bool),
     LimitStrength(bool),
@@ -450,7 +478,10 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
     }
     match rest[..value_index].join(" ").to_ascii_lowercase().as_str() {
         "hash" => value.parse().ok().map(EngineOption::Hash),
-        "threads" => (value.parse() == Ok(SEARCH_THREADS)).then_some(EngineOption::Threads),
+        "threads" => {
+            let threads: usize = value.parse().ok()?;
+            Some(EngineOption::Threads(threads.clamp(1, MAX_THREADS)))
+        }
         "move overhead" => {
             let millis: u64 = value.parse().ok()?;
             let overhead = Duration::from_millis(millis.min(MAX_MOVE_OVERHEAD_MS));
@@ -644,10 +675,13 @@ mod tests {
             ("name Hash value 64", Some(EngineOption::Hash(64))),
             ("name hash value 1", Some(EngineOption::Hash(1))),
             ("name Hash value big", None),
-            ("name Threads value 1", Some(EngineOption::Threads)),
-            ("name threads value 1", Some(EngineOption::Threads)),
-            ("name Threads value 4", None),
-            ("name Threads value 0", None),
+            ("name Threads value 1", Some(EngineOption::Threads(1))),
+            ("name threads value 8", Some(EngineOption::Threads(8))),
+            (
+                "name Threads value 1000",
+                Some(EngineOption::Threads(MAX_THREADS)),
+            ),
+            ("name Threads value 0", Some(EngineOption::Threads(1))),
             ("name Threads value many", None),
             ("name Hash", None),
             ("name Hash value 64 128", None),

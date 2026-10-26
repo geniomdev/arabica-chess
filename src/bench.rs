@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::history::History;
-use crate::search::{SearchLimits, Searcher};
+use crate::search::{SearchLimits, Searcher, SharedSearch};
 use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
 use crate::uci::parse_position;
 
@@ -77,7 +77,7 @@ pub fn run(arguments: &[&str]) {
         depth: Some(depth),
         ..SearchLimits::default()
     };
-    let mut table = TranspositionTable::new(DEFAULT_HASH_MB);
+    let mut shared = Arc::new(SharedSearch::new(TranspositionTable::new(DEFAULT_HASH_MB)));
     let mut history = History::default();
     let mut total_nodes = 0;
     let mut total_time = Duration::ZERO;
@@ -93,17 +93,21 @@ pub fn run(arguments: &[&str]) {
     for (index, setup) in BENCH_POSITIONS.iter().enumerate() {
         let tokens: Vec<&str> = setup.split_whitespace().collect();
         let mut board = parse_position(&tokens).expect("bench position is valid");
-        table.clear();
+        SharedSearch::exclusive_table(&mut shared).clear();
         history.clear();
 
         let mut nodes = 0;
         let started = Instant::now();
-        let mut searcher =
-            Searcher::new(limits, Arc::new(AtomicBool::new(false)), table).with_history(history);
+        let mut searcher = Searcher::new(
+            limits,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&shared),
+        )
+        .with_history(history);
         let (best_move, _) = searcher.search(&mut board, |iteration| nodes = iteration.nodes);
         let elapsed = started.elapsed();
         total_time += elapsed;
-        (table, history) = searcher.into_parts();
+        history = searcher.into_history();
 
         total_nodes += nodes;
         println!(
@@ -121,7 +125,7 @@ pub fn run(arguments: &[&str]) {
     println!("Nodes/second    : {nps}");
 }
 
-fn nodes_per_second(nodes: u64, elapsed: Duration) -> u64 {
+pub fn nodes_per_second(nodes: u64, elapsed: Duration) -> u64 {
     (nodes as f64 / elapsed.as_secs_f64().max(f64::EPSILON)) as u64
 }
 

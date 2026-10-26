@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, MoveList, see_value};
@@ -93,16 +94,54 @@ pub struct Iteration<'a> {
     pub hashfull: usize,
 }
 
+pub struct SharedSearch {
+    pub table: TranspositionTable,
+    helpers_stop: AtomicBool,
+    nodes: AtomicU64,
+}
+
+impl SharedSearch {
+    pub fn new(table: TranspositionTable) -> Self {
+        Self {
+            table,
+            helpers_stop: AtomicBool::new(false),
+            nodes: AtomicU64::new(0),
+        }
+    }
+
+    pub fn exclusive_table(shared: &mut Arc<Self>) -> &mut TranspositionTable {
+        &mut Arc::get_mut(shared)
+            .expect("no searcher holds the shared state")
+            .table
+    }
+
+    fn begin(&self) {
+        self.table.new_search();
+        self.helpers_stop.store(false, Ordering::Relaxed);
+        self.nodes.store(0, Ordering::Relaxed);
+    }
+
+    fn stop_helpers(&self) {
+        self.helpers_stop.store(true, Ordering::Release);
+    }
+
+    fn helpers_stopped(&self) -> bool {
+        self.helpers_stop.load(Ordering::Relaxed)
+    }
+}
+
 pub struct Searcher {
     limits: SearchLimits,
-    table: TranspositionTable,
+    shared: Arc<SharedSearch>,
     stop_signal: Arc<AtomicBool>,
     ponder_signal: Arc<AtomicBool>,
+    helper: bool,
     pondering: bool,
     start: Instant,
     clock_start: Instant,
     ponder_move: Option<Move>,
     nodes: u64,
+    flushed_nodes: u64,
     ply: usize,
     stopped: bool,
     first_iteration_completed: bool,
@@ -182,18 +221,20 @@ impl Searcher {
     pub fn new(
         limits: SearchLimits,
         stop_signal: Arc<AtomicBool>,
-        table: TranspositionTable,
+        shared: Arc<SharedSearch>,
     ) -> Self {
         Self {
             limits,
-            table,
+            shared,
             stop_signal,
             ponder_signal: Arc::default(),
+            helper: false,
             pondering: false,
             start: Instant::now(),
             clock_start: Instant::now(),
             ponder_move: None,
             nodes: 0,
+            flushed_nodes: 0,
             ply: 0,
             stopped: false,
             first_iteration_completed: false,
@@ -219,17 +260,64 @@ impl Searcher {
         self
     }
 
-    pub fn search(&mut self, board: &mut Board, mut report: impl FnMut(&Iteration)) -> (Move, i32) {
+    pub fn search(&mut self, board: &mut Board, report: impl FnMut(&Iteration)) -> (Move, i32) {
+        self.search_with_helpers(board, &mut [], report)
+    }
+
+    pub fn search_with_helpers(
+        &mut self,
+        board: &mut Board,
+        helpers: &mut [Searcher],
+        report: impl FnMut(&Iteration),
+    ) -> (Move, i32) {
+        self.shared.begin();
+        thread::scope(|scope| {
+            for helper in helpers.iter_mut() {
+                let mut helper_board = board.clone();
+                scope.spawn(move || helper.search_as_helper(&mut helper_board));
+            }
+            let best = self.search_as_main(board, report);
+            self.shared.stop_helpers();
+            best
+        })
+    }
+
+    fn reset(&mut self, helper: bool) {
+        self.helper = helper;
         self.start = Instant::now();
         self.clock_start = self.start;
-        self.pondering = self.ponder_signal.load(Ordering::Acquire);
+        self.pondering = !helper && self.ponder_signal.load(Ordering::Acquire);
         self.ponder_move = None;
         self.nodes = 0;
+        self.flushed_nodes = 0;
         self.ply = 0;
         self.stopped = false;
         self.first_iteration_completed = false;
         self.root_move_nodes.fill([0; SQUARES]);
-        self.table.new_search();
+    }
+
+    fn search_as_helper(&mut self, board: &mut Board) {
+        self.reset(true);
+        let mut score = 0;
+        for depth in 1..=MAX_DEPTH {
+            if self.shared.helpers_stopped() {
+                break;
+            }
+            let iteration_score = self.aspiration_search(board, i32::from(depth), score);
+            if self.stopped {
+                break;
+            }
+            score = iteration_score;
+        }
+        self.flush_nodes();
+    }
+
+    fn search_as_main(
+        &mut self,
+        board: &mut Board,
+        mut report: impl FnMut(&Iteration),
+    ) -> (Move, i32) {
+        self.reset(false);
 
         let max_depth = self.limits.depth.unwrap_or(MAX_DEPTH).clamp(1, MAX_DEPTH);
         let mut best = (Move::NULL, 0);
@@ -252,10 +340,10 @@ impl Searcher {
             report(&Iteration {
                 depth,
                 score,
-                nodes: self.nodes,
+                nodes: self.total_nodes(),
                 elapsed: self.start.elapsed(),
                 pv,
-                hashfull: self.table.hashfull(),
+                hashfull: self.shared.table.hashfull(),
             });
             let score_drop = if depth == 1 { 0 } else { previous.1 - score };
             let time_scale = soft_time_scale(
@@ -292,6 +380,7 @@ impl Searcher {
             return None;
         }
         let reply = self
+            .shared
             .table
             .probe(board.state.zobrist_key, 0)
             .and_then(|hit| hit.best_move)
@@ -306,11 +395,21 @@ impl Searcher {
     }
 
     pub fn nodes(&self) -> u64 {
-        self.nodes
+        self.total_nodes()
     }
 
-    pub fn into_parts(self) -> (TranspositionTable, History) {
-        (self.table, self.history)
+    pub fn into_history(self) -> History {
+        self.history
+    }
+
+    fn total_nodes(&self) -> u64 {
+        self.shared.nodes.load(Ordering::Relaxed) + self.nodes - self.flushed_nodes
+    }
+
+    fn flush_nodes(&mut self) {
+        let unflushed = self.nodes - self.flushed_nodes;
+        self.shared.nodes.fetch_add(unflushed, Ordering::Relaxed);
+        self.flushed_nodes = self.nodes;
     }
 
     fn aspiration_search(&mut self, board: &mut Board, depth: i32, previous_score: i32) -> i32 {
@@ -365,6 +464,9 @@ impl Searcher {
     }
 
     fn hard_limit_reached(&mut self) -> bool {
+        if self.helper {
+            return self.shared.helpers_stopped();
+        }
         self.stop_signal.load(Ordering::Relaxed)
             || (self.clock_running()
                 && self
@@ -374,17 +476,24 @@ impl Searcher {
     }
 
     fn node_limit_reached(&self) -> bool {
-        self.first_iteration_completed && self.limits.nodes.is_some_and(|limit| self.nodes >= limit)
+        self.first_iteration_completed
+            && self
+                .limits
+                .nodes
+                .is_some_and(|limit| self.total_nodes() >= limit)
     }
 
     fn soft_node_limit_reached(&self) -> bool {
         self.limits
             .soft_nodes
-            .is_some_and(|limit| self.nodes >= limit)
+            .is_some_and(|limit| self.total_nodes() >= limit)
     }
 
     fn visit_node(&mut self) {
         self.nodes += 1;
+        if self.nodes.is_multiple_of(TIME_CHECK_INTERVAL) {
+            self.flush_nodes();
+        }
         if self.node_limit_reached()
             || (self.nodes.is_multiple_of(TIME_CHECK_INTERVAL) && self.hard_limit_reached())
         {
@@ -562,7 +671,7 @@ impl Searcher {
         let singular_search = excluded != Move::NULL;
 
         let key = board.state.zobrist_key;
-        let hit = self.table.probe(key, self.ply);
+        let hit = self.shared.table.probe(key, self.ply);
         let probe_depth = depth.min(i32::from(u8::MAX)) as u8;
         if let Some(score) = hit
             .filter(|_| !is_pv && !singular_search)
@@ -628,7 +737,7 @@ impl Searcher {
             if let Some((best_move, score)) =
                 self.probcut(board, hash_move, probcut_beta, static_eval, depth)
             {
-                self.table.store(Store {
+                self.shared.table.store(Store {
                     key,
                     best_move,
                     score,
@@ -812,7 +921,7 @@ impl Searcher {
                     .update_correction(us, pawn_key(board), depth, score - raw_eval);
             }
         }
-        self.table.store(Store {
+        self.shared.table.store(Store {
             key,
             best_move,
             score,
@@ -834,7 +943,7 @@ impl Searcher {
         }
         let is_pv = beta - alpha > 1;
         let key = board.state.zobrist_key;
-        let hit = self.table.probe(key, self.ply);
+        let hit = self.shared.table.probe(key, self.ply);
         if let Some(score) = hit
             .filter(|_| !is_pv)
             .and_then(|hit| hit.cutoff_score(QUIESCENCE_DEPTH, alpha, beta))
@@ -854,7 +963,7 @@ impl Searcher {
             let stand_pat = hit.map_or(corrected_eval, |hit| hit.refine(corrected_eval));
             if stand_pat >= beta {
                 if hit.is_none() {
-                    self.table.store(Store {
+                    self.shared.table.store(Store {
                         key,
                         best_move: Move::NULL,
                         score: stand_pat,
@@ -909,7 +1018,7 @@ impl Searcher {
         if in_check && legal_moves == 0 {
             return -MATE + self.ply as i32;
         }
-        self.table.store(Store {
+        self.shared.table.store(Store {
             key,
             best_move,
             score: best_score,
@@ -931,6 +1040,45 @@ mod tests {
     use super::*;
     use crate::board::testing::board;
     use crate::board::{KIWIPETE, START_POSITION};
+
+    fn small_shared() -> Arc<SharedSearch> {
+        Arc::new(SharedSearch::new(TranspositionTable::new(1)))
+    }
+
+    #[test]
+    fn searches_with_helpers() {
+        let cases = [
+            ("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", 0, 3, Some("a1a8")),
+            ("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", 3, 3, Some("a1a8")),
+            ("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1", 2, 6, Some("d1d5")),
+            (KIWIPETE, 3, 7, None),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", 2, 4, Some("0000")),
+        ];
+
+        for (fen, helper_count, depth, expected_move) in cases {
+            let mut board = board(fen);
+            let shared = small_shared();
+            let limits = SearchLimits {
+                depth: Some(depth),
+                ..SearchLimits::default()
+            };
+            let mut helpers: Vec<Searcher> = (0..helper_count)
+                .map(|_| Searcher::new(limits, Arc::default(), Arc::clone(&shared)))
+                .collect();
+            let mut main = Searcher::new(limits, Arc::default(), Arc::clone(&shared));
+            let mut main_nodes = 0;
+            let (best_move, _) = main.search_with_helpers(&mut board, &mut helpers, |iteration| {
+                main_nodes = iteration.nodes
+            });
+            let context = format!("fen {fen:?}, helpers {helper_count}");
+            if let Some(expected) = expected_move {
+                assert_eq!(best_move.to_string(), expected, "{context}");
+            }
+            assert!(shared.helpers_stopped(), "{context}");
+            assert!(main.nodes() >= main_nodes, "{context}");
+            assert_eq!(board.to_fen(), fen, "{context}: board restored");
+        }
+    }
 
     #[test]
     fn finds_best_move() {
@@ -965,8 +1113,7 @@ mod tests {
                 ..SearchLimits::default()
             };
             let (best_move, score) =
-                Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
-                    .search(&mut board, |_| {});
+                Searcher::new(limits, Arc::default(), small_shared()).search(&mut board, |_| {});
             if let Some(expected) = expected_move {
                 assert_eq!(best_move.to_string(), expected, "fen {fen:?}");
             }
@@ -1061,11 +1208,8 @@ mod tests {
 
         for (fen, depth, previous_score, expected_score, expected_move) in cases {
             let mut board = board(fen);
-            let mut searcher = Searcher::new(
-                SearchLimits::default(),
-                Arc::default(),
-                TranspositionTable::new(1),
-            );
+            let mut searcher =
+                Searcher::new(SearchLimits::default(), Arc::default(), small_shared());
             let score = searcher.aspiration_search(&mut board, depth, previous_score);
             let context = format!("fen {fen:?}, depth {depth}, previous {previous_score}");
             assert!(expected_score.contains(&score), "{context}: score {score}");
@@ -1088,11 +1232,8 @@ mod tests {
 
         for (fen, expected) in cases {
             let mut board = board(fen);
-            let mut searcher = Searcher::new(
-                SearchLimits::default(),
-                Arc::default(),
-                TranspositionTable::new(1),
-            );
+            let mut searcher =
+                Searcher::new(SearchLimits::default(), Arc::default(), small_shared());
             let score = searcher.quiescence(&mut board, -INFINITY, INFINITY);
             assert!(expected.contains(&score), "fen {fen:?}, score {score}");
             assert_eq!(board.to_fen(), fen, "board restored for fen {fen:?}");
@@ -1114,7 +1255,7 @@ mod tests {
                 ..SearchLimits::default()
             };
             let mut last_report = None;
-            let (best_move, _) = Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+            let (best_move, _) = Searcher::new(limits, Arc::default(), small_shared())
                 .search(&mut board, |iteration| {
                     last_report = Some((iteration.nodes, iteration.pv[0]))
                 });
@@ -1148,7 +1289,7 @@ mod tests {
                 ..SearchLimits::default()
             };
             let mut last_depth = 0;
-            let mut searcher = Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+            let mut searcher = Searcher::new(limits, Arc::default(), small_shared())
                 .with_ponder_signal(Arc::new(AtomicBool::new(true)));
             let (best_move, _) =
                 searcher.search(&mut board, |iteration| last_depth = iteration.depth);
@@ -1182,7 +1323,7 @@ mod tests {
                 seed: 42,
             };
             let mut reports = Vec::new();
-            let (best_move, _) = Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
+            let (best_move, _) = Searcher::new(limits, Arc::default(), small_shared())
                 .with_eval_noise(noise)
                 .search(&mut board, |iteration| {
                     reports.push((iteration.depth, iteration.nodes, iteration.pv[0]))
@@ -1215,10 +1356,9 @@ mod tests {
                 ..SearchLimits::default()
             };
             let mut reports = Vec::new();
-            Searcher::new(limits, Arc::default(), TranspositionTable::new(1))
-                .search(&mut board, |iteration| {
-                    reports.push((iteration.depth, iteration.nodes))
-                });
+            Searcher::new(limits, Arc::default(), small_shared()).search(&mut board, |iteration| {
+                reports.push((iteration.depth, iteration.nodes))
+            });
             let context = format!("fen {fen:?}, soft {soft_limit}, hard {hard_limit:?}");
             let depths: Vec<u8> = reports.iter().map(|&(depth, _)| depth).collect();
             let expected_depths: Vec<u8> = (1..=reports.len() as u8).collect();

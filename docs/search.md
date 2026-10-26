@@ -2,6 +2,7 @@
 
 - Negamax
 - Iterative deepening
+- Lazy SMP
 - Aspiration windows
 - Principal variation search
 - Quiescence search
