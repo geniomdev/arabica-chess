@@ -1,9 +1,32 @@
 use crate::attacks::{bishop_attacks, rook_attacks};
 use crate::board::Board;
 use crate::board::makemove::en_passant_victim;
-use crate::types::{Bitboard, Move, MoveKind, Piece};
+use crate::types::{Bitboard, Color, Move, MoveKind, Piece, Square};
 
 const SEE_VALUES: [i32; 6] = [20_000, 900, 500, 330, 320, 100];
+const MAX_PINS: usize = 16;
+
+#[derive(Clone, Copy, Default)]
+struct Pin {
+    pinned: Bitboard,
+    pinner: Bitboard,
+}
+
+#[derive(Default)]
+struct Pins {
+    list: [Pin; MAX_PINS],
+    len: usize,
+}
+
+impl Pins {
+    fn frozen(&self, occupancy: Bitboard) -> Bitboard {
+        self.list[..self.len]
+            .iter()
+            .filter(|pin| !(pin.pinner & occupancy).is_empty())
+            .fold(Bitboard::empty(), |frozen, pin| frozen | pin.pinned)
+    }
+}
+
 const CHEAPEST_FIRST: [Piece; 6] = [
     Piece::Pawn,
     Piece::Knight,
@@ -44,6 +67,7 @@ impl Board {
         }
         let diagonal = self.pieces(Piece::Bishop) | self.pieces(Piece::Queen);
         let orthogonal = self.pieces(Piece::Rook) | self.pieces(Piece::Queen);
+        let pins = self.pins_off_line(from, to);
         let mut attackers = self.attackers_to(to, occupancy);
         let mut side = self.state.active_color;
         let mut winning = true;
@@ -51,7 +75,7 @@ impl Board {
         loop {
             side = side.opponent();
             attackers &= occupancy;
-            let side_attackers = attackers & self.occupied_by(side);
+            let side_attackers = attackers & self.occupied_by(side) & !pins.frozen(occupancy);
             if side_attackers.is_empty() {
                 break;
             }
@@ -79,6 +103,45 @@ impl Board {
         }
         winning
     }
+
+    fn pins_off_line(&self, from: Square, to: Square) -> Pins {
+        let moved = Bitboard::from_square(from);
+        let landed = Bitboard::from_square(to);
+        let occupancy = (self.occupancy() & !moved) | landed;
+        let mut pins = Pins::default();
+        for side in [Color::White, Color::Black] {
+            let king = self.king_square(side);
+            let enemy = side.opponent();
+            let rays: [(fn(Square, Bitboard) -> Bitboard, Bitboard); 2] = [
+                (rook_attacks, self.orthogonal_sliders(enemy)),
+                (bishop_attacks, self.diagonal_sliders(enemy)),
+            ];
+            for (slider_attacks, sliders) in rays {
+                let enemy_pieces = self.occupied_by(enemy) & !moved;
+                for pinner in slider_attacks(king, enemy_pieces) & sliders & !moved {
+                    let pinned = slider_attacks(king, occupancy)
+                        & slider_attacks(pinner, occupancy)
+                        & occupancy
+                        & self.occupied_by(side)
+                        & !landed;
+                    if pinned.is_empty() {
+                        continue;
+                    }
+                    let unpinned = occupancy & !pinned;
+                    let pin_line = slider_attacks(king, unpinned) & slider_attacks(pinner, unpinned);
+                    if pinner == to || pin_line.contains(to) {
+                        continue;
+                    }
+                    pins.list[pins.len] = Pin {
+                        pinned,
+                        pinner: Bitboard::from_square(pinner),
+                    };
+                    pins.len += 1;
+                }
+            }
+        }
+        pins
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +164,22 @@ mod tests {
             ("4k3/8/2b5/8/8/8/6Q1/4K2B w - - 0 1", "g2c6", 0, true),
             ("4k3/1b6/2b5/8/8/8/6Q1/4K3 w - - 0 1", "g2c6", 0, false),
             ("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1", "e1g1", 0, true),
+            ("4k3/4r3/8/1N6/8/8/8/4R1K1 w - - 0 1", "b5c7", 0, true),
+            ("4k3/4r3/8/8/7Q/8/8/4R1K1 w - - 0 1", "h4e4", 0, false),
+            ("4k3/4r3/8/1N6/8/8/8/4R1K1 b - - 0 1", "e7e1", 0, true),
+            ("4k3/4r3/2b5/8/8/8/8/4R1K1 w - - 0 1", "e1e7", 0, true),
+            (
+                "6k1/pp1r1pp1/2p1p2p/4P2P/3q1Q2/1P4R1/P1Pr1PP1/R5K1 w - - 0 24",
+                "f4f6",
+                0,
+                true,
+            ),
+            (
+                "6k1/pp1r1pp1/2p1p2p/4P2P/3q1Q2/1P6/P1Pr1PP1/R5K1 w - - 0 24",
+                "f4f6",
+                0,
+                false,
+            ),
         ];
 
         for (fen, notation, threshold, expected) in cases {
