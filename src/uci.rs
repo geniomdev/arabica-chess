@@ -21,6 +21,7 @@ const ENGINE_NAME: &str = "Arabica";
 const ENGINE_AUTHOR: &str = "Geniomdev";
 const DEFAULT_MOVE_OVERHEAD: Duration = Duration::from_millis(50);
 const MAX_MOVE_OVERHEAD_MS: u64 = 5000;
+const SEARCH_THREADS: u32 = 1;
 const DEFAULT_MOVES_TO_GO: u32 = 30;
 const HARD_LIMIT_SHARES: u32 = 3;
 const EMBEDDED_NETWORK_NAME: &str = "<embedded>";
@@ -86,6 +87,9 @@ impl Engine {
                     "option name Hash type spin default {DEFAULT_HASH_MB} min {MIN_HASH_MB} max {MAX_HASH_MB}"
                 );
                 println!(
+                    "option name Threads type spin default {SEARCH_THREADS} min {SEARCH_THREADS} max {SEARCH_THREADS}"
+                );
+                println!(
                     "option name Move Overhead type spin default {} min 0 max {MAX_MOVE_OVERHEAD_MS}",
                     DEFAULT_MOVE_OVERHEAD.as_millis()
                 );
@@ -111,6 +115,7 @@ impl Engine {
                     Some(EngineOption::Hash(megabytes)) => {
                         self.table = TranspositionTable::new(megabytes);
                     }
+                    Some(EngineOption::Threads) => {}
                     Some(EngineOption::MoveOverhead(overhead)) => self.move_overhead = overhead,
                     Some(EngineOption::Ponder(enabled)) => self.ponder = enabled,
                     Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
@@ -425,6 +430,7 @@ fn clock_budget(
 #[derive(Debug, PartialEq, Eq)]
 enum EngineOption {
     Hash(usize),
+    Threads,
     MoveOverhead(Duration),
     Ponder(bool),
     LimitStrength(bool),
@@ -444,6 +450,7 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
     }
     match rest[..value_index].join(" ").to_ascii_lowercase().as_str() {
         "hash" => value.parse().ok().map(EngineOption::Hash),
+        "threads" => (value.parse() == Ok(SEARCH_THREADS)).then_some(EngineOption::Threads),
         "move overhead" => {
             let millis: u64 = value.parse().ok()?;
             let overhead = Duration::from_millis(millis.min(MAX_MOVE_OVERHEAD_MS));
@@ -637,7 +644,11 @@ mod tests {
             ("name Hash value 64", Some(EngineOption::Hash(64))),
             ("name hash value 1", Some(EngineOption::Hash(1))),
             ("name Hash value big", None),
+            ("name Threads value 1", Some(EngineOption::Threads)),
+            ("name threads value 1", Some(EngineOption::Threads)),
             ("name Threads value 4", None),
+            ("name Threads value 0", None),
+            ("name Threads value many", None),
             ("name Hash", None),
             ("name Hash value 64 128", None),
             ("Hash value 64", None),
