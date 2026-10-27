@@ -113,6 +113,10 @@ pub fn use_embedded_network() {
 }
 
 pub fn evaluate(board: &mut Board) -> i32 {
+    evaluate_with(active(), board)
+}
+
+fn evaluate_with(active: &ActiveNetwork, board: &mut Board) -> i32 {
     if board.has_insufficient_material() {
         return 0;
     }
@@ -121,7 +125,7 @@ pub fn evaluate(board: &mut Board) -> i32 {
     let ActiveNetwork {
         network,
         madd_output,
-    } = active();
+    } = active;
     let (our_weights, their_weights) = network.output_weights.split_at(HIDDEN);
     let sum = simd::screlu_dot(*madd_output, &accumulators[us.index()].0, our_weights)
         + simd::screlu_dot(
@@ -588,6 +592,77 @@ mod tests {
         for (fen, expected) in cases {
             let score = evaluate(&mut board(fen));
             assert!(expected.contains(&score), "fen {fen:?}, score {score}");
+        }
+    }
+
+    fn embedded_with_output_weights(weight: Option<i16>, madd_output: bool) -> ActiveNetwork {
+        let mut network = Network::from_bytes(EMBEDDED_NETWORK).expect("embedded network");
+        if let Some(weight) = weight {
+            network.output_weights.fill(weight);
+        }
+        ActiveNetwork {
+            network,
+            madd_output,
+        }
+    }
+
+    fn played(fen: &str, moves: &[&str]) -> Board {
+        let mut position = board(fen);
+        for notation in moves {
+            let played = position.parse_move(notation).expect("move parsed");
+            assert!(position.make_move(played), "{notation} is legal in {fen:?}");
+        }
+        position
+    }
+
+    #[test]
+    fn evaluation_matches_reference_on_fresh_accumulators() {
+        let cases: [(&str, &[&str]); 6] = [
+            (START_POSITION, &[]),
+            (START_POSITION, &["e2e4"]),
+            (START_POSITION, &["e2e4", "d7d5", "e4d5", "d8d5", "b1c3"]),
+            (KIWIPETE, &[]),
+            (KIWIPETE, &["e1g1", "h3g2", "f3f6"]),
+            ("8/P6k/8/8/8/K7/6p1/8 b - - 0 1", &["g2g1q", "a7a8n"]),
+        ];
+        let paths = [false, *simd::AVX2];
+
+        for (fen, moves) in cases {
+            for madd_output in paths {
+                let active = embedded_with_output_weights(None, madd_output);
+                let mut position = played(fen, moves);
+                let us = position.state.active_color;
+                let fresh = Color::ALL.map(|perspective| {
+                    active
+                        .network
+                        .refresh(active_features(&position, perspective))
+                });
+                let expected = active
+                    .network
+                    .evaluate(&fresh[us.index()], &fresh[us.opponent().index()]);
+                assert_eq!(
+                    evaluate_with(&active, &mut position),
+                    expected,
+                    "fen {fen:?}, moves {moves:?}, madd {madd_output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evaluation_stays_below_mate_bound() {
+        let cases = [
+            (START_POSITION, Some(i16::MAX), MAX_EVALUATION),
+            (START_POSITION, Some(i16::MIN + 1), -MAX_EVALUATION),
+            (KIWIPETE, Some(i16::MAX), MAX_EVALUATION),
+            ("8/8/8/8/8/8/8/k5NK b - - 0 1", Some(i16::MAX), 0),
+        ];
+
+        for (fen, weight, expected) in cases {
+            let active = embedded_with_output_weights(weight, false);
+            let score = evaluate_with(&active, &mut board(fen));
+            assert_eq!(score, expected, "fen {fen:?}, output weights {weight:?}");
+            assert!(score.abs() < MATE_BOUND, "fen {fen:?}, score {score}");
         }
     }
 }

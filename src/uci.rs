@@ -850,4 +850,121 @@ mod tests {
             );
         }
     }
+
+    fn execute_all(engine: &mut Engine, commands: &[&str]) -> Flow {
+        let mut flow = Flow::Continue;
+        for command in commands {
+            flow = engine.execute(&tokens(command));
+        }
+        flow
+    }
+
+    #[test]
+    fn executes_state_changing_commands() {
+        let after_e4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+        let cases: [(&[&str], &str, usize, Flow); 8] = [
+            (&[], START_POSITION, 1, Flow::Continue),
+            (
+                &["position startpos moves e2e4"],
+                after_e4,
+                1,
+                Flow::Continue,
+            ),
+            (
+                &[
+                    "position startpos moves e2e4",
+                    "position startpos moves e2e5",
+                ],
+                after_e4,
+                1,
+                Flow::Continue,
+            ),
+            (
+                &["position startpos moves e2e4", "position fen invalid"],
+                after_e4,
+                1,
+                Flow::Continue,
+            ),
+            (
+                &["position startpos moves e2e4", "ucinewgame"],
+                START_POSITION,
+                1,
+                Flow::Continue,
+            ),
+            (
+                &[
+                    "setoption name Threads value 4",
+                    "setoption name Threads value 2",
+                ],
+                START_POSITION,
+                2,
+                Flow::Continue,
+            ),
+            (&["bogus command"], START_POSITION, 1, Flow::Continue),
+            (&["quit"], START_POSITION, 1, Flow::Quit),
+        ];
+
+        for (commands, fen, threads, expected_flow) in cases {
+            let mut engine = Engine::new();
+            let flow = execute_all(&mut engine, commands);
+            assert!(flow == expected_flow, "commands {commands:?}");
+            assert_eq!(engine.board.to_fen(), fen, "commands {commands:?}");
+            assert_eq!(engine.histories.len(), threads, "commands {commands:?}");
+        }
+    }
+
+    #[test]
+    fn searches_hand_back_every_thread_history() {
+        let cases: [(&[&str], bool, usize); 8] = [
+            (&["go depth 2"], true, 1),
+            (&["setoption name Threads value 3", "go depth 2"], true, 3),
+            (
+                &[
+                    "setoption name Threads value 3",
+                    "setoption name UCI_LimitStrength value true",
+                    "go depth 2",
+                ],
+                true,
+                3,
+            ),
+            (&["setoption name Threads value 2", "go infinite"], true, 2),
+            (
+                &[
+                    "setoption name Threads value 2",
+                    "go ponder depth 2",
+                    "ponderhit",
+                ],
+                true,
+                2,
+            ),
+            (
+                &[
+                    "setoption name Threads value 2",
+                    "go infinite",
+                    "go depth 1",
+                ],
+                true,
+                2,
+            ),
+            (
+                &[
+                    "setoption name Threads value 2",
+                    "go infinite",
+                    "position startpos moves e2e4",
+                ],
+                false,
+                2,
+            ),
+            (&["setoption name Threads value 2", "go perft 2"], false, 2),
+        ];
+
+        for (commands, searching, threads) in cases {
+            let mut engine = Engine::new();
+            execute_all(&mut engine, commands);
+            assert_eq!(engine.search.is_some(), searching, "commands {commands:?}");
+            engine.execute(&tokens("stop"));
+            assert!(engine.search.is_none(), "commands {commands:?}");
+            assert_eq!(engine.histories.len(), threads, "commands {commands:?}");
+        }
+    }
 }

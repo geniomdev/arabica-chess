@@ -6,6 +6,8 @@ use crate::types::{Bitboard, Color, Move, MoveKind, Piece, Square};
 const SEE_VALUES: [i32; 6] = [20_000, 900, 500, 330, 320, 100];
 const MAX_PINS: usize = 16;
 
+type SliderAttacks = fn(Square, Bitboard) -> Bitboard;
+
 #[derive(Clone, Copy, Default)]
 struct Pin {
     pinned: Bitboard,
@@ -112,7 +114,7 @@ impl Board {
         for side in [Color::White, Color::Black] {
             let king = self.king_square(side);
             let enemy = side.opponent();
-            let rays: [(fn(Square, Bitboard) -> Bitboard, Bitboard); 2] = [
+            let rays: [(SliderAttacks, Bitboard); 2] = [
                 (rook_attacks, self.orthogonal_sliders(enemy)),
                 (bishop_attacks, self.diagonal_sliders(enemy)),
             ];

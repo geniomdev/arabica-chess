@@ -326,7 +326,9 @@ fn run(arguments: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arabica::nnue::data::RECORD_BYTES;
+    use crate::testing::board;
+    use arabica::board::{KIWIPETE, START_POSITION};
+    use arabica::nnue::data::{Outcome, RECORD_BYTES};
 
     #[test]
     fn learning_rate_decays_along_a_cosine() {
@@ -389,6 +391,124 @@ mod tests {
 
         for (records, expected) in cases {
             assert_eq!(validation_size(records), expected, "{records} records");
+        }
+    }
+
+    fn scratch_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("arabica-{}-{name}", std::process::id()))
+    }
+
+    fn records() -> Vec<RawRecord> {
+        let cases = [
+            (START_POSITION, 20, Outcome::Draw),
+            (KIWIPETE, -90, Outcome::Loss),
+            ("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1", 150, Outcome::Win),
+            ("6k1/5p1p/4N3/8/8/8/8/4K1Q1 b - - 0 1", -800, Outcome::Loss),
+            ("8/8/8/8/8/8/8/k6K w - - 0 1", 0, Outcome::Draw),
+        ];
+        cases
+            .iter()
+            .map(|&(fen, score, outcome)| Record::new(&board(fen), score, outcome).to_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn checkpoints_never_take_the_network_extension() {
+        let cases = [
+            ("net.nnue", false),
+            ("runs/net.nnue", false),
+            ("run.ckpt", true),
+            ("run", true),
+            ("run.nnue.ckpt", true),
+            ("nets.nnue/run.ckpt", true),
+        ];
+
+        for (path, accepted) in cases {
+            assert_eq!(
+                reject_network_extension(Path::new(path)).is_ok(),
+                accepted,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn mean_loss_does_not_depend_on_threads() {
+        let model = Model::random(&mut Random::new(11));
+        let records = records();
+        let sequential: f64 = records
+            .iter()
+            .map(|bytes| f64::from(model.loss(&decode(bytes), WDL_WEIGHT)))
+            .sum::<f64>()
+            / records.len() as f64;
+        let cases = [
+            (records.len(), 1, sequential),
+            (records.len(), 2, sequential),
+            (records.len(), 3, sequential),
+            (records.len(), 64, sequential),
+            (0, 4, 0.0),
+        ];
+
+        for (len, threads, expected) in cases {
+            let loss = mean_loss(&model, &records[..len], threads);
+            assert!(
+                (loss - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+                "{len} records, {threads} threads: {loss} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn training_runs_resume_and_export() {
+        let data = scratch_path("run-data.bin");
+        let checkpoint_path = scratch_path("run.ckpt");
+        let network = network_path(&checkpoint_path);
+        let exported = scratch_path("run-exported.nnue");
+        std::fs::write(&data, records().as_flattened()).expect("data written");
+        let text = |path: &Path| path.display().to_string();
+        let train_command = |epochs: &str| {
+            vec![
+                "train".to_owned(),
+                text(&data),
+                text(&checkpoint_path),
+                epochs.to_owned(),
+                "2".to_owned(),
+            ]
+        };
+        let steps: [(Vec<String>, bool, usize); 6] = [
+            (train_command("1"), true, 1),
+            (train_command("1"), true, 1),
+            (train_command("2"), true, 2),
+            (
+                vec!["train".to_owned(), text(&data), text(&network)],
+                false,
+                2,
+            ),
+            (
+                vec!["export".to_owned(), text(&checkpoint_path), text(&exported)],
+                true,
+                2,
+            ),
+            (vec!["export".to_owned()], false, 2),
+        ];
+
+        for (arguments, succeeds, epoch) in steps {
+            let result = match arguments.split_first() {
+                Some((command, rest)) if command == "train" => run(rest),
+                Some((_, rest)) => export_command(rest),
+                None => unreachable!(),
+            };
+            assert_eq!(result.is_ok(), succeeds, "{arguments:?}: {result:?}");
+            let saved = Checkpoint::load(&checkpoint_path).expect("checkpoint saved");
+            assert_eq!(saved.epoch, epoch, "{arguments:?}");
+            assert!(network.exists(), "{arguments:?}");
+        }
+        assert_eq!(
+            std::fs::read(&exported).expect("exported network"),
+            std::fs::read(&network).expect("trained network")
+        );
+        for path in [&data, &checkpoint_path, &network, &exported] {
+            std::fs::remove_file(path).expect("scratch file removed");
         }
     }
 }

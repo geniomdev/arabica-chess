@@ -650,4 +650,67 @@ mod tests {
         }
         fs::remove_dir_all(&directory).expect("directory removed");
     }
+
+    fn played(positions: u64, white_outcome: Outcome, ending: Ending) -> PlayedGame {
+        PlayedGame {
+            game: games::Game {
+                start: START_POSITION.to_owned(),
+                white_outcome,
+                plies: Vec::new(),
+            },
+            positions,
+            searched_plies: positions + 1,
+            searched_nodes: 100 * positions,
+            ending,
+        }
+    }
+
+    #[test]
+    fn output_counts_written_games_up_to_the_target() {
+        let directory =
+            std::env::temp_dir().join(format!("arabica-{}-datagen-output", std::process::id()));
+        fs::create_dir_all(&directory).expect("directory created");
+        let mixed = [
+            (4, Outcome::Win, Ending::Rules),
+            (3, Outcome::Draw, Ending::AdjudicatedDraw),
+            (5, Outcome::Loss, Ending::AdjudicatedWin),
+            (2, Outcome::Win, Ending::AdjudicatedWin),
+        ];
+        let cases: [(&str, u64, bool, [u64; 9]); 4] = [
+            ("all", 100, false, [4, 14, 2, 1, 1, 2, 1, 18, 1_400]),
+            ("cut", 7, false, [2, 7, 1, 1, 0, 0, 1, 9, 700]),
+            ("zero", 0, false, [0; 9]),
+            ("failed", 100, true, [0; 9]),
+        ];
+
+        for (name, target, failed, expected) in cases {
+            let path = directory.join(format!("{name}.games"));
+            let mut output = Output {
+                writer: BufWriter::new(open_games_file(&path).expect("file opened")),
+                totals: Totals::default(),
+                target,
+                error: failed.then(|| io::Error::other("disk full")),
+            };
+            for (positions, outcome, ending) in mixed {
+                output.write_game(played(positions, outcome, ending));
+            }
+            output.writer.flush().expect("file flushed");
+            let totals = &output.totals;
+            let counted = [
+                totals.games,
+                totals.positions,
+                totals.white_wins,
+                totals.draws,
+                totals.black_wins,
+                totals.adjudicated_wins,
+                totals.adjudicated_draws,
+                totals.searched_plies,
+                totals.searched_nodes,
+            ];
+            assert_eq!(counted, expected, "{name}");
+            let file = games::contents(&path).expect("file read");
+            assert_eq!(file.games, totals.games, "{name}");
+        }
+        fs::remove_dir_all(&directory).expect("directory removed");
+    }
 }

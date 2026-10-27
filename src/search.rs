@@ -1046,6 +1046,40 @@ mod tests {
     }
 
     #[test]
+    fn corrected_evaluation_stays_below_mate_bound() {
+        let ceiling = MATE_BOUND - 1;
+        let cases = [
+            (0, None, 0),
+            (ceiling, None, ceiling),
+            (ceiling, Some(MATE), ceiling),
+            (-ceiling, Some(-MATE), -ceiling),
+            (ceiling - 10, Some(MATE), ceiling),
+            (ceiling, Some(-MATE), ceiling - 64),
+            (100, Some(MATE), 164),
+        ];
+
+        for (raw_eval, search_error, expected) in cases {
+            let position = board(KIWIPETE);
+            let mut history = History::default();
+            if let Some(error) = search_error {
+                history.update_correction(
+                    position.state.active_color,
+                    pawn_key(&position),
+                    MAX_DEPTH as i32,
+                    error,
+                );
+            }
+            let searcher = Searcher::new(SearchLimits::default(), Arc::default(), small_shared())
+                .with_history(history);
+            let corrected = searcher.corrected_evaluation(&position, raw_eval);
+            assert_eq!(
+                corrected, expected,
+                "raw eval {raw_eval}, search error {search_error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn searches_with_helpers() {
         let cases = [
             ("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", 0, 3, Some("a1a8")),
