@@ -16,9 +16,8 @@ const SAME_POSITION_DEPTH_MARGIN: u8 = 4;
 const MISSING_EVAL: i16 = i16::MIN;
 const HASHFULL_SAMPLE: usize = 1000;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bound {
-    #[default]
     Exact,
     Lower,
     Upper,
@@ -43,7 +42,7 @@ impl Bound {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Entry {
     key: u64,
     best_move: Move,
@@ -172,7 +171,6 @@ pub struct Store {
     pub ply: usize,
 }
 
-#[derive(Default)]
 pub struct TranspositionTable {
     buckets: Vec<Bucket>,
     generation: AtomicU8,

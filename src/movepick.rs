@@ -5,10 +5,6 @@ use crate::types::{Move, MoveKind, Piece};
 const CAPTURE_HISTORY_ORDER_DIVISOR: i32 = 8;
 const KING_ATTACKER_RANK: i32 = 1_000;
 
-pub fn is_noisy(candidate: Move) -> bool {
-    candidate.is_capture() || candidate.is_promotion()
-}
-
 pub fn moved_piece(board: &Board, candidate: Move) -> PieceTo {
     PieceTo {
         side: board.state.active_color,
@@ -182,7 +178,7 @@ impl MovePicker {
         if !board.is_pseudo_legal(hash_move) {
             return false;
         }
-        !self.noisy_only || (is_noisy(hash_move) && board.see(hash_move, 0))
+        !self.noisy_only || (hash_move.is_noisy() && board.see(hash_move, 0))
     }
 
     fn next_valid_killer(&mut self, board: &Board) -> Option<Move> {
@@ -192,7 +188,7 @@ impl MovePicker {
             let playable = !self.quiets_skipped
                 && Some(killer) != self.hash_move
                 && !self.killers[..self.next_killer - 1].contains(&killer)
-                && !is_noisy(killer)
+                && !killer.is_noisy()
                 && board.is_pseudo_legal(killer);
             if playable {
                 return Some(killer);
@@ -302,7 +298,7 @@ mod tests {
                     .position(|&played| played == killer)
                     .expect("killer yielded");
                 let ordinary_quiet_before_killer = order[..killer_position].iter().any(|&played| {
-                    !is_noisy(played) && Some(played) != hash_move && !killers.contains(&played)
+                    !played.is_noisy() && Some(played) != hash_move && !killers.contains(&played)
                 });
                 assert!(
                     !ordinary_quiet_before_killer,
@@ -311,13 +307,13 @@ mod tests {
             }
             let first_bad_noisy = order
                 .iter()
-                .position(|&candidate| is_noisy(candidate) && !board.see(candidate, 0))
+                .position(|&candidate| candidate.is_noisy() && !board.see(candidate, 0))
                 .filter(|&index| Some(order[index]) != hash_move);
             if let Some(first_bad) = first_bad_noisy {
                 assert!(
                     order[first_bad..]
                         .iter()
-                        .all(|&candidate| is_noisy(candidate)),
+                        .all(|&candidate| candidate.is_noisy()),
                     "fen {fen:?}: quiet after bad noisy"
                 );
             }
@@ -339,18 +335,18 @@ mod tests {
             let expected_noisy: Vec<Move> = all
                 .iter()
                 .copied()
-                .filter(|&candidate| is_noisy(candidate))
+                .filter(|&candidate| candidate.is_noisy())
                 .collect();
             let yielded_noisy: Vec<Move> = order
                 .iter()
                 .copied()
-                .filter(|&candidate| is_noisy(candidate))
+                .filter(|&candidate| candidate.is_noisy())
                 .collect();
             assert_eq!(sorted(yielded_noisy), sorted(expected_noisy), "fen {fen:?}");
             let quiets_after_skip = order
                 .iter()
                 .skip(skip_after)
-                .filter(|&&candidate| !is_noisy(candidate))
+                .filter(|&&candidate| !candidate.is_noisy())
                 .count();
             assert_eq!(quiets_after_skip, 0, "fen {fen:?}, skip after {skip_after}");
         }
@@ -372,7 +368,7 @@ mod tests {
             let order = picked(&board, MovePicker::good_noisy_only(hash_move), None);
             let expected: Vec<Move> = generated(&board)
                 .into_iter()
-                .filter(|&candidate| is_noisy(candidate) && board.see(candidate, 0))
+                .filter(|&candidate| candidate.is_noisy() && board.see(candidate, 0))
                 .collect();
             assert_eq!(sorted(order.clone()), sorted(expected), "fen {fen:?}");
             if let Some(hash_move) = hash_move.filter(|&hash_move| order.contains(&hash_move)) {

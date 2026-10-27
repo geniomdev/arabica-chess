@@ -1,4 +1,26 @@
 const UNIT_BITS: u32 = 24;
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+pub const fn splitmix64(value: u64) -> u64 {
+    let mut mixed = value.wrapping_add(SPLITMIX_GAMMA);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
+}
+
+pub struct SplitMix(u64);
+
+impl SplitMix {
+    pub const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub const fn next_u64(&mut self) -> u64 {
+        let value = splitmix64(self.0);
+        self.0 = self.0.wrapping_add(SPLITMIX_GAMMA);
+        value
+    }
+}
 
 pub struct Random(u64);
 

@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::history::History;
+use crate::progress::per_second;
 use crate::search::{SearchLimits, Searcher, SharedSearch};
-use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
+use crate::tt::DEFAULT_HASH_MB;
 use crate::uci::parse_position;
 
 const DEFAULT_BENCH_DEPTH: u8 = 13;
@@ -77,7 +77,7 @@ pub fn run(arguments: &[&str]) {
         depth: Some(depth),
         ..SearchLimits::default()
     };
-    let mut shared = Arc::new(SharedSearch::new(TranspositionTable::new(DEFAULT_HASH_MB)));
+    let mut shared = Arc::new(SharedSearch::new(DEFAULT_HASH_MB));
     let mut history = History::default();
     let mut total_nodes = 0;
     let mut total_time = Duration::ZERO;
@@ -98,12 +98,8 @@ pub fn run(arguments: &[&str]) {
 
         let mut nodes = 0;
         let started = Instant::now();
-        let mut searcher = Searcher::new(
-            limits,
-            Arc::new(AtomicBool::new(false)),
-            Arc::clone(&shared),
-        )
-        .with_history(history);
+        let mut searcher =
+            Searcher::new(limits, Arc::default(), Arc::clone(&shared)).with_history(history);
         let (best_move, _) = searcher.search(&mut board, |iteration| nodes = iteration.nodes);
         let elapsed = started.elapsed();
         total_time += elapsed;
@@ -114,19 +110,15 @@ pub fn run(arguments: &[&str]) {
             "{:>2}  {nodes:>10}  {:>7}  {:>8}  {best_move}",
             index + 1,
             elapsed.as_millis(),
-            nodes_per_second(nodes, elapsed),
+            per_second(nodes, elapsed) as u64,
         );
     }
 
-    let nps = nodes_per_second(total_nodes, total_time);
+    let nps = per_second(total_nodes, total_time) as u64;
     println!();
     println!("Total time (ms) : {}", total_time.as_millis());
     println!("Nodes searched  : {total_nodes}");
     println!("Nodes/second    : {nps}");
-}
-
-pub fn nodes_per_second(nodes: u64, elapsed: Duration) -> u64 {
-    (nodes as f64 / elapsed.as_secs_f64().max(f64::EPSILON)) as u64
 }
 
 #[cfg(test)]

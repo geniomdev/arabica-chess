@@ -3,7 +3,8 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
 use super::data::{Outcome, Record};
-use crate::board::{Board, MoveList};
+use crate::board::Board;
+use crate::cli::invalid_data;
 use crate::search::MATE_BOUND;
 use crate::types::Move;
 
@@ -33,8 +34,7 @@ impl Filter {
     pub fn accepts(&self, ply_index: usize, board: &Board, ply: Ply) -> bool {
         ply_index >= self.skipped_plies
             && i32::from(ply.score).abs() <= self.max_score
-            && !ply.best_move.is_capture()
-            && !ply.best_move.is_promotion()
+            && !ply.best_move.is_noisy()
             && !board.in_check()
     }
 }
@@ -44,10 +44,6 @@ pub struct Game {
     pub start: String,
     pub white_outcome: Outcome,
     pub plies: Vec<Ply>,
-}
-
-fn invalid_data(message: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn read_bytes<const N: usize>(reader: &mut impl Read) -> io::Result<[u8; N]> {
@@ -124,9 +120,7 @@ impl Game {
                 let outcome = self.white_outcome.for_side(board.state.active_color);
                 records.push(Record::new(&board, ply.score, outcome));
             }
-            let mut moves = MoveList::new();
-            board.generate_pseudo_legal(&mut moves);
-            let legal = moves.as_slice().contains(&ply.best_move) && board.make_move(ply.best_move);
+            let legal = board.is_pseudo_legal(ply.best_move) && board.make_move(ply.best_move);
             if !legal {
                 return Err(invalid_data(format!(
                     "illegal move {} at ply {index} after {:?}",

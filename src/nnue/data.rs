@@ -10,15 +10,6 @@ const PIECE_CODE_MASK: u8 = 7;
 const NIBBLE_BITS: usize = 4;
 const NIBBLE_MASK: u8 = 0b1111;
 
-const BULLET_PIECE_ORDER: [Piece; 6] = [
-    Piece::Pawn,
-    Piece::Knight,
-    Piece::Bishop,
-    Piece::Rook,
-    Piece::Queen,
-    Piece::King,
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Outcome {
@@ -54,7 +45,7 @@ impl Outcome {
 }
 
 fn piece_code(piece: Piece) -> u8 {
-    BULLET_PIECE_ORDER
+    Piece::CHEAPEST_FIRST
         .iter()
         .position(|&candidate| candidate == piece)
         .expect("every piece has a code") as u8
@@ -97,8 +88,8 @@ impl Record {
         }
     }
 
-    pub fn with_outcome(self, outcome: Outcome) -> Self {
-        Self { outcome, ..self }
+    pub fn piece_count(&self) -> usize {
+        self.occupancy.count_ones() as usize
     }
 
     pub fn pieces(&self) -> impl Iterator<Item = (Color, Piece, Square)> + '_ {
@@ -112,7 +103,7 @@ impl Record {
                 } else {
                     Color::Black
                 };
-                let piece = BULLET_PIECE_ORDER[usize::from(code & PIECE_CODE_MASK)];
+                let piece = Piece::CHEAPEST_FIRST[usize::from(code & PIECE_CODE_MASK)];
                 (side, piece, square)
             })
     }
@@ -150,7 +141,7 @@ impl Record {
         }
         let valid_codes = (0..slots).all(|slot| {
             let code = (pieces[slot / 2] >> (NIBBLE_BITS * (slot & 1))) & NIBBLE_MASK;
-            usize::from(code & PIECE_CODE_MASK) < BULLET_PIECE_ORDER.len()
+            usize::from(code & PIECE_CODE_MASK) < Piece::CHEAPEST_FIRST.len()
         });
         valid_codes.then_some(Self {
             occupancy,
@@ -164,9 +155,8 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::testing::board;
+    use crate::board::testing::{board, features};
     use crate::board::{KIWIPETE, START_POSITION};
-    use crate::nnue::active_features;
 
     #[test]
     fn start_position_matches_bullet_layout() {
@@ -224,7 +214,7 @@ mod tests {
             for (perspective, real_side) in [(Color::White, us), (Color::Black, us.opponent())] {
                 assert_eq!(
                     sorted(decoded.features(perspective)),
-                    sorted(active_features(&position, real_side)),
+                    features(&position, real_side),
                     "fen {fen:?}, perspective {perspective:?}"
                 );
             }

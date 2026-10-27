@@ -29,9 +29,8 @@ pub fn column_ranges(threads: usize) -> Vec<Range<usize>> {
     let shards = threads.clamp(1, BLOCKS);
     (0..shards)
         .map(|shard| {
-            let start = shard * BLOCKS / shards;
-            let end = (shard + 1) * BLOCKS / shards;
-            start * COLUMN_BLOCK..end * COLUMN_BLOCK
+            let blocks = share(BLOCKS, shard, shards);
+            blocks.start * COLUMN_BLOCK..blocks.end * COLUMN_BLOCK
         })
         .collect()
 }
@@ -264,17 +263,12 @@ impl Position {
     fn decode(bytes: &RawRecord, wdl_weight: f32) -> Self {
         let record = Record::from_bytes(bytes).expect("records are validated on load");
         let mut position = Self::EMPTY;
-        for (side, perspective) in Color::ALL.into_iter().enumerate() {
-            let mut count = 0;
-            for (slot, feature) in position.features[side]
-                .iter_mut()
-                .zip(record.features(perspective))
-            {
+        for (features, perspective) in position.features.iter_mut().zip(Color::ALL) {
+            for (slot, feature) in features.iter_mut().zip(record.features(perspective)) {
                 *slot = feature as u16;
-                count += 1;
             }
-            position.count = count;
         }
+        position.count = record.piece_count();
         position.target = target(&record, wdl_weight);
         position
     }

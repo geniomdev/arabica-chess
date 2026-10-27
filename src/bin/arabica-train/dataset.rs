@@ -3,16 +3,14 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::thread;
 
+use arabica::cli::invalid_data;
 use arabica::nnue::data::{RECORD_BYTES, Record};
 use arabica::nnue::games::{Filter, Game, GameReader, is_games_file};
 
+use super::chunk_size;
 use super::shard::RawRecord;
 
 const GAMES_PER_BLOCK: usize = 1 << 16;
-
-fn invalid_data(message: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
 
 pub struct Dataset {
     pub records: Vec<RawRecord>,
@@ -94,7 +92,7 @@ fn replay_blocks(
             .sum::<u64>();
         let parts = thread::scope(|scope| {
             let workers: Vec<_> = block
-                .chunks(block.len().div_ceil(threads.max(1)))
+                .chunks(chunk_size(block.len(), threads))
                 .map(|games| scope.spawn(move || replay(games, filter)))
                 .collect();
             workers
@@ -130,14 +128,10 @@ fn load_games(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::board;
+    use crate::testing::{board, scratch_path};
     use arabica::board::START_POSITION;
     use arabica::nnue::data::Outcome;
     use arabica::nnue::games::{Ply, write_header};
-
-    fn scratch_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("arabica-{}-{name}", std::process::id()))
-    }
 
     fn opening_game(white_outcome: Outcome) -> Game {
         let mut position = board(START_POSITION);

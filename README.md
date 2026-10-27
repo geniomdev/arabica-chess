@@ -7,7 +7,7 @@
   <a href="https://lichess.org/@/ArabicaNNUE/perf/rapid"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FArabicaNNUE&query=%24.perfs.rapid.rating&label=Rapid&logo=lichess&logoColor=white&color=blue" alt="Rapid"></a>
 </p>
 
-UCI chess engine in Rust powered by NNUE
+Arabica is a UCI chess engine written from scratch in Rust, with zero dependencies. The engine plays games against itself to produce training data, a built-in trainer learns from those games, and the resulting NNUE is compiled straight into the engine.
 
 ## UCI commands
 

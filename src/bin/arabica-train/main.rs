@@ -13,7 +13,7 @@ use std::time::Instant;
 use arabica::cli::{default_threads, parse_argument, usage_error};
 use arabica::nnue::data::Record;
 use arabica::nnue::games::Filter;
-use arabica::progress::{Ticker, bar, eta, format_duration, percent};
+use arabica::progress::{Ticker, bar, eta, format_duration, per_second, percent};
 use arabica::random::Random;
 use checkpoint::Checkpoint;
 use model::{Adam, Model};
@@ -45,11 +45,17 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod testing {
+    use std::path::PathBuf;
+
     use arabica::board::Board;
 
     pub fn board(fen: &str) -> Board {
         fen.parse()
             .unwrap_or_else(|error| panic!("fen {fen:?} rejected: {error}"))
+    }
+
+    pub fn scratch_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("arabica-{}-{name}", std::process::id()))
     }
 }
 
@@ -132,7 +138,7 @@ impl Run<'_> {
         let total = ((self.epochs - self.first_epoch) * epoch_size) as u64;
         let finished = ((epoch - self.first_epoch) * epoch_size + done) as u64;
         let elapsed = self.started.elapsed();
-        let rate = finished as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+        let rate = per_second(finished, elapsed);
         format!(
             "{} epoch {}/{} {:5.1}%  loss {loss:.6}  elapsed {}  eta {}  {rate:.0}/s",
             bar(done as u64, epoch_size as u64),
@@ -196,8 +202,8 @@ fn print_summary(
     quantization: &QuantizationError,
 ) {
     let elapsed = run.started.elapsed();
-    let processed = ((run.epochs - run.first_epoch) * training_positions) as f64;
-    let rate = processed / elapsed.as_secs_f64().max(f64::EPSILON);
+    let processed = ((run.epochs - run.first_epoch) * training_positions) as u64;
+    let rate = per_second(processed, elapsed);
     eprintln!("train finished");
     eprintln!("  time               {}", format_duration(elapsed));
     eprintln!(
@@ -326,7 +332,7 @@ fn run(arguments: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::board;
+    use crate::testing::{board, scratch_path};
     use arabica::board::{KIWIPETE, START_POSITION};
     use arabica::nnue::data::{Outcome, RECORD_BYTES};
 
@@ -392,10 +398,6 @@ mod tests {
         for (records, expected) in cases {
             assert_eq!(validation_size(records), expected, "{records} records");
         }
-    }
-
-    fn scratch_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("arabica-{}-{name}", std::process::id()))
     }
 
     fn records() -> Vec<RawRecord> {

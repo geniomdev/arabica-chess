@@ -171,6 +171,25 @@ impl Board {
             .find(|candidate| candidate.to_string() == notation)
     }
 
+    pub fn is_legal(&mut self, candidate: Move) -> bool {
+        let legal = self.make_move(candidate);
+        if legal {
+            self.unmake_move();
+        }
+        legal
+    }
+
+    pub fn legal_moves(&mut self) -> Vec<Move> {
+        let mut moves = MoveList::new();
+        self.generate_pseudo_legal(&mut moves);
+        moves
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|&candidate| self.is_legal(candidate))
+            .collect()
+    }
+
     fn generate(&self, moves: &mut MoveList, generation: Generation) {
         let side = self.state.active_color;
         let allies = self.occupied_by(side);
@@ -429,9 +448,20 @@ mod tests {
             let mut quiets = MoveList::new();
             board.generate_quiets(&mut quiets);
             let all = generate(fen);
-            let is_noisy = |candidate: &Move| candidate.is_capture() || candidate.is_promotion();
-            assert!(noisy.as_slice().iter().all(is_noisy), "fen {fen:?}");
-            assert!(!quiets.as_slice().iter().any(is_noisy), "fen {fen:?}");
+            assert!(
+                noisy
+                    .as_slice()
+                    .iter()
+                    .all(|candidate| candidate.is_noisy()),
+                "fen {fen:?}"
+            );
+            assert!(
+                !quiets
+                    .as_slice()
+                    .iter()
+                    .any(|candidate| candidate.is_noisy()),
+                "fen {fen:?}"
+            );
             assert_eq!(
                 sorted([noisy.as_slice(), quiets.as_slice()].concat()),
                 sorted(all),

@@ -1,4 +1,5 @@
 use super::Board;
+use crate::random::SplitMix;
 use crate::types::{CastlingRights, Color, FILES, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
 
 const SEED: u64 = 0x2545_F491_4F6C_DD1D;
@@ -13,16 +14,8 @@ struct Keys {
 
 static KEYS: Keys = generate_keys();
 
-const fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut mixed = *state;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    mixed ^ (mixed >> 31)
-}
-
 const fn generate_keys() -> Keys {
-    let mut state = SEED;
+    let mut keys = SplitMix::new(SEED);
     let mut pieces = [[[0; SQUARES]; PIECE_TYPES]; SIDES];
     let mut side = 0;
     while side < SIDES {
@@ -30,7 +23,7 @@ const fn generate_keys() -> Keys {
         while piece < PIECE_TYPES {
             let mut square = 0;
             while square < SQUARES {
-                pieces[side][piece][square] = splitmix64(&mut state);
+                pieces[side][piece][square] = keys.next_u64();
                 square += 1;
             }
             piece += 1;
@@ -41,7 +34,7 @@ const fn generate_keys() -> Keys {
     let mut single_right_keys = [0; 4];
     let mut right = 0;
     while right < single_right_keys.len() {
-        single_right_keys[right] = splitmix64(&mut state);
+        single_right_keys[right] = keys.next_u64();
         right += 1;
     }
     let mut castling = [0; CASTLING_COMBINATIONS];
@@ -60,7 +53,7 @@ const fn generate_keys() -> Keys {
     let mut en_passant_file = [0; FILES as usize];
     let mut file = 0;
     while file < en_passant_file.len() {
-        en_passant_file[file] = splitmix64(&mut state);
+        en_passant_file[file] = keys.next_u64();
         file += 1;
     }
 
@@ -68,7 +61,7 @@ const fn generate_keys() -> Keys {
         pieces,
         castling,
         en_passant_file,
-        black_to_move: splitmix64(&mut state),
+        black_to_move: keys.next_u64(),
     }
 }
 

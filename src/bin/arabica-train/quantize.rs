@@ -70,7 +70,7 @@ pub fn export(model: &Model, path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::model::{FEATURE_BIAS, PARAMETERS, WEIGHT_LIMIT};
-    use crate::testing::board;
+    use crate::testing::{board, scratch_path};
     use arabica::board::{KIWIPETE, START_POSITION};
     use arabica::nnue::NETWORK_BYTES;
     use arabica::nnue::data::Outcome;
@@ -196,7 +196,7 @@ mod tests {
         }
 
         let model = spread_model(5);
-        let path = std::env::temp_dir().join(format!("arabica-{}-export.nnue", std::process::id()));
+        let path = scratch_path("export.nnue");
         export(&model, &path).expect("network exported");
         let bytes = std::fs::read(&path).expect("network read");
         std::fs::remove_file(&path).expect("network removed");

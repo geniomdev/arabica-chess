@@ -324,21 +324,11 @@ const fn leaper_table<const N: usize>(steps: [Direction; N]) -> [u64; SQUARES] {
 mod tests {
     use super::*;
     use crate::board::testing::square;
-
-    struct XorShift(u64);
-
-    impl XorShift {
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-    }
+    use crate::random::Random;
 
     #[test]
     fn magic_lookup_matches_ray_walk() {
-        let mut random = XorShift(42);
+        let mut random = Random::new(42);
         for index in 0..SQUARES as u8 {
             let square = Square::from_index(index);
             for _ in 0..1000 {

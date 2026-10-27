@@ -126,6 +126,10 @@ impl Move {
         self.flags() & 8 != 0
     }
 
+    pub const fn is_noisy(self) -> bool {
+        self.is_capture() || self.is_promotion()
+    }
+
     pub const fn kind(self) -> MoveKind {
         match self.flags() {
             0 => MoveKind::Quiet,
@@ -272,24 +276,6 @@ impl IntoIterator for Bitboard {
     }
 }
 
-impl std::fmt::Display for Bitboard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for rank in (0..RANKS).rev() {
-            write!(f, "{} ", rank + 1)?;
-            for file in 0..FILES {
-                let symbol = if self.contains(Square::new(file, rank)) {
-                    '1'
-                } else {
-                    '.'
-                };
-                write!(f, " {symbol}")?;
-            }
-            writeln!(f)?;
-        }
-        write!(f, "   a b c d e f g h")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EverySide<T>([T; SIDES]);
 
@@ -381,7 +367,7 @@ impl Color {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Piece {
     King = 0,
@@ -400,6 +386,15 @@ impl Piece {
         Self::Bishop,
         Self::Knight,
         Self::Pawn,
+    ];
+
+    pub const CHEAPEST_FIRST: [Self; PIECE_TYPES] = [
+        Self::Pawn,
+        Self::Knight,
+        Self::Bishop,
+        Self::Rook,
+        Self::Queen,
+        Self::King,
     ];
 
     pub const fn index(self) -> usize {

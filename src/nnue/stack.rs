@@ -1,4 +1,4 @@
-use super::{Accumulator, HIDDEN, Network, feature_index};
+use super::{Accumulator, HIDDEN, Network, active_features, feature_index};
 use crate::types::{Bitboard, Color, Piece, SIDES, Square};
 
 const MAX_CHANGES: usize = 2;
@@ -71,12 +71,6 @@ impl Entry {
         removed: Changes::EMPTY,
         status: Status::Stale,
     };
-
-    fn record(&mut self, changes: fn(&mut Self) -> &mut Changes, change: Change) {
-        if self.status == Status::Pending && !changes(self).push(change) {
-            self.status = Status::Stale;
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -134,12 +128,6 @@ fn apply(
     }
 }
 
-impl Default for AccumulatorStack {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AccumulatorStack {
     pub fn new() -> Self {
         Self {
@@ -171,21 +159,29 @@ impl AccumulatorStack {
     }
 
     pub fn add(&mut self, side: Color, piece: Piece, square: Square) {
-        let change = Change {
-            side,
-            piece,
-            square,
-        };
-        self.entries[self.top].record(|entry| &mut entry.added, change);
+        let entry = &mut self.entries[self.top];
+        if entry.status == Status::Pending
+            && !entry.added.push(Change {
+                side,
+                piece,
+                square,
+            })
+        {
+            entry.status = Status::Stale;
+        }
     }
 
     pub fn remove(&mut self, side: Color, piece: Piece, square: Square) {
-        let change = Change {
-            side,
-            piece,
-            square,
-        };
-        self.entries[self.top].record(|entry| &mut entry.removed, change);
+        let entry = &mut self.entries[self.top];
+        if entry.status == Status::Pending
+            && !entry.removed.push(Change {
+                side,
+                piece,
+                square,
+            })
+        {
+            entry.status = Status::Stale;
+        }
     }
 
     pub fn shift(&mut self, side: Color, piece: Piece, from: Square, to: Square) {
@@ -206,15 +202,8 @@ impl AccumulatorStack {
         if self.entries[base].status == Status::Stale {
             let entry = &mut self.entries[top];
             for perspective in Color::ALL {
-                let features = Color::ALL.into_iter().flat_map(|side| {
-                    let pieces_of = &pieces_of;
-                    Piece::ALL.into_iter().flat_map(move |piece| {
-                        pieces_of(side, piece)
-                            .into_iter()
-                            .map(move |square| feature_index(perspective, side, piece, square))
-                    })
-                });
-                entry.accumulators[perspective.index()] = network.refresh(features);
+                entry.accumulators[perspective.index()] =
+                    network.refresh(active_features(perspective, &pieces_of));
             }
             entry.status = Status::Computed;
             return &self.entries[top].accumulators;

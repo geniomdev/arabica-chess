@@ -23,3 +23,7 @@ pub fn usage_error(usage: &str) -> io::Error {
 pub fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
 }
+
+pub fn invalid_data(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}

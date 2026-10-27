@@ -3,20 +3,19 @@ use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::board::{Board, MoveList, START_POSITION, color_flipped_fen};
-use crate::cli::{default_threads, parse_argument, usage_error};
+use crate::board::{Board, START_POSITION, color_flipped_fen};
+use crate::cli::{default_threads, invalid_data, parse_argument, usage_error};
 use crate::nnue::data::Outcome;
 use crate::nnue::games::{self, Filter, Ply, read_header, write_header};
-use crate::progress::{Ticker, bar, eta, format_duration, percent};
+use crate::progress::{Ticker, bar, eta, format_duration, per_second, percent, ratio};
 use crate::random::Random;
 use crate::search::{SearchLimits, Searcher, SharedSearch};
 use crate::strength::fresh_noise_seed;
-use crate::tt::{DEFAULT_HASH_MB, TranspositionTable};
-use crate::types::{Color, Move};
+use crate::tt::DEFAULT_HASH_MB;
+use crate::types::Color;
 
 const DEFAULT_NODES: u64 = 2_000;
 const HARD_NODE_FACTOR: u64 = 10;
@@ -32,25 +31,8 @@ const FIFTY_MOVE_PLIES: u8 = 100;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const THREAD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
 
-fn legal_moves(board: &mut Board) -> Vec<Move> {
-    let mut moves = MoveList::new();
-    board.generate_pseudo_legal(&mut moves);
-    moves
-        .as_slice()
-        .iter()
-        .copied()
-        .filter(|&candidate| {
-            let legal = board.make_move(candidate);
-            if legal {
-                board.unmake_move();
-            }
-            legal
-        })
-        .collect()
-}
-
 fn rules_outcome(board: &mut Board) -> Option<Outcome> {
-    if legal_moves(board).is_empty() {
+    if board.legal_moves().is_empty() {
         let winner = board.state.active_color.opponent();
         return Some(if board.in_check() {
             Outcome::Win.for_side(winner)
@@ -113,7 +95,7 @@ struct PlayedGame {
 fn random_opening(random: &mut Random) -> Option<Board> {
     let mut board: Board = START_POSITION.parse().expect("start position is valid");
     for _ in 0..RANDOM_PLIES {
-        let moves = legal_moves(&mut board);
+        let moves = board.legal_moves();
         if moves.is_empty() {
             return None;
         }
@@ -132,52 +114,49 @@ fn play_game(random: &mut Random, shared: &Arc<SharedSearch>, nodes: u64) -> Opt
         soft_nodes: Some(nodes),
         ..SearchLimits::default()
     };
-    let mut searcher = Searcher::new(limits, Arc::new(AtomicBool::new(false)), Arc::clone(shared));
-    random_opening(random).and_then(|mut board| {
-        let start = board.to_fen();
-        let mut plies = Vec::new();
-        let mut positions = 0;
-        let mut searched_plies = 0;
-        let mut searched_nodes = 0;
-        let mut adjudication = Adjudication::default();
-        let (white_outcome, ending) = loop {
-            if let Some(outcome) = rules_outcome(&mut board) {
-                break (outcome, Ending::Rules);
-            }
-            let (best_move, score) = searcher.search(&mut board, |_| {});
-            searched_nodes += searcher.nodes();
-            if searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
-                return None;
-            }
-            let index = searched_plies;
-            searched_plies += 1;
-            let side = board.state.active_color;
-            if let Some(adjudicated) =
-                adjudication.observe(board.state.fullmove_number, side, score)
-            {
-                break adjudicated;
-            }
-            let ply = Ply {
-                best_move,
-                score: score as i16,
-            };
-            if Filter::DEFAULT.accepts(index, &board, ply) {
-                positions += 1;
-            }
-            plies.push(ply);
-            board.make_move(best_move);
+    let mut searcher = Searcher::new(limits, Arc::default(), Arc::clone(shared));
+    let mut board = random_opening(random)?;
+    let start = board.to_fen();
+    let mut plies = Vec::new();
+    let mut positions = 0;
+    let mut searched_plies = 0;
+    let mut searched_nodes = 0;
+    let mut adjudication = Adjudication::default();
+    let (white_outcome, ending) = loop {
+        if let Some(outcome) = rules_outcome(&mut board) {
+            break (outcome, Ending::Rules);
+        }
+        let (best_move, score) = searcher.search(&mut board, |_| {});
+        searched_nodes += searcher.nodes();
+        if searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
+            return None;
+        }
+        let index = searched_plies;
+        searched_plies += 1;
+        let side = board.state.active_color;
+        if let Some(adjudicated) = adjudication.observe(board.state.fullmove_number, side, score) {
+            break adjudicated;
+        }
+        let ply = Ply {
+            best_move,
+            score: score as i16,
         };
-        Some(PlayedGame {
-            game: games::Game {
-                start,
-                white_outcome,
-                plies,
-            },
-            positions,
-            searched_plies: searched_plies as u64,
-            searched_nodes,
-            ending,
-        })
+        if Filter::DEFAULT.accepts(index, &board, ply) {
+            positions += 1;
+        }
+        plies.push(ply);
+        board.make_move(best_move);
+    };
+    Some(PlayedGame {
+        game: games::Game {
+            start,
+            white_outcome,
+            plies,
+        },
+        positions,
+        searched_plies: searched_plies as u64,
+        searched_nodes,
+        ending,
     })
 }
 
@@ -239,7 +218,7 @@ impl Output {
 
 fn generate(output: &Mutex<Output>, seed: u64, nodes: u64) {
     let mut random = Random::new(seed);
-    let mut shared = Arc::new(SharedSearch::new(TranspositionTable::new(DEFAULT_HASH_MB)));
+    let mut shared = Arc::new(SharedSearch::new(DEFAULT_HASH_MB));
     while !output.lock().expect("output lock").is_done() {
         let game = play_game(&mut random, &shared, nodes);
         SharedSearch::exclusive_table(&mut shared).clear();
@@ -253,7 +232,7 @@ fn generate(output: &Mutex<Output>, seed: u64, nodes: u64) {
 
 fn progress_line(positions: u64, target: u64, elapsed: Duration) -> String {
     let done = positions.min(target);
-    let rate = positions as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+    let rate = per_second(positions, elapsed);
     format!(
         "{} {:5.1}%  {done}/{target}  elapsed {}  eta {}  {rate:.0}/s",
         bar(done, target),
@@ -261,10 +240,6 @@ fn progress_line(positions: u64, target: u64, elapsed: Duration) -> String {
         format_duration(elapsed),
         eta(done, target, elapsed)
     )
-}
-
-fn ratio(part: u64, whole: u64) -> f64 {
-    part as f64 / whole.max(1) as f64
 }
 
 struct Summary<'a> {
@@ -279,8 +254,7 @@ struct Summary<'a> {
 
 fn print_summary(summary: &Summary) {
     let totals = summary.totals;
-    let seconds = summary.elapsed.as_secs_f64().max(f64::EPSILON);
-    let rate = totals.positions as f64 / seconds;
+    let rate = per_second(totals.positions, summary.elapsed);
     let attempted = totals.games + totals.discarded_openings;
     eprintln!("datagen finished");
     eprintln!("  time               {}", format_duration(summary.elapsed));
@@ -292,7 +266,7 @@ fn print_summary(summary: &Summary) {
     eprintln!(
         "  games              {} ({:.2}/s), {:.1} positions and {:.1} searched plies per game",
         totals.games,
-        totals.games as f64 / seconds,
+        per_second(totals.games, summary.elapsed),
         ratio(totals.positions, totals.games),
         ratio(totals.searched_plies, totals.games)
     );
@@ -360,10 +334,10 @@ fn open_games_file(path: &Path) -> io::Result<File> {
     }
     file.seek(SeekFrom::Start(0))?;
     if !read_header(&mut file)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} exists and is not an arabica games file", path.display()),
-        ));
+        return Err(invalid_data(format!(
+            "{} exists and is not an arabica games file",
+            path.display()
+        )));
     }
     Ok(file)
 }
@@ -436,7 +410,7 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::testing::board;
+    use crate::board::testing::{board, scratch_path};
     use crate::search::MATE_BOUND;
     use crate::types::Piece;
 
@@ -598,7 +572,7 @@ mod tests {
         let mut played = 0;
         for seed in seeds {
             let mut random = Random::new(seed);
-            let shared = Arc::new(SharedSearch::new(TranspositionTable::new(1)));
+            let shared = Arc::new(SharedSearch::new(1));
             let game = play_game(&mut random, &shared, 200);
             let Some(played_game) = game else { continue };
             played += 1;
@@ -628,8 +602,7 @@ mod tests {
 
     #[test]
     fn appends_only_to_games_files() {
-        let directory =
-            std::env::temp_dir().join(format!("arabica-{}-datagen-files", std::process::id()));
+        let directory = scratch_path("datagen-files");
         fs::create_dir_all(&directory).expect("directory created");
         let cases: [(&str, Option<&[u8]>, bool); 4] = [
             ("fresh.games", None, true),
@@ -667,8 +640,7 @@ mod tests {
 
     #[test]
     fn output_counts_written_games_up_to_the_target() {
-        let directory =
-            std::env::temp_dir().join(format!("arabica-{}-datagen-output", std::process::id()));
+        let directory = scratch_path("datagen-output");
         fs::create_dir_all(&directory).expect("directory created");
         let mixed = [
             (4, Outcome::Win, Ending::Rules),

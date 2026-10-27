@@ -60,13 +60,6 @@ impl Features {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-struct Activations {
-    features: [Features; SIDES],
-    accumulators: [[f32; HIDDEN]; SIDES],
-    output: f32,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     pub parameters: Vec<f32>,
@@ -87,22 +80,21 @@ impl Model {
         Self { parameters }
     }
 
-    fn forward(&self, record: &Record) -> Activations {
-        let features = [
-            Features::of(record, Color::White),
-            Features::of(record, Color::Black),
-        ];
-        let mut accumulators = [[0.0; HIDDEN]; SIDES];
-        let bias = &self.parameters[FEATURE_BIAS..OUTPUT_WEIGHTS];
-        let mut output = self.parameters[OUTPUT_BIAS];
-        for (side, accumulator) in accumulators.iter_mut().enumerate() {
-            accumulator.copy_from_slice(bias);
-            for &feature in features[side].as_slice() {
-                let row = &self.parameters[feature * HIDDEN..(feature + 1) * HIDDEN];
-                for (value, weight) in accumulator.iter_mut().zip(row) {
-                    *value += weight;
-                }
+    fn accumulator(&self, features: &Features) -> [f32; HIDDEN] {
+        let mut accumulator = [0.0; HIDDEN];
+        accumulator.copy_from_slice(&self.parameters[FEATURE_BIAS..OUTPUT_WEIGHTS]);
+        for &feature in features.as_slice() {
+            let row = &self.parameters[feature * HIDDEN..(feature + 1) * HIDDEN];
+            for (value, weight) in accumulator.iter_mut().zip(row) {
+                *value += weight;
             }
+        }
+        accumulator
+    }
+
+    fn output_of(&self, accumulators: &[[f32; HIDDEN]; SIDES]) -> f32 {
+        let mut output = self.parameters[OUTPUT_BIAS];
+        for (side, accumulator) in accumulators.iter().enumerate() {
             let weights = &self.parameters
                 [OUTPUT_WEIGHTS + side * HIDDEN..OUTPUT_WEIGHTS + (side + 1) * HIDDEN];
             output += accumulator
@@ -111,15 +103,13 @@ impl Model {
                 .map(|(&value, weight)| screlu(value) * weight)
                 .sum::<f32>();
         }
-        Activations {
-            features,
-            accumulators,
-            output,
-        }
+        output
     }
 
     pub fn output(&self, record: &Record) -> f32 {
-        self.forward(record).output
+        self.output_of(
+            &Color::ALL.map(|perspective| self.accumulator(&Features::of(record, perspective))),
+        )
     }
 
     pub fn loss(&self, record: &Record, wdl_weight: f32) -> f32 {
@@ -129,14 +119,17 @@ impl Model {
 
     #[cfg(test)]
     pub fn backpropagate(&self, record: &Record, wdl_weight: f32, gradient: &mut [f32]) -> f32 {
-        let activations = self.forward(record);
-        let prediction = sigmoid(activations.output);
+        let features = Color::ALL.map(|perspective| Features::of(record, perspective));
+        let accumulators = features
+            .each_ref()
+            .map(|features| self.accumulator(features));
+        let prediction = sigmoid(self.output_of(&accumulators));
         let error = prediction - target(record, wdl_weight);
         let output_gradient = 2.0 * error * prediction * (1.0 - prediction);
 
         gradient[OUTPUT_BIAS] += output_gradient;
         for side in 0..SIDES {
-            let accumulator = &activations.accumulators[side];
+            let accumulator = &accumulators[side];
             let output_offset = OUTPUT_WEIGHTS + side * HIDDEN;
             let mut hidden_gradient = [0.0; HIDDEN];
             for (index, &value) in accumulator.iter().enumerate() {
@@ -150,7 +143,7 @@ impl Model {
             {
                 *slot += value;
             }
-            for &feature in activations.features[side].as_slice() {
+            for &feature in features[side].as_slice() {
                 let row = &mut gradient[feature * HIDDEN..(feature + 1) * HIDDEN];
                 for (slot, &value) in row.iter_mut().zip(&hidden_gradient) {
                     *slot += value;

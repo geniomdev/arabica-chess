@@ -2,6 +2,8 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use arabica::cli::invalid_data;
+
 use super::model::{Adam, Model, PARAMETERS};
 
 const MAGIC: &[u8; 8] = b"ARBNNUE1";
@@ -75,10 +77,10 @@ impl Checkpoint {
         let mut magic = [0; 8];
         reader.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is not an arabica training checkpoint", path.display()),
-            ));
+            return Err(invalid_data(format!(
+                "{} is not an arabica training checkpoint",
+                path.display()
+            )));
         }
         let epoch = read_u64(&mut reader)? as usize;
         let step = read_u64(&mut reader)?;
@@ -86,10 +88,10 @@ impl Checkpoint {
         let first_moments = read_floats(&mut reader)?;
         let second_moments = read_floats(&mut reader)?;
         if reader.read(&mut [0])? != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} has trailing bytes", path.display()),
-            ));
+            return Err(invalid_data(format!(
+                "{} has trailing bytes",
+                path.display()
+            )));
         }
         Ok(Self {
             epoch,
@@ -106,11 +108,8 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::scratch_path;
     use arabica::random::Random;
-
-    fn scratch_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("arabica-{}-{name}", std::process::id()))
-    }
 
     #[test]
     fn checkpoints_round_trip() {

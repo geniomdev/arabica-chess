@@ -32,14 +32,8 @@ pub struct GameState {
     pub played_move: Move,
 }
 
-impl Default for GameState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GameState {
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             active_color: Color::White,
             castling: CastlingRights::NONE,
@@ -63,14 +57,8 @@ pub struct Board {
     pub history: Vec<GameState>,
 }
 
-impl Default for Board {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Board {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             pieces: EveryPiece::new(Bitboard::empty()),
             colors: EverySide::new(Bitboard::empty()),
@@ -107,12 +95,20 @@ impl Board {
         self.colors[Color::White] | self.colors[Color::Black]
     }
 
+    pub fn bishops_and_queens(&self) -> Bitboard {
+        self.pieces[Piece::Bishop] | self.pieces[Piece::Queen]
+    }
+
+    pub fn rooks_and_queens(&self) -> Bitboard {
+        self.pieces[Piece::Rook] | self.pieces[Piece::Queen]
+    }
+
     pub fn diagonal_sliders(&self, side: Color) -> Bitboard {
-        (self.pieces[Piece::Bishop] | self.pieces[Piece::Queen]) & self.colors[side]
+        self.bishops_and_queens() & self.colors[side]
     }
 
     pub fn orthogonal_sliders(&self, side: Color) -> Bitboard {
-        (self.pieces[Piece::Rook] | self.pieces[Piece::Queen]) & self.colors[side]
+        self.rooks_and_queens() & self.colors[side]
     }
 
     pub fn piece_on(&self, square: Square) -> Option<Piece> {
@@ -139,13 +135,11 @@ impl Board {
         let pawns = (pawn_attacks(Color::White, square)
             & self.pieces_of(Color::Black, Piece::Pawn))
             | (pawn_attacks(Color::Black, square) & self.pieces_of(Color::White, Piece::Pawn));
-        let diagonal = self.pieces[Piece::Bishop] | self.pieces[Piece::Queen];
-        let orthogonal = self.pieces[Piece::Rook] | self.pieces[Piece::Queen];
         pawns
             | (knight_attacks(square) & self.pieces[Piece::Knight])
             | (king_attacks(square) & self.pieces[Piece::King])
-            | (bishop_attacks(square, occupancy) & diagonal)
-            | (rook_attacks(square, occupancy) & orthogonal)
+            | (bishop_attacks(square, occupancy) & self.bishops_and_queens())
+            | (rook_attacks(square, occupancy) & self.rooks_and_queens())
     }
 
     pub fn is_attacked(&self, square: Square, by: Color, occupancy: Bitboard) -> bool {
@@ -230,8 +224,11 @@ impl std::fmt::Display for Board {
 
 #[cfg(test)]
 pub mod testing {
+    use std::path::PathBuf;
+
     use super::Board;
-    use crate::types::{Move, Square};
+    use crate::nnue::active_features;
+    use crate::types::{Color, Move, Square};
 
     pub fn board(fen: &str) -> Board {
         fen.parse()
@@ -246,5 +243,16 @@ pub mod testing {
         board
             .parse_move(notation)
             .unwrap_or_else(|| panic!("fen {:?}, move {notation} not generated", board.to_fen()))
+    }
+
+    pub fn features(board: &Board, perspective: Color) -> Vec<usize> {
+        let mut features: Vec<usize> =
+            active_features(perspective, |side, piece| board.pieces_of(side, piece)).collect();
+        features.sort_unstable();
+        features
+    }
+
+    pub fn scratch_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("arabica-{}-{name}", std::process::id()))
     }
 }

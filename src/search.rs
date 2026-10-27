@@ -3,9 +3,9 @@ use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::board::{Board, MoveList, see_value};
+use crate::board::{Board, see_value};
 use crate::history::{Continuations, History, PieceTo, history_bonus};
-use crate::movepick::{MovePicker, captured_piece, is_noisy, moved_piece};
+use crate::movepick::{MovePicker, captured_piece, moved_piece};
 use crate::nnue;
 use crate::strength::EvalNoise;
 use crate::tt::{Bound, Hit, Store, TranspositionTable};
@@ -101,9 +101,9 @@ pub struct SharedSearch {
 }
 
 impl SharedSearch {
-    pub fn new(table: TranspositionTable) -> Self {
+    pub fn new(hash_megabytes: usize) -> Self {
         Self {
-            table,
+            table: TranspositionTable::new(hash_megabytes),
             helpers_stop: AtomicBool::new(false),
             nodes: AtomicU64::new(0),
         }
@@ -177,27 +177,13 @@ fn pawn_key(board: &Board) -> u64 {
     (white ^ black.rotate_left(BLACK_PAWNS_ROTATION)).wrapping_mul(PAWN_KEY_MULTIPLIER)
 }
 
+fn table_depth(depth: i32) -> u8 {
+    depth.min(i32::from(u8::MAX)) as u8
+}
+
 fn late_move_reduction(depth: i32, move_number: usize) -> i32 {
     let depth = (depth as usize).min(REDUCTION_TABLE_SIZE - 1);
     REDUCTIONS[depth][move_number.min(REDUCTION_TABLE_SIZE - 1)]
-}
-
-fn is_legal(board: &mut Board, candidate: Move) -> bool {
-    let legal = board.make_move(candidate);
-    if legal {
-        board.unmake_move();
-    }
-    legal
-}
-
-fn first_legal_move(board: &mut Board) -> Option<Move> {
-    let mut moves = MoveList::new();
-    board.generate_pseudo_legal(&mut moves);
-    moves
-        .as_slice()
-        .iter()
-        .copied()
-        .find(|&candidate| is_legal(board, candidate))
 }
 
 pub fn is_mate_score(score: i32) -> bool {
@@ -340,7 +326,7 @@ impl Searcher {
             report(&Iteration {
                 depth,
                 score,
-                nodes: self.total_nodes(),
+                nodes: self.nodes(),
                 elapsed: self.start.elapsed(),
                 pv,
                 hashfull: self.shared.table.hashfull(),
@@ -363,7 +349,7 @@ impl Searcher {
             }
         }
         if best.0 == Move::NULL {
-            best.0 = first_legal_move(board).unwrap_or(Move::NULL);
+            best.0 = board.legal_moves().first().copied().unwrap_or(Move::NULL);
         }
         if self.ponder_move.is_none() && best.0 != Move::NULL {
             self.ponder_move = self.table_reply(board, best.0);
@@ -384,7 +370,7 @@ impl Searcher {
             .table
             .probe(board.state.zobrist_key, 0)
             .and_then(|hit| hit.best_move)
-            .filter(|&reply| board.is_pseudo_legal(reply) && is_legal(board, reply));
+            .filter(|&reply| board.is_pseudo_legal(reply) && board.is_legal(reply));
         board.unmake_move();
         reply
     }
@@ -394,15 +380,11 @@ impl Searcher {
         self
     }
 
-    pub fn nodes(&self) -> u64 {
-        self.total_nodes()
-    }
-
     pub fn into_history(self) -> History {
         self.history
     }
 
-    fn total_nodes(&self) -> u64 {
+    pub fn nodes(&self) -> u64 {
         self.shared.nodes.load(Ordering::Relaxed) + self.nodes - self.flushed_nodes
     }
 
@@ -477,16 +459,13 @@ impl Searcher {
 
     fn node_limit_reached(&self) -> bool {
         self.first_iteration_completed
-            && self
-                .limits
-                .nodes
-                .is_some_and(|limit| self.total_nodes() >= limit)
+            && self.limits.nodes.is_some_and(|limit| self.nodes() >= limit)
     }
 
     fn soft_node_limit_reached(&self) -> bool {
         self.limits
             .soft_nodes
-            .is_some_and(|limit| self.total_nodes() >= limit)
+            .is_some_and(|limit| self.nodes() >= limit)
     }
 
     fn visit_node(&mut self) {
@@ -555,7 +534,7 @@ impl Searcher {
         depth: i32,
     ) {
         let bonus = history_bonus(depth);
-        if is_noisy(cutoff) {
+        if cutoff.is_noisy() {
             self.history.update_capture(
                 moved_piece(board, cutoff),
                 captured_piece(board, cutoff),
@@ -672,10 +651,9 @@ impl Searcher {
 
         let key = board.state.zobrist_key;
         let hit = self.shared.table.probe(key, self.ply);
-        let probe_depth = depth.min(i32::from(u8::MAX)) as u8;
         if let Some(score) = hit
             .filter(|_| !is_pv && !singular_search)
-            .and_then(|hit| hit.cutoff_score(probe_depth, alpha, beta))
+            .and_then(|hit| hit.cutoff_score(table_depth(depth), alpha, beta))
         {
             return score;
         }
@@ -683,7 +661,6 @@ impl Searcher {
         if depth >= INTERNAL_REDUCTION_DEPTH && hash_move.is_none() {
             depth -= 1;
         }
-        let table_depth = depth.min(i32::from(u8::MAX)) as u8;
 
         let us = board.state.active_color;
         let unrefined_eval = (!in_check).then(|| self.cached_static_evaluation(board, hit));
@@ -755,7 +732,7 @@ impl Searcher {
 
         let continuations = self.continuations();
         let mut picker = MovePicker::new(hash_move, self.killers[self.ply]);
-        let hash_move_is_noisy = hash_move.is_some_and(is_noisy);
+        let hash_move_is_noisy = hash_move.is_some_and(Move::is_noisy);
 
         let original_alpha = alpha;
         let mut best_score = -INFINITY;
@@ -769,7 +746,7 @@ impl Searcher {
             if candidate == excluded {
                 continue;
             }
-            let is_quiet = !is_noisy(candidate);
+            let is_quiet = !candidate.is_noisy();
             let moved = moved_piece(board, candidate);
             let move_history = if is_quiet {
                 self.history.quiet_score(candidate, moved, continuations)
@@ -910,7 +887,7 @@ impl Searcher {
             Bound::Exact
         };
         if let (Some(raw_eval), Some(corrected_eval)) = (unrefined_eval, corrected_eval) {
-            let quiet_best = best_move == Move::NULL || !is_noisy(best_move);
+            let quiet_best = best_move == Move::NULL || !best_move.is_noisy();
             let consistent = match bound {
                 Bound::Lower => score > corrected_eval,
                 Bound::Upper => score < corrected_eval,
@@ -926,7 +903,7 @@ impl Searcher {
             best_move,
             score,
             static_eval: unrefined_eval,
-            depth: table_depth,
+            depth: table_depth(depth),
             bound,
             ply: self.ply,
         });
@@ -1042,7 +1019,7 @@ mod tests {
     use crate::board::{KIWIPETE, START_POSITION};
 
     fn small_shared() -> Arc<SharedSearch> {
-        Arc::new(SharedSearch::new(TranspositionTable::new(1)))
+        Arc::new(SharedSearch::new(1))
     }
 
     #[test]
@@ -1277,8 +1254,8 @@ mod tests {
     #[test]
     fn keeps_best_move_from_interrupted_iteration() {
         let cases = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            START_POSITION,
+            KIWIPETE,
             "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
         ];
 
@@ -1303,14 +1280,8 @@ mod tests {
     #[test]
     fn ignores_clock_while_pondering() {
         let cases = [
-            (
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-                5,
-            ),
-            (
-                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-                4,
-            ),
+            (START_POSITION, 5),
+            (KIWIPETE, 4),
             ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 6),
         ];
 
@@ -1337,14 +1308,7 @@ mod tests {
 
     #[test]
     fn completes_first_iteration_under_node_limit() {
-        let cases = [
-            (START_POSITION, 1),
-            (
-                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-                1,
-            ),
-            (START_POSITION, 5_000),
-        ];
+        let cases = [(START_POSITION, 1), (KIWIPETE, 1), (START_POSITION, 5_000)];
 
         for (fen, node_limit) in cases {
             let mut board = board(fen);

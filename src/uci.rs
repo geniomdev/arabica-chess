@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::bench::{self, nodes_per_second};
+use crate::bench;
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::history::History;
 use crate::nnue::{evaluate, load_network, use_embedded_network};
+use crate::progress::per_second;
 use crate::search::{Iteration, SearchLimits, Searcher, SharedSearch, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
-use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, TranspositionTable};
+use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB};
 use crate::types::{Color, EverySide};
 
 const ENGINE_NAME: &str = "Arabica";
@@ -65,7 +66,7 @@ impl Engine {
     fn new() -> Self {
         Self {
             board: start_position(),
-            shared: Arc::new(SharedSearch::new(TranspositionTable::new(DEFAULT_HASH_MB))),
+            shared: Arc::new(SharedSearch::new(DEFAULT_HASH_MB)),
             histories: iter::repeat_with(History::default)
                 .take(DEFAULT_THREADS)
                 .collect(),
@@ -76,10 +77,6 @@ impl Engine {
             noise_seed: fresh_noise_seed(),
             search: None,
         }
-    }
-
-    fn handicap(&self) -> Option<Handicap> {
-        self.limit_strength.then(|| Handicap::from_elo(self.elo))
     }
 
     fn execute(&mut self, tokens: &[&str]) -> Flow {
@@ -117,8 +114,7 @@ impl Engine {
                 self.stop_search();
                 match parse_option(arguments) {
                     Some(EngineOption::Hash(megabytes)) => {
-                        self.shared =
-                            Arc::new(SharedSearch::new(TranspositionTable::new(megabytes)));
+                        self.shared = Arc::new(SharedSearch::new(megabytes));
                     }
                     Some(EngineOption::Threads(threads)) => {
                         self.histories.resize_with(threads, History::default);
@@ -158,7 +154,10 @@ impl Engine {
                 self.board.to_fen(),
                 self.board.state.zobrist_key
             ),
-            ["eval", ..] => print_evaluation(&mut self.board),
+            ["eval", ..] => println!(
+                "NNUE evaluation: {:+} cp (side to move)",
+                evaluate(&mut self.board)
+            ),
             ["quit", ..] => return Flow::Quit,
             _ => {}
         }
@@ -172,7 +171,8 @@ impl Engine {
         }
         let mut limits = params.limits(self.board.state.active_color, self.move_overhead);
         let mut eval_noise = EvalNoise::default();
-        if let Some(handicap) = self.handicap() {
+        if self.limit_strength {
+            let handicap = Handicap::from_elo(self.elo);
             limits.nodes = Some(
                 limits
                     .nodes
@@ -322,14 +322,10 @@ fn print_iteration(iteration: &Iteration) {
         iteration.depth,
         uci_score(iteration.score),
         iteration.nodes,
-        nodes_per_second(iteration.nodes, iteration.elapsed),
+        per_second(iteration.nodes, iteration.elapsed) as u64,
         iteration.elapsed.as_millis(),
         iteration.hashfull,
     );
-}
-
-fn print_evaluation(board: &mut Board) {
-    println!("NNUE evaluation: {:+} cp (side to move)", evaluate(board));
 }
 
 fn print_perft_divide(board: &mut Board, depth: u32) {
@@ -386,17 +382,14 @@ pub fn parse_position(arguments: &[&str]) -> Result<Board, PositionError> {
         _ => return Err(PositionError::Setup(setup.join(" "))),
     };
     for &text in moves.iter().skip(1) {
-        if !play_uci_move(&mut board, text) {
+        let legal = board
+            .parse_move(text)
+            .is_some_and(|candidate| board.make_move(candidate));
+        if !legal {
             return Err(PositionError::IllegalMove(text.to_string()));
         }
     }
     Ok(board)
-}
-
-fn play_uci_move(board: &mut Board, text: &str) -> bool {
-    board
-        .parse_move(text)
-        .is_some_and(|candidate| board.make_move(candidate))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

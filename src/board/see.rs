@@ -29,15 +29,6 @@ impl Pins {
     }
 }
 
-const CHEAPEST_FIRST: [Piece; 6] = [
-    Piece::Pawn,
-    Piece::Knight,
-    Piece::Bishop,
-    Piece::Rook,
-    Piece::Queen,
-    Piece::King,
-];
-
 pub const fn see_value(piece: Piece) -> i32 {
     SEE_VALUES[piece.index()]
 }
@@ -67,8 +58,8 @@ impl Board {
         if played.kind() == MoveKind::EnPassant {
             occupancy &= !Bitboard::from_square(en_passant_victim(to));
         }
-        let diagonal = self.pieces(Piece::Bishop) | self.pieces(Piece::Queen);
-        let orthogonal = self.pieces(Piece::Rook) | self.pieces(Piece::Queen);
+        let diagonal = self.bishops_and_queens();
+        let orthogonal = self.rooks_and_queens();
         let pins = self.pins_off_line(from, to);
         let mut attackers = self.attackers_to(to, occupancy);
         let mut side = self.state.active_color;
@@ -82,7 +73,7 @@ impl Board {
                 break;
             }
             winning = !winning;
-            let (piece, candidates) = CHEAPEST_FIRST
+            let (piece, candidates) = Piece::CHEAPEST_FIRST
                 .into_iter()
                 .map(|piece| (piece, side_attackers & self.pieces(piece)))
                 .find(|(_, candidates)| !candidates.is_empty())
@@ -111,7 +102,7 @@ impl Board {
         let landed = Bitboard::from_square(to);
         let occupancy = (self.occupancy() & !moved) | landed;
         let mut pins = Pins::default();
-        for side in [Color::White, Color::Black] {
+        for side in Color::ALL {
             let king = self.king_square(side);
             let enemy = side.opponent();
             let rays: [(SliderAttacks, Bitboard); 2] = [

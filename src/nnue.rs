@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::board::Board;
 use crate::search::MATE_BOUND;
-use crate::types::{Color, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
-pub use stack::AccumulatorStack;
+use crate::types::{Bitboard, Color, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
+pub(crate) use stack::AccumulatorStack;
 
 pub const INPUTS: usize = SIDES * PIECE_TYPES * SQUARES;
 pub const HIDDEN: usize = 512;
@@ -122,18 +122,14 @@ fn evaluate_with(active: &ActiveNetwork, board: &mut Board) -> i32 {
     }
     let us = board.state.active_color;
     let accumulators = board.accumulators();
-    let ActiveNetwork {
-        network,
-        madd_output,
-    } = active;
-    let (our_weights, their_weights) = network.output_weights.split_at(HIDDEN);
-    let sum = simd::screlu_dot(*madd_output, &accumulators[us.index()].0, our_weights)
-        + simd::screlu_dot(
-            *madd_output,
-            &accumulators[us.opponent().index()].0,
-            their_weights,
-        );
-    network.finish(sum).clamp(-MAX_EVALUATION, MAX_EVALUATION)
+    active
+        .network
+        .output(
+            active.madd_output,
+            &accumulators[us.index()],
+            &accumulators[us.opponent().index()],
+        )
+        .clamp(-MAX_EVALUATION, MAX_EVALUATION)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,14 +199,13 @@ impl Network {
     }
 
     pub fn evaluate(&self, us: &Accumulator, them: &Accumulator) -> i32 {
-        let (our_weights, their_weights) = self.output_weights.split_at(HIDDEN);
-        self.finish(
-            simd::screlu_dot_portable(&us.0, our_weights)
-                + simd::screlu_dot_portable(&them.0, their_weights),
-        )
+        self.output(false, us, them)
     }
 
-    fn finish(&self, sum: i64) -> i32 {
+    fn output(&self, madd: bool, us: &Accumulator, them: &Accumulator) -> i32 {
+        let (our_weights, their_weights) = self.output_weights.split_at(HIDDEN);
+        let sum = simd::screlu_dot(madd, &us.0, our_weights)
+            + simd::screlu_dot(madd, &them.0, their_weights);
         let output = sum / i64::from(QA) + i64::from(self.output_bias);
         (output * i64::from(SCALE) / i64::from(QA * QB)) as i32
     }
@@ -222,12 +217,13 @@ pub fn feature_index(perspective: Color, side: Color, piece: Piece, square: Squa
         + relative_square(perspective, square).index()
 }
 
-#[cfg(test)]
-pub fn active_features(board: &Board, perspective: Color) -> impl Iterator<Item = usize> + '_ {
+pub fn active_features(
+    perspective: Color,
+    pieces_of: impl Fn(Color, Piece) -> Bitboard + Copy,
+) -> impl Iterator<Item = usize> {
     Color::ALL.into_iter().flat_map(move |side| {
         Piece::ALL.into_iter().flat_map(move |piece| {
-            board
-                .pieces_of(side, piece)
+            pieces_of(side, piece)
                 .into_iter()
                 .map(move |square| feature_index(perspective, side, piece, square))
         })
@@ -238,7 +234,7 @@ pub fn active_features(board: &Board, perspective: Color) -> impl Iterator<Item 
 mod tests {
     use super::*;
     use crate::board::color_flipped_fen;
-    use crate::board::testing::board;
+    use crate::board::testing::{board, features, scratch_path};
     use crate::board::{KIWIPETE, MoveList, START_POSITION};
 
     #[test]
@@ -313,12 +309,6 @@ mod tests {
         }
     }
 
-    fn sorted_features(fen: &str, perspective: Color) -> Vec<usize> {
-        let mut features: Vec<usize> = active_features(&board(fen), perspective).collect();
-        features.sort_unstable();
-        features
-    }
-
     #[test]
     fn color_flip_swaps_perspectives() {
         let cases = [
@@ -333,8 +323,8 @@ mod tests {
             let flipped = color_flipped_fen(fen);
             for perspective in Color::ALL {
                 assert_eq!(
-                    sorted_features(fen, perspective),
-                    sorted_features(&flipped, perspective.opponent()),
+                    features(&board(fen), perspective),
+                    features(&board(&flipped), perspective.opponent()),
                     "fen {fen:?}, perspective {perspective:?}"
                 );
             }
@@ -416,7 +406,7 @@ mod tests {
         }
         network.feature_bias = [3; HIDDEN];
         let position = board(KIWIPETE);
-        let features: Vec<usize> = active_features(&position, Color::White).collect();
+        let features = features(&position, Color::White);
 
         let mut incremental = network.refresh([]);
         for &feature in &features {
@@ -431,7 +421,7 @@ mod tests {
 
     fn assert_fresh_accumulators(position: &mut Board, context: &str) {
         let fresh =
-            Color::ALL.map(|perspective| network().refresh(active_features(position, perspective)));
+            Color::ALL.map(|perspective| network().refresh(features(position, perspective)));
         let fen = position.to_fen();
         assert_eq!(position.accumulators(), &fresh, "{context}, fen {fen:?}");
     }
@@ -509,7 +499,7 @@ mod tests {
 
     #[test]
     fn loads_networks_from_files() {
-        let directory = std::env::temp_dir().join(format!("arabica-{}-load", std::process::id()));
+        let directory = scratch_path("load");
         fs::create_dir_all(&directory).expect("directory created");
         let cases = [
             ("embedded.nnue", Some(NETWORK_BYTES), Ok(())),
@@ -632,11 +622,8 @@ mod tests {
                 let active = embedded_with_output_weights(None, madd_output);
                 let mut position = played(fen, moves);
                 let us = position.state.active_color;
-                let fresh = Color::ALL.map(|perspective| {
-                    active
-                        .network
-                        .refresh(active_features(&position, perspective))
-                });
+                let fresh = Color::ALL
+                    .map(|perspective| active.network.refresh(features(&position, perspective)));
                 let expected = active
                     .network
                     .evaluate(&fresh[us.index()], &fresh[us.opponent().index()]);

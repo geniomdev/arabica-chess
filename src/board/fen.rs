@@ -127,26 +127,26 @@ impl Board {
             (
                 CastlingRights::WHITE_KING,
                 Color::White,
-                Square::new(4, 0),
-                Square::new(7, 0),
+                Square::E1,
+                Square::H1,
             ),
             (
                 CastlingRights::WHITE_QUEEN,
                 Color::White,
-                Square::new(4, 0),
-                Square::new(0, 0),
+                Square::E1,
+                Square::A1,
             ),
             (
                 CastlingRights::BLACK_KING,
                 Color::Black,
-                Square::new(4, 7),
-                Square::new(7, 7),
+                Square::E8,
+                Square::H8,
             ),
             (
                 CastlingRights::BLACK_QUEEN,
                 Color::Black,
-                Square::new(4, 7),
-                Square::new(0, 7),
+                Square::E8,
+                Square::A8,
             ),
         ];
         requirements.into_iter().all(|(right, side, king, rook)| {

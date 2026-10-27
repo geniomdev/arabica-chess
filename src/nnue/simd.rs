@@ -27,7 +27,7 @@ pub fn has_avx2() -> bool {
     }
 }
 
-pub fn screlu_dot_portable(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
+fn screlu_dot_portable(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
     accumulator
         .iter()
         .zip(weights)

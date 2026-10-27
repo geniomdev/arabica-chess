@@ -6,12 +6,16 @@ const TERMINAL_INTERVAL: Duration = Duration::from_secs(1);
 const LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CLEAR_TO_LINE_END: &str = "\x1b[K";
 
+pub fn ratio(part: u64, whole: u64) -> f64 {
+    part as f64 / whole.max(1) as f64
+}
+
 pub fn percent(part: u64, whole: u64) -> f64 {
-    if whole == 0 {
-        0.0
-    } else {
-        100.0 * part as f64 / whole as f64
-    }
+    100.0 * ratio(part, whole)
+}
+
+pub fn per_second(count: u64, elapsed: Duration) -> f64 {
+    count as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
 }
 
 pub fn format_duration(duration: Duration) -> String {
