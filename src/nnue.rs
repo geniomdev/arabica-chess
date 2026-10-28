@@ -17,12 +17,14 @@ use crate::types::{Bitboard, Color, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
 pub(crate) use stack::AccumulatorStack;
 
 pub const INPUTS: usize = SIDES * PIECE_TYPES * SQUARES;
-pub const HIDDEN: usize = 512;
+pub const HIDDEN: usize = 1024;
+pub const OUTPUT_BUCKETS: usize = 8;
 pub const QA: i32 = 255;
 pub const QB: i32 = 64;
 pub const SCALE: i32 = 400;
 
 const VERTICAL_FLIP: u8 = 56;
+const PIECES_PER_BUCKET: usize = 32 / OUTPUT_BUCKETS;
 
 pub const fn relative_square(perspective: Color, square: Square) -> Square {
     match perspective {
@@ -31,22 +33,31 @@ pub const fn relative_square(perspective: Color, square: Square) -> Square {
     }
 }
 
+pub const fn output_bucket(piece_count: usize) -> usize {
+    let bucket = piece_count.saturating_sub(2) / PIECES_PER_BUCKET;
+    if bucket < OUTPUT_BUCKETS {
+        bucket
+    } else {
+        OUTPUT_BUCKETS - 1
+    }
+}
+
 #[repr(C, align(64))]
 pub struct Network {
     pub feature_weights: [[i16; HIDDEN]; INPUTS],
     pub feature_bias: [i16; HIDDEN],
-    pub output_weights: [i16; SIDES * HIDDEN],
-    pub output_bias: i16,
+    pub output_weights: [[i16; SIDES * HIDDEN]; OUTPUT_BUCKETS],
+    pub output_bias: [i16; OUTPUT_BUCKETS],
 }
 
 const VALUE_BYTES: usize = std::mem::size_of::<i16>();
 const MAX_EVALUATION: i32 = MATE_BOUND - 1;
 
-pub const NETWORK_VALUES: usize = INPUTS * HIDDEN + HIDDEN + SIDES * HIDDEN + 1;
+pub const NETWORK_VALUES: usize = INPUTS * HIDDEN + HIDDEN + OUTPUT_BUCKETS * (SIDES * HIDDEN + 1);
 pub const NETWORK_BYTES: usize = NETWORK_VALUES * VALUE_BYTES;
 
 const EMBEDDED_NETWORK: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/networks/net2.nnue"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/networks/net3.nnue"));
 const _: () = assert!(EMBEDDED_NETWORK.len() == NETWORK_BYTES);
 
 struct ActiveNetwork {
@@ -56,7 +67,7 @@ struct ActiveNetwork {
 
 impl ActiveNetwork {
     fn new(network: Box<Network>) -> Self {
-        let madd_output = *simd::AVX2 && simd::fits_madd(&network.output_weights);
+        let madd_output = *simd::AVX2 && simd::fits_madd(network.output_weights.as_flattened());
         Self {
             network,
             madd_output,
@@ -121,6 +132,7 @@ fn evaluate_with(active: &ActiveNetwork, board: &mut Board) -> i32 {
         return 0;
     }
     let us = board.state.active_color;
+    let piece_count = board.occupancy().count() as usize;
     let accumulators = board.accumulators();
     active
         .network
@@ -128,6 +140,7 @@ fn evaluate_with(active: &ActiveNetwork, board: &mut Board) -> i32 {
             active.madd_output,
             &accumulators[us.index()],
             &accumulators[us.opponent().index()],
+            piece_count,
         )
         .clamp(-MAX_EVALUATION, MAX_EVALUATION)
 }
@@ -161,8 +174,8 @@ impl Network {
             .as_flattened()
             .iter()
             .chain(&self.feature_bias)
-            .chain(&self.output_weights)
-            .chain(std::iter::once(&self.output_bias))
+            .chain(self.output_weights.as_flattened())
+            .chain(&self.output_bias)
             .copied()
     }
 
@@ -171,8 +184,8 @@ impl Network {
             .as_flattened_mut()
             .iter_mut()
             .chain(&mut self.feature_bias)
-            .chain(&mut self.output_weights)
-            .chain(std::iter::once(&mut self.output_bias))
+            .chain(self.output_weights.as_flattened_mut())
+            .chain(&mut self.output_bias)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Box<Self>> {
@@ -198,15 +211,16 @@ impl Network {
         accumulator
     }
 
-    pub fn evaluate(&self, us: &Accumulator, them: &Accumulator) -> i32 {
-        self.output(false, us, them)
+    pub fn evaluate(&self, us: &Accumulator, them: &Accumulator, piece_count: usize) -> i32 {
+        self.output(false, us, them, piece_count)
     }
 
-    fn output(&self, madd: bool, us: &Accumulator, them: &Accumulator) -> i32 {
-        let (our_weights, their_weights) = self.output_weights.split_at(HIDDEN);
+    fn output(&self, madd: bool, us: &Accumulator, them: &Accumulator, piece_count: usize) -> i32 {
+        let bucket = output_bucket(piece_count);
+        let (our_weights, their_weights) = self.output_weights[bucket].split_at(HIDDEN);
         let sum = simd::screlu_dot(madd, &us.0, our_weights)
             + simd::screlu_dot(madd, &them.0, their_weights);
-        let output = sum / i64::from(QA) + i64::from(self.output_bias);
+        let output = sum / i64::from(QA) + i64::from(self.output_bias[bucket]);
         (output * i64::from(SCALE) / i64::from(QA * QB)) as i32
     }
 }
@@ -340,7 +354,11 @@ mod tests {
             ("first feature", network.feature_weights[0].as_ptr()),
             ("last feature", network.feature_weights[INPUTS - 1].as_ptr()),
             ("feature bias", network.feature_bias.as_ptr()),
-            ("output weights", network.output_weights.as_ptr()),
+            ("first output bucket", network.output_weights[0].as_ptr()),
+            (
+                "last output bucket",
+                network.output_weights[OUTPUT_BUCKETS - 1].as_ptr(),
+            ),
         ];
 
         for (name, row) in rows {
@@ -374,26 +392,55 @@ mod tests {
     fn evaluates_hand_built_networks() {
         let full = (QA * QB) as i16;
         let cases = [
-            (255, 64, 0, 0, 204_800),
-            (255, 0, -64, 0, -204_800),
+            (255, 64, 0, 0, 409_600),
+            (255, 0, -64, 0, -409_600),
             (0, 64, 64, full, SCALE),
             (-100, 64, 64, 0, 0),
-            (510, 1, 0, 0, 3_200),
-            (255, 64, 64, -full, 409_600 - SCALE),
-            (255, 127, 127, full, 813_200),
+            (510, 1, 0, 0, 6_400),
+            (255, 64, 64, -full, 819_200 - SCALE),
+            (255, 127, 127, full, 1_626_000),
         ];
 
         for (bias, our_weight, their_weight, output_bias, expected) in cases {
             let mut network = Network::zeroed();
             network.feature_bias = [bias; HIDDEN];
-            network.output_weights[..HIDDEN].fill(our_weight);
-            network.output_weights[HIDDEN..].fill(their_weight);
-            network.output_bias = output_bias;
+            for row in &mut network.output_weights {
+                row[..HIDDEN].fill(our_weight);
+                row[HIDDEN..].fill(their_weight);
+            }
+            network.output_bias = [output_bias; OUTPUT_BUCKETS];
             let accumulator = network.refresh([]);
             assert_eq!(
-                network.evaluate(&accumulator, &accumulator),
+                network.evaluate(&accumulator, &accumulator, 32),
                 expected,
                 "bias {bias}, weights {our_weight}/{their_weight}, output bias {output_bias}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_buckets_follow_piece_count() {
+        let cases = [(2, 0), (5, 0), (6, 1), (17, 3), (30, 7), (31, 7), (32, 7)];
+
+        for (piece_count, expected) in cases {
+            assert_eq!(output_bucket(piece_count), expected, "{piece_count} pieces");
+        }
+    }
+
+    #[test]
+    fn evaluation_uses_the_bucket_of_the_piece_count() {
+        let mut network = Network::zeroed();
+        for (bucket, bias) in network.output_bias.iter_mut().enumerate() {
+            *bias = (bucket as i32 * QA * QB / 8) as i16;
+        }
+        let accumulator = network.refresh([]);
+        let cases = [(3, 0), (10, 2), (21, 4), (32, 7)];
+
+        for (piece_count, bucket) in cases {
+            assert_eq!(
+                network.evaluate(&accumulator, &accumulator, piece_count),
+                bucket * SCALE / 8,
+                "{piece_count} pieces"
             );
         }
     }
@@ -588,7 +635,7 @@ mod tests {
     fn embedded_with_output_weights(weight: Option<i16>, madd_output: bool) -> ActiveNetwork {
         let mut network = Network::from_bytes(EMBEDDED_NETWORK).expect("embedded network");
         if let Some(weight) = weight {
-            network.output_weights.fill(weight);
+            network.output_weights.as_flattened_mut().fill(weight);
         }
         ActiveNetwork {
             network,
@@ -624,9 +671,11 @@ mod tests {
                 let us = position.state.active_color;
                 let fresh = Color::ALL
                     .map(|perspective| active.network.refresh(features(&position, perspective)));
-                let expected = active
-                    .network
-                    .evaluate(&fresh[us.index()], &fresh[us.opponent().index()]);
+                let expected = active.network.evaluate(
+                    &fresh[us.index()],
+                    &fresh[us.opponent().index()],
+                    position.occupancy().count() as usize,
+                );
                 assert_eq!(
                     evaluate_with(&active, &mut position),
                     expected,

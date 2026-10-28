@@ -1,12 +1,12 @@
 use arabica::nnue::data::Record;
-use arabica::nnue::{HIDDEN, INPUTS, SCALE};
+use arabica::nnue::{HIDDEN, INPUTS, OUTPUT_BUCKETS, SCALE, output_bucket};
 use arabica::random::Random;
 use arabica::types::{Color, SIDES};
 
 pub const FEATURE_BIAS: usize = INPUTS * HIDDEN;
 pub const OUTPUT_WEIGHTS: usize = FEATURE_BIAS + HIDDEN;
-pub const OUTPUT_BIAS: usize = OUTPUT_WEIGHTS + SIDES * HIDDEN;
-pub const PARAMETERS: usize = OUTPUT_BIAS + 1;
+pub const OUTPUT_BIAS: usize = OUTPUT_WEIGHTS + OUTPUT_BUCKETS * SIDES * HIDDEN;
+pub const PARAMETERS: usize = OUTPUT_BIAS + OUTPUT_BUCKETS;
 pub const WEIGHT_LIMIT: f32 = 1.98;
 
 pub const MAX_ACTIVE_FEATURES: usize = 32;
@@ -92,11 +92,12 @@ impl Model {
         accumulator
     }
 
-    fn output_of(&self, accumulators: &[[f32; HIDDEN]; SIDES]) -> f32 {
-        let mut output = self.parameters[OUTPUT_BIAS];
+    fn output_of(&self, accumulators: &[[f32; HIDDEN]; SIDES], bucket: usize) -> f32 {
+        let bucket_weights = OUTPUT_WEIGHTS + bucket * SIDES * HIDDEN;
+        let mut output = self.parameters[OUTPUT_BIAS + bucket];
         for (side, accumulator) in accumulators.iter().enumerate() {
             let weights = &self.parameters
-                [OUTPUT_WEIGHTS + side * HIDDEN..OUTPUT_WEIGHTS + (side + 1) * HIDDEN];
+                [bucket_weights + side * HIDDEN..bucket_weights + (side + 1) * HIDDEN];
             output += accumulator
                 .iter()
                 .zip(weights)
@@ -109,6 +110,7 @@ impl Model {
     pub fn output(&self, record: &Record) -> f32 {
         self.output_of(
             &Color::ALL.map(|perspective| self.accumulator(&Features::of(record, perspective))),
+            output_bucket(record.piece_count()),
         )
     }
 
@@ -123,14 +125,15 @@ impl Model {
         let accumulators = features
             .each_ref()
             .map(|features| self.accumulator(features));
-        let prediction = sigmoid(self.output_of(&accumulators));
+        let bucket = output_bucket(record.piece_count());
+        let prediction = sigmoid(self.output_of(&accumulators, bucket));
         let error = prediction - target(record, wdl_weight);
         let output_gradient = 2.0 * error * prediction * (1.0 - prediction);
 
-        gradient[OUTPUT_BIAS] += output_gradient;
+        gradient[OUTPUT_BIAS + bucket] += output_gradient;
         for side in 0..SIDES {
             let accumulator = &accumulators[side];
-            let output_offset = OUTPUT_WEIGHTS + side * HIDDEN;
+            let output_offset = OUTPUT_WEIGHTS + (bucket * SIDES + side) * HIDDEN;
             let mut hidden_gradient = [0.0; HIDDEN];
             for (index, &value) in accumulator.iter().enumerate() {
                 gradient[output_offset + index] += output_gradient * screlu(value);
@@ -275,7 +278,10 @@ mod tests {
             FEATURE_BIAS + 120,
             OUTPUT_WEIGHTS + 9,
             OUTPUT_WEIGHTS + HIDDEN + 64,
+            OUTPUT_WEIGHTS + 7 * SIDES * HIDDEN + 9,
+            OUTPUT_WEIGHTS + (7 * SIDES + 1) * HIDDEN + 64,
             OUTPUT_BIAS,
+            OUTPUT_BIAS + 7,
         ];
 
         let mut gradient = vec![0.0; PARAMETERS];

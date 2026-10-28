@@ -6,7 +6,7 @@ use arabica::cli::invalid_data;
 
 use super::model::{Adam, Model, PARAMETERS};
 
-const MAGIC: &[u8; 8] = b"ARBNNUE1";
+const MAGIC: &[u8; 8] = b"ARBNNUE2";
 const FLOAT_BYTES: usize = std::mem::size_of::<f32>();
 
 #[derive(Clone, Debug, PartialEq)]

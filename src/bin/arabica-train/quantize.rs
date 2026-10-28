@@ -17,7 +17,7 @@ fn quantized(value: f32, scale: i32) -> i16 {
 
 fn scale_of(parameter: usize) -> i32 {
     match parameter {
-        OUTPUT_BIAS => QA * QB,
+        index if index >= OUTPUT_BIAS => QA * QB,
         index if index >= OUTPUT_WEIGHTS => QB,
         _ => QA,
     }
@@ -38,7 +38,7 @@ pub fn network_path(checkpoint: &Path) -> PathBuf {
 pub fn network_output(network: &Network, record: &Record) -> i32 {
     let us = network.refresh(record.features(Color::White));
     let them = network.refresh(record.features(Color::Black));
-    network.evaluate(&us, &them)
+    network.evaluate(&us, &them, record.piece_count())
 }
 
 pub struct QuantizationError {
@@ -100,7 +100,7 @@ mod tests {
         let mut parameters = vec![0.0; PARAMETERS];
         for (index, value) in parameters.iter_mut().enumerate() {
             *value = match index {
-                OUTPUT_BIAS => uniform(-0.5, 0.5),
+                index if index >= OUTPUT_BIAS => uniform(-0.5, 0.5),
                 index if index >= OUTPUT_WEIGHTS => uniform(-0.5, 0.5),
                 index if index >= FEATURE_BIAS => uniform(0.0, 0.4),
                 _ => uniform(-0.12, 0.12),

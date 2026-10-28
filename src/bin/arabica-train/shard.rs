@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 
 use arabica::nnue::data::{RECORD_BYTES, Record};
-use arabica::nnue::{HIDDEN, INPUTS};
+use arabica::nnue::{HIDDEN, INPUTS, OUTPUT_BUCKETS, output_bucket};
 use arabica::types::{Color, SIDES};
 
 use super::model::{
@@ -16,7 +16,7 @@ pub type RawRecord = [u8; RECORD_BYTES];
 pub const COLUMN_BLOCK: usize = 16;
 
 const BLOCKS: usize = HIDDEN / COLUMN_BLOCK;
-const ROWS: usize = INPUTS + 1 + SIDES;
+const ROWS: usize = INPUTS + 1 + OUTPUT_BUCKETS * SIDES;
 const BIAS_ROW: usize = INPUTS;
 const OUTPUT_ROW: usize = INPUTS + 1;
 const CHUNK: usize = 256;
@@ -122,7 +122,7 @@ fn columns_of(global: &[f32], columns: &Range<usize>) -> Vec<f32> {
         .flat_map(|row| &global[row * HIDDEN + columns.start..row * HIDDEN + columns.end])
         .copied()
         .collect();
-    local.push(global[OUTPUT_BIAS]);
+    local.extend_from_slice(&global[OUTPUT_BIAS..]);
     local
 }
 
@@ -131,7 +131,7 @@ fn write_columns(local: &[f32], columns: &Range<usize>, global: &mut [f32]) {
     for (row, values) in local[..ROWS * width].chunks_exact(width).enumerate() {
         global[row * HIDDEN + columns.start..row * HIDDEN + columns.end].copy_from_slice(values);
     }
-    global[OUTPUT_BIAS] = local[ROWS * width];
+    global[OUTPUT_BIAS..].copy_from_slice(&local[ROWS * width..]);
 }
 
 pub struct Shard {
@@ -179,8 +179,8 @@ impl Shard {
         self.columns.len()
     }
 
-    fn output_bias_index(&self) -> usize {
-        ROWS * self.width()
+    fn output_bias_index(&self, bucket: usize) -> usize {
+        ROWS * self.width() + bucket
     }
 
     fn forward(&self, position: &Position, cache: &mut [f32]) -> f32 {
@@ -190,7 +190,7 @@ impl Shard {
             let layer = Layer {
                 parameters: &self.parameters,
                 width,
-                output_row: (OUTPUT_ROW + side) * width,
+                output_row: (OUTPUT_ROW + position.bucket() * SIDES + side) * width,
                 features: position.side(side),
             };
             for (start, size) in tiles(width) {
@@ -206,13 +206,13 @@ impl Shard {
 
     fn backward(&mut self, position: &Position, cache: &[f32], output_gradient: f32) {
         let width = self.width();
-        let bias_index = self.output_bias_index();
+        let bias_index = self.output_bias_index(position.bucket());
         self.gradient[bias_index] += output_gradient;
         for (side, accumulators) in cache.chunks_exact(width).enumerate() {
             let layer = Layer {
                 parameters: &self.parameters,
                 width,
-                output_row: (OUTPUT_ROW + side) * width,
+                output_row: (OUTPUT_ROW + position.bucket() * SIDES + side) * width,
                 features: position.side(side),
             };
             for (start, size) in tiles(width) {
@@ -231,8 +231,8 @@ impl Shard {
         }
     }
 
-    fn output_bias(&self) -> f32 {
-        self.parameters[self.output_bias_index()]
+    fn output_bias(&self, bucket: usize) -> f32 {
+        self.parameters[self.output_bias_index(bucket)]
     }
 
     fn update(&mut self, step: &AdamStep) {
@@ -275,6 +275,10 @@ impl Position {
 
     fn side(&self, side: usize) -> &[u16] {
         &self.features[side][..self.count]
+    }
+
+    fn bucket(&self) -> usize {
+        output_bucket(self.count)
     }
 }
 
@@ -418,7 +422,9 @@ fn work(context: &Context, index: usize, shard: &mut Shard, mut report: impl FnM
             }
             context.barrier.wait();
             for (offset, position) in chunk.enumerate() {
-                let prediction = sigmoid(exchange.output(position) + shard.output_bias());
+                let prediction = sigmoid(
+                    exchange.output(position) + shard.output_bias(positions[offset].bucket()),
+                );
                 let error = prediction - positions[offset].target;
                 loss += f64::from(error * error);
                 let cached = &cache[offset * SIDES * shard.width()..][..SIDES * shard.width()];

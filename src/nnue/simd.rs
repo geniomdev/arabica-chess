@@ -13,6 +13,11 @@ pub const MADD_WEIGHT_LIMIT: i16 = 128;
 const AVX2_LANES: usize = 16;
 #[cfg(target_arch = "x86_64")]
 const AVX2_SUMS: usize = 8;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    (HIDDEN / AVX2_LANES) as i64 * 2 * (QA * QA) as i64 * MADD_WEIGHT_LIMIT as i64
+        <= i32::MAX as i64
+);
 
 pub static AVX2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(has_avx2);
 
