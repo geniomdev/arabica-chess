@@ -8,6 +8,7 @@ use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::movepick::{MovePicker, captured_piece, moved_piece};
 use crate::nnue;
 use crate::strength::EvalNoise;
+use crate::syzygy::{Tablebases, Wdl};
 use crate::tt::{Bound, Hit, Store, TranspositionTable};
 use crate::types::{Color, Move, Piece, SQUARES};
 
@@ -17,6 +18,8 @@ pub const MAX_PLY: usize = 128;
 pub const MAX_DEPTH: u8 = 64;
 
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
+pub const TABLEBASE_WIN: i32 = MATE_BOUND - 1 - MAX_PLY as i32;
+const TABLEBASE_DEPTH_BONUS: i32 = 6;
 const TIME_CHECK_INTERVAL: u64 = 2048;
 const QUIESCENCE_DEPTH: u8 = 0;
 const QUIESCENCE_FUTILITY_MARGIN: i32 = 200;
@@ -92,12 +95,14 @@ pub struct Iteration<'a> {
     pub elapsed: Duration,
     pub pv: &'a [Move],
     pub hashfull: usize,
+    pub tablebase_hits: u64,
 }
 
 pub struct SharedSearch {
     pub table: TranspositionTable,
     helpers_stop: AtomicBool,
     nodes: AtomicU64,
+    tablebase_hits: AtomicU64,
 }
 
 impl SharedSearch {
@@ -106,6 +111,7 @@ impl SharedSearch {
             table: TranspositionTable::new(hash_megabytes),
             helpers_stop: AtomicBool::new(false),
             nodes: AtomicU64::new(0),
+            tablebase_hits: AtomicU64::new(0),
         }
     }
 
@@ -119,6 +125,11 @@ impl SharedSearch {
         self.table.new_search();
         self.helpers_stop.store(false, Ordering::Relaxed);
         self.nodes.store(0, Ordering::Relaxed);
+        self.tablebase_hits.store(0, Ordering::Relaxed);
+    }
+
+    fn count_tablebase_hits(&self, hits: u64) {
+        self.tablebase_hits.fetch_add(hits, Ordering::Relaxed);
     }
 
     fn stop_helpers(&self) {
@@ -154,6 +165,9 @@ pub struct Searcher {
     history: History,
     played: [Option<PieceTo>; MAX_PLY],
     root_move_nodes: Box<RootMoveNodes>,
+    tablebases: Option<Arc<Tablebases>>,
+    tablebase_root_moves: Vec<Move>,
+    tablebase_probing: bool,
 }
 
 fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_share: f64) -> f64 {
@@ -233,7 +247,15 @@ impl Searcher {
             history: History::default(),
             played: [None; MAX_PLY],
             root_move_nodes: Box::new([[0; SQUARES]; SQUARES]),
+            tablebases: None,
+            tablebase_root_moves: Vec::new(),
+            tablebase_probing: false,
         }
+    }
+
+    pub fn with_tablebases(mut self, tablebases: Arc<Tablebases>) -> Self {
+        self.tablebases = Some(tablebases);
+        self
     }
 
     pub fn with_eval_noise(mut self, eval_noise: EvalNoise) -> Self {
@@ -257,14 +279,48 @@ impl Searcher {
         report: impl FnMut(&Iteration),
     ) -> (Move, i32) {
         self.shared.begin();
+        self.prepare_tablebase_root(board);
         thread::scope(|scope| {
             for helper in helpers.iter_mut() {
+                helper.tablebases.clone_from(&self.tablebases);
+                helper
+                    .tablebase_root_moves
+                    .clone_from(&self.tablebase_root_moves);
+                helper.tablebase_probing = self.tablebase_probing;
                 let mut helper_board = board.clone();
                 scope.spawn(move || helper.search_as_helper(&mut helper_board));
             }
             let best = self.search_as_main(board, report);
             self.shared.stop_helpers();
             best
+        })
+    }
+
+    fn prepare_tablebase_root(&mut self, board: &mut Board) {
+        let root = self
+            .tablebases
+            .as_ref()
+            .and_then(|tablebases| tablebases.root_moves(board));
+        self.tablebase_probing = self.tablebases.is_some() && root.is_none();
+        self.tablebase_root_moves = root.map(|root| root.moves).unwrap_or_default();
+        if !self.tablebase_root_moves.is_empty() {
+            self.shared
+                .count_tablebase_hits(self.tablebase_root_moves.len() as u64);
+        }
+    }
+
+    fn excluded_at_root(&self, candidate: Move) -> bool {
+        !self.tablebase_root_moves.is_empty() && !self.tablebase_root_moves.contains(&candidate)
+    }
+
+    fn probe_tablebase(&mut self, board: &mut Board) -> Option<(i32, Bound)> {
+        let wdl = self.tablebases.as_ref()?.probe_wdl(board)?;
+        self.shared.count_tablebase_hits(1);
+        let ply = self.ply as i32;
+        Some(match wdl {
+            Wdl::Win => (TABLEBASE_WIN - ply, Bound::Lower),
+            Wdl::Loss => (-TABLEBASE_WIN + ply, Bound::Upper),
+            near_draw => (2 * near_draw.value(), Bound::Exact),
         })
     }
 
@@ -330,6 +386,7 @@ impl Searcher {
                 elapsed: self.start.elapsed(),
                 pv,
                 hashfull: self.shared.table.hashfull(),
+                tablebase_hits: self.shared.tablebase_hits.load(Ordering::Relaxed),
             });
             let score_drop = if depth == 1 { 0 } else { previous.1 - score };
             let time_scale = soft_time_scale(
@@ -349,7 +406,12 @@ impl Searcher {
             }
         }
         if best.0 == Move::NULL {
-            best.0 = board.legal_moves().first().copied().unwrap_or(Move::NULL);
+            best.0 = self
+                .tablebase_root_moves
+                .first()
+                .copied()
+                .or_else(|| board.legal_moves().first().copied())
+                .unwrap_or(Move::NULL);
         }
         if self.ponder_move.is_none() && best.0 != Move::NULL {
             self.ponder_move = self.table_reply(board, best.0);
@@ -657,6 +719,43 @@ impl Searcher {
         {
             return score;
         }
+        let original_alpha = alpha;
+        let mut tablebase_floor = -INFINITY;
+        let mut tablebase_ceiling = INFINITY;
+        if !is_root
+            && !singular_search
+            && self.tablebase_probing
+            && board.state.halfmove_clock == 0
+            && let Some((score, bound)) = self.probe_tablebase(board)
+        {
+            let decisive = match bound {
+                Bound::Exact => true,
+                Bound::Lower => score >= beta,
+                Bound::Upper => score <= alpha,
+            };
+            if decisive {
+                self.shared.table.store(Store {
+                    key,
+                    best_move: Move::NULL,
+                    score,
+                    static_eval: None,
+                    depth: table_depth(depth + TABLEBASE_DEPTH_BONUS),
+                    bound,
+                    ply: self.ply,
+                });
+                return score;
+            }
+            if is_pv {
+                match bound {
+                    Bound::Lower => {
+                        tablebase_floor = score;
+                        alpha = alpha.max(score);
+                    }
+                    Bound::Upper => tablebase_ceiling = score,
+                    Bound::Exact => {}
+                }
+            }
+        }
         let hash_move = hit.and_then(|hit| hit.best_move);
         if depth >= INTERNAL_REDUCTION_DEPTH && hash_move.is_none() {
             depth -= 1;
@@ -734,8 +833,7 @@ impl Searcher {
         let mut picker = MovePicker::new(hash_move, self.killers[self.ply]);
         let hash_move_is_noisy = hash_move.is_some_and(Move::is_noisy);
 
-        let original_alpha = alpha;
-        let mut best_score = -INFINITY;
+        let mut best_score = tablebase_floor;
         let mut best_move = Move::NULL;
         let mut legal_moves = 0;
         let mut tried_quiets = [Move::NULL; TRACKED_QUIETS];
@@ -743,7 +841,7 @@ impl Searcher {
         let mut tried_noisy = [Move::NULL; TRACKED_NOISY];
         let mut tried_noisy_count = 0;
         while let Some(candidate) = picker.next_move(board, &self.history, continuations) {
-            if candidate == excluded {
+            if candidate == excluded || (is_root && self.excluded_at_root(candidate)) {
                 continue;
             }
             let is_quiet = !candidate.is_noisy();
@@ -875,7 +973,7 @@ impl Searcher {
         let score = match legal_moves {
             0 if in_check => -MATE + self.ply as i32,
             0 => 0,
-            _ => best_score,
+            _ => best_score.min(tablebase_ceiling),
         };
         let bound = if legal_moves == 0 {
             Bound::Exact
@@ -1017,6 +1115,7 @@ mod tests {
     use super::*;
     use crate::board::testing::board;
     use crate::board::{KIWIPETE, START_POSITION};
+    use crate::syzygy::testing::local_tablebases;
 
     fn small_shared() -> Arc<SharedSearch> {
         Arc::new(SharedSearch::new(1))
@@ -1088,6 +1187,49 @@ mod tests {
             assert!(shared.helpers_stopped(), "{context}");
             assert!(main.nodes() >= main_nodes, "{context}");
             assert_eq!(board.to_fen(), fen, "{context}: board restored");
+        }
+    }
+
+    #[test]
+    fn consults_tablebases_at_root_and_in_search() {
+        let Some(tablebases) = local_tablebases() else {
+            return;
+        };
+        let tablebases = Arc::new(tablebases);
+        let cases = [
+            ("8/8/4k3/8/8/8/1B6/1K2N3 w - - 0 1", 8, true, false),
+            ("8/3k4/8/8/R7/8/1r6/2K5 w - - 0 1", 6, true, false),
+            ("6k1/7p/8/8/8/2K5/3R3r/1R6 w - - 0 1", 6, false, true),
+        ];
+
+        for (fen, depth, root_in_tables, proves_win) in cases {
+            let mut position = board(fen);
+            let root = tablebases.root_moves(&mut position);
+            assert_eq!(root.is_some(), root_in_tables, "fen {fen:?}");
+            let limits = SearchLimits {
+                depth: Some(depth),
+                ..SearchLimits::default()
+            };
+            let mut tablebase_hits = 0;
+            let (best_move, score) = Searcher::new(limits, Arc::default(), small_shared())
+                .with_tablebases(Arc::clone(&tablebases))
+                .search(&mut position, |iteration| {
+                    tablebase_hits = iteration.tablebase_hits;
+                });
+            assert!(tablebase_hits > 0, "fen {fen:?}");
+            if let Some(root) = root {
+                assert!(
+                    root.moves.contains(&best_move),
+                    "fen {fen:?}, move {best_move}"
+                );
+            }
+            if proves_win {
+                assert!(
+                    score > TABLEBASE_WIN - MAX_PLY as i32,
+                    "fen {fen:?}, score {score}"
+                );
+            }
+            assert_eq!(position.to_fen(), fen, "board restored for fen {fen:?}");
         }
     }
 

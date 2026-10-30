@@ -16,6 +16,7 @@ use crate::nnue::{evaluate, load_network, use_embedded_network};
 use crate::progress::per_second;
 use crate::search::{Iteration, SearchLimits, Searcher, SharedSearch, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
+use crate::syzygy::Tablebases;
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB};
 use crate::types::{Color, EverySide};
 
@@ -28,6 +29,7 @@ const MAX_THREADS: usize = 256;
 const DEFAULT_MOVES_TO_GO: u32 = 30;
 const HARD_LIMIT_SHARES: u32 = 3;
 const EMBEDDED_NETWORK_NAME: &str = "<embedded>";
+const NO_TABLEBASES_NAME: &str = "<empty>";
 
 pub fn run() {
     println!("{ENGINE_NAME} {}", env!("CARGO_PKG_VERSION"));
@@ -59,6 +61,7 @@ struct Engine {
     limit_strength: bool,
     elo: u32,
     noise_seed: u64,
+    tablebases: Option<Arc<Tablebases>>,
     search: Option<RunningSearch>,
 }
 
@@ -75,6 +78,7 @@ impl Engine {
             limit_strength: false,
             elo: DEFAULT_ELO,
             noise_seed: fresh_noise_seed(),
+            tablebases: None,
             search: None,
         }
     }
@@ -100,6 +104,7 @@ impl Engine {
                     "option name UCI_Elo type spin default {DEFAULT_ELO} min {MIN_ELO} max {MAX_ELO}"
                 );
                 println!("option name EvalFile type string default {EMBEDDED_NETWORK_NAME}");
+                println!("option name SyzygyPath type string default {NO_TABLEBASES_NAME}");
                 println!("uciok");
             }
             ["isready", ..] => println!("readyok"),
@@ -124,6 +129,7 @@ impl Engine {
                     Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
                     Some(EngineOption::Elo(elo)) => self.elo = elo,
                     Some(EngineOption::EvalFile(path)) => self.set_network(path),
+                    Some(EngineOption::SyzygyPath(paths)) => self.set_tablebases(paths),
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
                 }
             }
@@ -195,6 +201,7 @@ impl Engine {
             limits,
             eval_noise,
             Arc::clone(&self.shared),
+            self.tablebases.clone(),
             active_histories,
             SearchMode {
                 infinite: params.infinite,
@@ -225,6 +232,32 @@ impl Engine {
         SharedSearch::exclusive_table(&mut self.shared).clear();
     }
 
+    fn set_tablebases(&mut self, paths: Option<String>) {
+        let Some(paths) = paths else {
+            self.tablebases = None;
+            println!("info string tablebases disabled");
+            return;
+        };
+        match Tablebases::open(&paths) {
+            Ok(tablebases) if tablebases.is_empty() => {
+                self.tablebases = None;
+                println!("info string no tablebases found in {paths}");
+            }
+            Ok(tablebases) => {
+                println!(
+                    "info string found {} tablebases up to {} pieces in {paths}",
+                    tablebases.len(),
+                    tablebases.max_pieces()
+                );
+                self.tablebases = Some(Arc::new(tablebases));
+            }
+            Err(error) => {
+                self.tablebases = None;
+                println!("info string failed to open tablebases {paths}: {error}");
+            }
+        }
+    }
+
     fn stop_search(&mut self) {
         if let Some(search) = self.search.take() {
             let mut histories = search.stop();
@@ -252,6 +285,7 @@ impl RunningSearch {
         limits: SearchLimits,
         eval_noise: EvalNoise,
         shared: Arc<SharedSearch>,
+        tablebases: Option<Arc<Tablebases>>,
         histories: Vec<History>,
         mode: SearchMode,
     ) -> Self {
@@ -271,6 +305,9 @@ impl RunningSearch {
                 .with_ponder_signal(Arc::clone(&searcher_ponder))
                 .with_eval_noise(eval_noise)
                 .with_history(main_history);
+            if let Some(tablebases) = tablebases {
+                searcher = searcher.with_tablebases(tablebases);
+            }
             let (best_move, _) =
                 searcher.search_with_helpers(&mut board, &mut helpers, print_iteration);
             while !searcher_stop.load(Ordering::Acquire)
@@ -318,13 +355,14 @@ fn print_iteration(iteration: &Iteration) {
         format!(" pv{pv}")
     };
     println!(
-        "info depth {} score {} nodes {} nps {} time {} hashfull {}{pv_section}",
+        "info depth {} score {} nodes {} nps {} time {} hashfull {} tbhits {}{pv_section}",
         iteration.depth,
         uci_score(iteration.score),
         iteration.nodes,
         per_second(iteration.nodes, iteration.elapsed) as u64,
         iteration.elapsed.as_millis(),
         iteration.hashfull,
+        iteration.tablebase_hits,
     );
 }
 
@@ -462,6 +500,7 @@ enum EngineOption {
     LimitStrength(bool),
     Elo(u32),
     EvalFile(Option<PathBuf>),
+    SyzygyPath(Option<String>),
 }
 
 fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
@@ -493,6 +532,9 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
         }
         "evalfile" => Some(EngineOption::EvalFile(
             (!value.eq_ignore_ascii_case(EMBEDDED_NETWORK_NAME)).then(|| PathBuf::from(value)),
+        )),
+        "syzygypath" => Some(EngineOption::SyzygyPath(
+            (!value.eq_ignore_ascii_case(NO_TABLEBASES_NAME)).then(|| value.to_owned()),
         )),
         _ => None,
     }
@@ -735,6 +777,25 @@ mod tests {
                 Some(EngineOption::EvalFile(None)),
             ),
             ("name EvalFile value", None),
+            (
+                "name SyzygyPath value /tables/a:/tables/b",
+                Some(EngineOption::SyzygyPath(Some(
+                    "/tables/a:/tables/b".to_owned(),
+                ))),
+            ),
+            (
+                "name syzygypath value my tables",
+                Some(EngineOption::SyzygyPath(Some("my tables".to_owned()))),
+            ),
+            (
+                "name SyzygyPath value <empty>",
+                Some(EngineOption::SyzygyPath(None)),
+            ),
+            (
+                "name SyzygyPath value <EMPTY>",
+                Some(EngineOption::SyzygyPath(None)),
+            ),
+            ("name SyzygyPath value", None),
         ];
 
         for (command, expected) in cases {
@@ -850,6 +911,28 @@ mod tests {
             flow = engine.execute(&tokens(command));
         }
         flow
+    }
+
+    #[test]
+    fn loads_and_unloads_tablebases() {
+        let tables = concat!(env!("CARGO_MANIFEST_DIR"), "/bin/syzygy");
+        let tables_present = std::path::Path::new(tables).is_dir();
+        let load = format!("setoption name SyzygyPath value {tables}");
+        let unload = "setoption name SyzygyPath value <empty>";
+        let missing = "setoption name SyzygyPath value /nonexistent/arabica/syzygy";
+        let cases: [(&[&str], bool); 5] = [
+            (&[], false),
+            (&[&load], tables_present),
+            (&[&load, unload], false),
+            (&[missing], false),
+            (&[&load, missing], false),
+        ];
+
+        for (commands, loaded) in cases {
+            let mut engine = Engine::new();
+            execute_all(&mut engine, commands);
+            assert_eq!(engine.tablebases.is_some(), loaded, "commands {commands:?}");
+        }
     }
 
     #[test]

@@ -45,6 +45,7 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 | `UCI_LimitStrength` | check | false | | Plays at the strength set by `UCI_Elo` |
 | `UCI_Elo` | spin | 1500 | 600-3000 | Target strength when `UCI_LimitStrength` is on |
 | `EvalFile` | string | `<embedded>` | | Loads a `.nnue` network from the given path and clears the transposition table; `<embedded>` restores the built-in network, a file that fails to load keeps the current one |
+| `SyzygyPath` | string | `<empty>` | | Directories with Syzygy tablebase files, separated by `:` (`;` on Windows); `<empty>` turns tablebases off |
 
 Board representation and move generation are summarized in [docs/board.md](docs/board.md).
 

@@ -10,6 +10,7 @@ pub mod progress;
 pub mod random;
 mod search;
 mod strength;
+mod syzygy;
 mod tt;
 pub mod types;
 pub mod uci;

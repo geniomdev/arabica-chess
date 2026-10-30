@@ -30,3 +30,4 @@
 - SEE pruning
 - Quiescence futility pruning
 - Time management (soft and hard limits scaled by best move stability, score drop and best move node share)
+- Syzygy tablebases (WDL and DTZ)
