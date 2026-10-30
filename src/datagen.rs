@@ -14,6 +14,7 @@ use crate::progress::{Ticker, bar, eta, format_duration, per_second, percent, ra
 use crate::random::Random;
 use crate::search::{SearchLimits, Searcher, SharedSearch};
 use crate::strength::fresh_noise_seed;
+use crate::syzygy::{Tablebases, Wdl};
 use crate::tt::DEFAULT_HASH_MB;
 use crate::types::Color;
 
@@ -28,6 +29,7 @@ const DRAW_ADJUDICATION_MOVE: u16 = 32;
 const DRAW_ADJUDICATION_SCORE: i32 = 20;
 const DRAW_ADJUDICATION_PLIES: usize = 12;
 const FIFTY_MOVE_PLIES: u8 = 100;
+const TABLEBASE_CONTINUATION_PLIES: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const THREAD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -51,6 +53,7 @@ enum Ending {
     Rules,
     AdjudicatedWin,
     AdjudicatedDraw,
+    Tablebase,
 }
 
 #[derive(Default)]
@@ -84,6 +87,18 @@ impl Adjudication {
     }
 }
 
+fn tablebase_outcome(tablebases: &Tablebases, board: &mut Board) -> Option<Outcome> {
+    if board.state.halfmove_clock != 0 {
+        return None;
+    }
+    let side = board.state.active_color;
+    Some(match tablebases.probe_wdl(board)? {
+        Wdl::Win => Outcome::Win.for_side(side),
+        Wdl::Loss => Outcome::Loss.for_side(side),
+        Wdl::CursedWin | Wdl::Draw | Wdl::BlessedLoss => Outcome::Draw,
+    })
+}
+
 struct PlayedGame {
     game: games::Game,
     positions: u64,
@@ -108,33 +123,62 @@ fn random_opening(random: &mut Random) -> Option<Board> {
     Some(flipped.parse().expect("flipped opening is valid"))
 }
 
-fn play_game(random: &mut Random, shared: &Arc<SharedSearch>, nodes: u64) -> Option<PlayedGame> {
+struct GameSetup<'a> {
+    shared: &'a Arc<SharedSearch>,
+    nodes: u64,
+    tablebases: Option<&'a Arc<Tablebases>>,
+}
+
+fn play_game(random: &mut Random, setup: &GameSetup) -> Option<PlayedGame> {
+    play_from(random_opening(random)?, setup, true)
+}
+
+fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Option<PlayedGame> {
+    let nodes = setup.nodes;
     let limits = SearchLimits {
         nodes: Some(nodes.saturating_mul(HARD_NODE_FACTOR)),
         soft_nodes: Some(nodes),
         ..SearchLimits::default()
     };
-    let mut searcher = Searcher::new(limits, Arc::default(), Arc::clone(shared));
-    let mut board = random_opening(random)?;
+    let mut searcher = Searcher::new(limits, Arc::default(), Arc::clone(setup.shared));
+    if let Some(tablebases) = setup.tablebases {
+        searcher = searcher.with_root_tablebases(Arc::clone(tablebases));
+    }
     let start = board.to_fen();
     let mut plies = Vec::new();
     let mut positions = 0;
     let mut searched_plies = 0;
     let mut searched_nodes = 0;
     let mut adjudication = Adjudication::default();
+    let mut settled: Option<(Outcome, usize)> = None;
     let (white_outcome, ending) = loop {
         if let Some(outcome) = rules_outcome(&mut board) {
-            break (outcome, Ending::Rules);
+            break match settled {
+                Some((tablebase_outcome, _)) => (tablebase_outcome, Ending::Tablebase),
+                None => (outcome, Ending::Rules),
+            };
+        }
+        if settled.is_none() {
+            settled = setup
+                .tablebases
+                .and_then(|tablebases| tablebase_outcome(tablebases, &mut board))
+                .map(|outcome| (outcome, TABLEBASE_CONTINUATION_PLIES));
+        }
+        if let Some((outcome, 0)) = settled {
+            break (outcome, Ending::Tablebase);
         }
         let (best_move, score) = searcher.search(&mut board, |_| {});
         searched_nodes += searcher.nodes();
-        if searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
+        if balanced_start && searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
             return None;
         }
         let index = searched_plies;
         searched_plies += 1;
         let side = board.state.active_color;
-        if let Some(adjudicated) = adjudication.observe(board.state.fullmove_number, side, score) {
+        if settled.is_none()
+            && let Some(adjudicated) =
+                adjudication.observe(board.state.fullmove_number, side, score)
+        {
             break adjudicated;
         }
         let ply = Ply {
@@ -146,6 +190,9 @@ fn play_game(random: &mut Random, shared: &Arc<SharedSearch>, nodes: u64) -> Opt
         }
         plies.push(ply);
         board.make_move(best_move);
+        if let Some((_, remaining)) = &mut settled {
+            *remaining -= 1;
+        }
     };
     Some(PlayedGame {
         game: games::Game {
@@ -171,6 +218,7 @@ struct Totals {
     searched_nodes: u64,
     adjudicated_wins: u64,
     adjudicated_draws: u64,
+    tablebase_endings: u64,
     discarded_openings: u64,
 }
 
@@ -184,6 +232,7 @@ impl Totals {
             Ending::Rules => {}
             Ending::AdjudicatedWin => self.adjudicated_wins += 1,
             Ending::AdjudicatedDraw => self.adjudicated_draws += 1,
+            Ending::Tablebase => self.tablebase_endings += 1,
         }
         match played.game.white_outcome {
             Outcome::Win => self.white_wins += 1,
@@ -216,11 +265,16 @@ impl Output {
     }
 }
 
-fn generate(output: &Mutex<Output>, seed: u64, nodes: u64) {
+fn generate(output: &Mutex<Output>, seed: u64, nodes: u64, tablebases: Option<&Arc<Tablebases>>) {
     let mut random = Random::new(seed);
     let mut shared = Arc::new(SharedSearch::new(DEFAULT_HASH_MB));
     while !output.lock().expect("output lock").is_done() {
-        let game = play_game(&mut random, &shared, nodes);
+        let setup = GameSetup {
+            shared: &shared,
+            nodes,
+            tablebases,
+        };
+        let game = play_game(&mut random, &setup);
         SharedSearch::exclusive_table(&mut shared).clear();
         let mut output = output.lock().expect("output lock");
         match game {
@@ -279,14 +333,19 @@ fn print_summary(summary: &Summary) {
         totals.black_wins,
         percent(totals.black_wins, totals.games)
     );
-    let by_rules = totals.games - totals.adjudicated_wins - totals.adjudicated_draws;
+    let by_rules = totals.games
+        - totals.adjudicated_wins
+        - totals.adjudicated_draws
+        - totals.tablebase_endings;
     eprintln!(
-        "  endings            rules {by_rules} ({:.1}%), adjudicated win {} ({:.1}%), adjudicated draw {} ({:.1}%)",
+        "  endings            rules {by_rules} ({:.1}%), adjudicated win {} ({:.1}%), adjudicated draw {} ({:.1}%), tablebase {} ({:.1}%)",
         percent(by_rules, totals.games),
         totals.adjudicated_wins,
         percent(totals.adjudicated_wins, totals.games),
         totals.adjudicated_draws,
-        percent(totals.adjudicated_draws, totals.games)
+        percent(totals.adjudicated_draws, totals.games),
+        totals.tablebase_endings,
+        percent(totals.tablebase_endings, totals.games)
     );
     eprintln!(
         "  kept positions     {:.1}% of searched plies",
@@ -342,10 +401,18 @@ fn open_games_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+fn open_tablebases(paths: &str) -> io::Result<Arc<Tablebases>> {
+    let tablebases = Tablebases::open(paths)?;
+    if tablebases.is_empty() {
+        return Err(invalid_data(format!("no Syzygy tables in {paths}")));
+    }
+    Ok(Arc::new(tablebases))
+}
+
 pub fn run(arguments: &[String]) -> io::Result<()> {
     let [positions, rest @ ..] = arguments else {
         return Err(usage_error(
-            "arabica datagen <positions> [threads] [nodes] [output]",
+            "arabica datagen <positions> [threads] [nodes] [output] [syzygy]",
         ));
     };
     let target: u64 = parse_argument(Some(positions), "positions", 0)?;
@@ -354,6 +421,10 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
     let path = rest
         .get(2)
         .map_or_else(|| default_output(nodes), PathBuf::from);
+    let tablebases = rest
+        .get(3)
+        .map(|paths| open_tablebases(paths))
+        .transpose()?;
 
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)?;
@@ -369,14 +440,22 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
         "datagen: {target} positions into {}, {threads} threads, {nodes} nodes per move",
         path.display()
     );
+    if let Some(tablebases) = &tablebases {
+        eprintln!(
+            "datagen: {} tablebases up to {} pieces settle results, {TABLEBASE_CONTINUATION_PLIES} plies are played on after",
+            tablebases.len(),
+            tablebases.max_pieces()
+        );
+    }
 
     let started = Instant::now();
     let base_seed = fresh_noise_seed();
     thread::scope(|scope| {
         for index in 0..threads as u64 {
             let output = &output;
+            let tablebases = tablebases.as_ref();
             let seed = base_seed.wrapping_add(index.wrapping_mul(THREAD_SEED_STRIDE));
-            scope.spawn(move || generate(output, seed, nodes));
+            scope.spawn(move || generate(output, seed, nodes, tablebases));
         }
         let positions = || output.lock().expect("output lock").totals.positions;
         let mut ticker = Ticker::new();
@@ -412,6 +491,7 @@ mod tests {
     use super::*;
     use crate::board::testing::{board, scratch_path};
     use crate::search::MATE_BOUND;
+    use crate::syzygy::testing::local_tablebases;
     use crate::types::Piece;
 
     #[test]
@@ -573,7 +653,12 @@ mod tests {
         for seed in seeds {
             let mut random = Random::new(seed);
             let shared = Arc::new(SharedSearch::new(1));
-            let game = play_game(&mut random, &shared, 200);
+            let setup = GameSetup {
+                shared: &shared,
+                nodes: 200,
+                tablebases: None,
+            };
+            let game = play_game(&mut random, &setup);
             let Some(played_game) = game else { continue };
             played += 1;
             let mut bytes = Vec::new();
@@ -598,6 +683,70 @@ mod tests {
             }
         }
         assert!(played > 0, "every opening was discarded");
+    }
+
+    #[test]
+    fn settles_results_with_tablebases() {
+        let Some(tablebases) = local_tablebases() else {
+            return;
+        };
+        let tablebases = Arc::new(tablebases);
+        let kbn_vs_k = "8/8/4k3/8/8/8/1B6/1K2N3 w - - 0 1";
+        let cases = [
+            (kbn_vs_k, true, Some(Outcome::Win), true),
+            (
+                "8/k7/8/R7/8/8/4K3/8 b - - 0 1",
+                true,
+                Some(Outcome::Win),
+                true,
+            ),
+            (
+                "8/8/8/3k4/2n5/8/7B/4KB2 w - - 0 1",
+                true,
+                Some(Outcome::Draw),
+                true,
+            ),
+            (
+                "2b2N1k/8/8/8/1K6/8/1b6/8 w - - 0 1",
+                true,
+                Some(Outcome::Draw),
+                true,
+            ),
+            (
+                "6k1/7p/8/8/8/2K5/3R3r/1R6 w - - 0 1",
+                true,
+                Some(Outcome::Win),
+                false,
+            ),
+            ("8/8/4k3/8/8/8/1B6/1K2N3 w - - 1 1", true, None, false),
+            (kbn_vs_k, false, None, false),
+        ];
+
+        for (fen, with_tablebases, settled_outcome, settled_at_start) in cases {
+            let shared = Arc::new(SharedSearch::new(1));
+            let setup = GameSetup {
+                shared: &shared,
+                nodes: 200,
+                tablebases: with_tablebases.then_some(&tablebases),
+            };
+            let played = play_from(board(fen), &setup, false).expect("game played");
+            let plies = played.game.plies.len();
+            match settled_outcome {
+                Some(outcome) => {
+                    assert_eq!(played.ending, Ending::Tablebase, "fen {fen:?}");
+                    assert_eq!(played.game.white_outcome, outcome, "fen {fen:?}");
+                }
+                None => assert_ne!(played.ending, Ending::Tablebase, "fen {fen:?}"),
+            }
+            if settled_at_start {
+                assert!(
+                    plies <= TABLEBASE_CONTINUATION_PLIES,
+                    "fen {fen:?}, {plies} plies"
+                );
+            }
+            let records = played.game.records(&Filter::DEFAULT).expect("legal game");
+            assert_eq!(records.len() as u64, played.positions, "fen {fen:?}");
+        }
     }
 
     #[test]
@@ -647,12 +796,13 @@ mod tests {
             (3, Outcome::Draw, Ending::AdjudicatedDraw),
             (5, Outcome::Loss, Ending::AdjudicatedWin),
             (2, Outcome::Win, Ending::AdjudicatedWin),
+            (3, Outcome::Draw, Ending::Tablebase),
         ];
-        let cases: [(&str, u64, bool, [u64; 9]); 4] = [
-            ("all", 100, false, [4, 14, 2, 1, 1, 2, 1, 18, 1_400]),
-            ("cut", 7, false, [2, 7, 1, 1, 0, 0, 1, 9, 700]),
-            ("zero", 0, false, [0; 9]),
-            ("failed", 100, true, [0; 9]),
+        let cases: [(&str, u64, bool, [u64; 10]); 4] = [
+            ("all", 100, false, [5, 17, 2, 2, 1, 2, 1, 1, 22, 1_700]),
+            ("cut", 7, false, [2, 7, 1, 1, 0, 0, 1, 0, 9, 700]),
+            ("zero", 0, false, [0; 10]),
+            ("failed", 100, true, [0; 10]),
         ];
 
         for (name, target, failed, expected) in cases {
@@ -676,6 +826,7 @@ mod tests {
                 totals.black_wins,
                 totals.adjudicated_wins,
                 totals.adjudicated_draws,
+                totals.tablebase_endings,
                 totals.searched_plies,
                 totals.searched_nodes,
             ];

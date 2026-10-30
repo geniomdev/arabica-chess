@@ -168,6 +168,7 @@ pub struct Searcher {
     tablebases: Option<Arc<Tablebases>>,
     tablebase_root_moves: Vec<Move>,
     tablebase_probing: bool,
+    tablebases_in_search: bool,
 }
 
 fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_share: f64) -> f64 {
@@ -250,11 +251,18 @@ impl Searcher {
             tablebases: None,
             tablebase_root_moves: Vec::new(),
             tablebase_probing: false,
+            tablebases_in_search: true,
         }
     }
 
     pub fn with_tablebases(mut self, tablebases: Arc<Tablebases>) -> Self {
         self.tablebases = Some(tablebases);
+        self
+    }
+
+    pub fn with_root_tablebases(mut self, tablebases: Arc<Tablebases>) -> Self {
+        self.tablebases = Some(tablebases);
+        self.tablebases_in_search = false;
         self
     }
 
@@ -301,7 +309,8 @@ impl Searcher {
             .tablebases
             .as_ref()
             .and_then(|tablebases| tablebases.root_moves(board));
-        self.tablebase_probing = self.tablebases.is_some() && root.is_none();
+        self.tablebase_probing =
+            self.tablebases.is_some() && root.is_none() && self.tablebases_in_search;
         self.tablebase_root_moves = root.map(|root| root.moves).unwrap_or_default();
         if !self.tablebase_root_moves.is_empty() {
             self.shared
