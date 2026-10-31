@@ -30,8 +30,10 @@ jobs:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, cpu: x86-64-v2, suffix: linux-x86-64-v2 }
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, cpu: x86-64-v3, suffix: linux-x86-64-v3 }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, cpu: x86-64-v4, suffix: linux-x86-64-v4 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   cpu: x86-64-v2, suffix: windows-x86-64-v2, ext: .exe }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   cpu: x86-64-v3, suffix: windows-x86-64-v3, ext: .exe }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   cpu: x86-64-v4, suffix: windows-x86-64-v4, ext: .exe }
           - { os: macos-latest,   target: aarch64-apple-darwin,     cpu: apple-m1,  suffix: macos-arm64 }
     runs-on: ${{ matrix.os }}
     env:

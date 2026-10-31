@@ -2,9 +2,11 @@ use super::{HIDDEN, QA};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m256i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_max_epi16,
+    __m256i, __m512i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_max_epi16,
     _mm256_min_epi16, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_setzero_si256,
-    _mm256_storeu_si256,
+    _mm256_storeu_si256, _mm512_add_epi32, _mm512_loadu_si512, _mm512_madd_epi16, _mm512_max_epi16,
+    _mm512_min_epi16, _mm512_mullo_epi16, _mm512_set1_epi16, _mm512_setzero_si512,
+    _mm512_storeu_si512,
 };
 
 pub const MADD_WEIGHT_LIMIT: i16 = 128;
@@ -14,22 +16,50 @@ const AVX2_LANES: usize = 16;
 #[cfg(target_arch = "x86_64")]
 const AVX2_SUMS: usize = 8;
 #[cfg(target_arch = "x86_64")]
+const AVX512_LANES: usize = 32;
+#[cfg(target_arch = "x86_64")]
+const AVX512_SUMS: usize = 16;
+#[cfg(target_arch = "x86_64")]
 const _: () = assert!(
     (HIDDEN / AVX2_LANES) as i64 * 2 * (QA * QA) as i64 * MADD_WEIGHT_LIMIT as i64
         <= i32::MAX as i64
 );
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    (HIDDEN / AVX512_LANES) as i64 * 2 * (QA * QA) as i64 * MADD_WEIGHT_LIMIT as i64
+        <= i32::MAX as i64
+);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(HIDDEN.is_multiple_of(AVX512_LANES));
 
-pub static AVX2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(has_avx2);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputKernel {
+    Portable,
+    Avx2,
+    Avx512,
+}
 
-pub fn has_avx2() -> bool {
+pub static FASTEST_KERNEL: std::sync::LazyLock<OutputKernel> = std::sync::LazyLock::new(|| {
+    supported_kernels()
+        .last()
+        .copied()
+        .unwrap_or(OutputKernel::Portable)
+});
+
+pub fn supported_kernels() -> Vec<OutputKernel> {
+    let mut kernels = vec![OutputKernel::Portable];
     #[cfg(target_arch = "x86_64")]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        if std::arch::is_x86_feature_detected!("avx2") {
+            kernels.push(OutputKernel::Avx2);
+        }
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            kernels.push(OutputKernel::Avx512);
+        }
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+    kernels
 }
 
 fn screlu_dot_portable(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
@@ -66,13 +96,37 @@ fn screlu_dot_avx2(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
     lanes.iter().map(|&lane| i64::from(lane)).sum()
 }
 
-pub fn screlu_dot(madd: bool, accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
-    #[cfg(target_arch = "x86_64")]
-    if madd {
-        return unsafe { screlu_dot_avx2(accumulator, weights) };
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+fn screlu_dot_avx512(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
+    assert_eq!(weights.len(), HIDDEN);
+    let zero = _mm512_setzero_si512();
+    let ceiling = _mm512_set1_epi16(QA as i16);
+    let mut sum = _mm512_setzero_si512();
+    for offset in (0..HIDDEN).step_by(AVX512_LANES) {
+        let (values, row) = unsafe {
+            (
+                _mm512_loadu_si512(accumulator.as_ptr().add(offset).cast::<__m512i>()),
+                _mm512_loadu_si512(weights.as_ptr().add(offset).cast::<__m512i>()),
+            )
+        };
+        let clipped = _mm512_min_epi16(_mm512_max_epi16(values, zero), ceiling);
+        let weighted = _mm512_mullo_epi16(clipped, row);
+        sum = _mm512_add_epi32(sum, _mm512_madd_epi16(weighted, clipped));
     }
-    let _ = madd;
-    screlu_dot_portable(accumulator, weights)
+    let mut lanes = [0i32; AVX512_SUMS];
+    unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast::<__m512i>(), sum) };
+    lanes.iter().map(|&lane| i64::from(lane)).sum()
+}
+
+pub fn screlu_dot(kernel: OutputKernel, accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        OutputKernel::Avx512 => unsafe { screlu_dot_avx512(accumulator, weights) },
+        #[cfg(target_arch = "x86_64")]
+        OutputKernel::Avx2 => unsafe { screlu_dot_avx2(accumulator, weights) },
+        _ => screlu_dot_portable(accumulator, weights),
+    }
 }
 
 pub fn fits_madd(weights: &[i16]) -> bool {
@@ -92,10 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn avx2_dot_products_match_portable_ones() {
-        if !has_avx2() {
-            return;
-        }
+    fn vector_dot_products_match_portable_ones() {
         let cases = [
             (1, -600, 600, -128, 128),
             (2, 0, 255, -128, 128),
@@ -105,15 +156,17 @@ mod tests {
             (6, 255, 255, 128, 128),
         ];
 
-        for (seed, low, high, weight_low, weight_high) in cases {
-            let mut random = Random::new(seed);
-            let accumulator = random_row(&mut random, low, high);
-            let weights = random_row(&mut random, weight_low, weight_high);
-            assert_eq!(
-                screlu_dot(true, &accumulator, &weights),
-                screlu_dot(false, &accumulator, &weights),
-                "seed {seed}"
-            );
+        for kernel in supported_kernels() {
+            for (seed, low, high, weight_low, weight_high) in cases {
+                let mut random = Random::new(seed);
+                let accumulator = random_row(&mut random, low, high);
+                let weights = random_row(&mut random, weight_low, weight_high);
+                assert_eq!(
+                    screlu_dot(kernel, &accumulator, &weights),
+                    screlu_dot(OutputKernel::Portable, &accumulator, &weights),
+                    "kernel {kernel:?}, seed {seed}"
+                );
+            }
         }
     }
 
@@ -123,13 +176,25 @@ mod tests {
         let weights = [MADD_WEIGHT_LIMIT; HIDDEN];
         let expected = i64::from(QA * QA) * i64::from(MADD_WEIGHT_LIMIT) * HIDDEN as i64;
         assert!(expected > i64::from(i32::MAX));
-        for madd in [false, has_avx2()] {
+        for kernel in supported_kernels() {
             assert_eq!(
-                screlu_dot(madd, &accumulator, &weights),
+                screlu_dot(kernel, &accumulator, &weights),
                 expected,
-                "madd {madd}"
+                "kernel {kernel:?}"
             );
         }
+    }
+
+    #[test]
+    fn fastest_kernel_is_supported() {
+        let supported = supported_kernels();
+        assert_eq!(supported.first(), Some(&OutputKernel::Portable));
+        assert!(
+            supported.contains(&*FASTEST_KERNEL),
+            "{:?}",
+            *FASTEST_KERNEL
+        );
+        assert_eq!(supported.last(), Some(&*FASTEST_KERNEL));
     }
 
     #[test]

@@ -47,6 +47,15 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 | `EvalFile` | string | `<embedded>` | | Loads a `.nnue` network from the given path and clears the transposition table; `<embedded>` restores the built-in network, a file that fails to load keeps the current one |
 | `SyzygyPath` | string | `<empty>` | | Directories with Syzygy tablebase files, separated by `:` (`;` on Windows); `<empty>` turns tablebases off |
 
+## Release builds
+
+| Build | CPUs |
+|---|---|
+| `x86-64-v2` | Any x86-64 CPU with SSE4.2 and POPCNT (about 2009 and later); the output layer still switches to AVX2 or AVX-512 at run time when the CPU has them |
+| `x86-64-v3` | AVX2, BMI2 and FMA (Intel Haswell, AMD Zen and later); the build for most machines |
+| `x86-64-v4` | AVX-512 (AMD Zen 4, Intel Skylake-X, Ice Lake, Sapphire Rapids and later); stops with an illegal instruction error on other CPUs |
+| `macos-arm64` | Apple silicon |
+
 Board representation and move generation are summarized in [docs/board.md](docs/board.md).
 
 Search techniques are listed in [docs/search.md](docs/search.md).

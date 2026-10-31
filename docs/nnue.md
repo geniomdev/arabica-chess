@@ -1,6 +1,6 @@
 # NNUE
 
-Evaluation uses a SCReLU NNUE with a lazily updated accumulator stack and an AVX2 output layer, trained on self-play data with its own CPU trainer.
+Evaluation uses a SCReLU NNUE with a lazily updated accumulator stack and an AVX2 or AVX-512 output layer, trained on self-play data with its own CPU trainer.
 
 ## Current network
 
@@ -16,7 +16,7 @@ Evaluation uses a SCReLU NNUE with a lazily updated accumulator stack and an AVX
 | Parameters | 803 848 (`i16`, little-endian), 1 607 696 bytes |
 | Quantization | QA = 255 (feature weights and biases), QB = 64 (output weights), output biases scaled by QA * QB |
 | Evaluation scale | 400 (centipawns = output * 400 / (QA * QB)) |
-| Inference | AVX2 `madd` output layer when available and the output weights of all buckets fit, portable fallback otherwise; per-lane sums stay in `i32` (checked at compile time for the 1024-wide layer) and the total is widened to `i64` |
+| Inference | Output layer kernel picked at startup from the CPU: AVX-512 (`avx512f` + `avx512bw`, 32 lanes) or AVX2 (16 lanes) `madd` when the output weights of all buckets fit, portable fallback otherwise; per-lane sums stay in `i32` (checked at compile time for both widths of the 1024-wide layer) and the total is widened to `i64`. The kernel is chosen at run time, so every release build uses the widest one the CPU has; the build target (`x86-64-v2` / `v3` / `v4`) only changes what the compiler may use for the rest of the code, such as accumulator updates |
 | Memory layout | Network rows and accumulators aligned to 64 bytes, so every 2 KB row starts on a cache line |
 
 ## Network history
