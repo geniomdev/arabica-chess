@@ -16,7 +16,7 @@ use crate::search::{SearchLimits, Searcher, SharedSearch};
 use crate::strength::fresh_noise_seed;
 use crate::syzygy::{Tablebases, Wdl};
 use crate::tt::DEFAULT_HASH_MB;
-use crate::types::Color;
+use crate::types::{CastlingRights, Color, FILES, Piece, RANKS, Square};
 
 const DEFAULT_NODES: u64 = 2_000;
 const HARD_NODE_FACTOR: u64 = 10;
@@ -30,6 +30,14 @@ const DRAW_ADJUDICATION_SCORE: i32 = 20;
 const DRAW_ADJUDICATION_PLIES: usize = 12;
 const FIFTY_MOVE_PLIES: u8 = 100;
 const TABLEBASE_CONTINUATION_PLIES: usize = 16;
+const WIN_ADJUDICATION_CONTINUATION_PLIES: usize = 6;
+const MATERIAL_ODDS_PERCENT: usize = 5;
+const ODDS_CLASSES: [&[Piece]; 4] = [
+    &[Piece::Queen],
+    &[Piece::Rook],
+    &[Piece::Knight, Piece::Bishop],
+    &[Piece::Pawn],
+];
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const THREAD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -107,7 +115,12 @@ struct PlayedGame {
     ending: Ending,
 }
 
-fn random_opening(random: &mut Random) -> Option<Board> {
+struct Opening {
+    board: Board,
+    material_odds: bool,
+}
+
+fn random_opening(random: &mut Random) -> Option<Opening> {
     let mut board: Board = START_POSITION.parse().expect("start position is valid");
     for _ in 0..RANDOM_PLIES {
         let moves = board.legal_moves();
@@ -116,11 +129,99 @@ fn random_opening(random: &mut Random) -> Option<Board> {
         }
         board.make_move(moves[random.below(moves.len())]);
     }
-    if random.below(2) == 0 {
-        return Some(board);
+    let mut material_odds = false;
+    if random.below(100) < MATERIAL_ODDS_PERCENT
+        && let Some(odds) = with_material_odds(&board, random)
+    {
+        board = odds;
+        material_odds = true;
     }
-    let flipped = color_flipped_fen(&board.to_fen());
-    Some(flipped.parse().expect("flipped opening is valid"))
+    if random.below(2) == 1 {
+        let flipped = color_flipped_fen(&board.to_fen());
+        board = flipped.parse().expect("flipped opening is valid");
+    }
+    Some(Opening {
+        board,
+        material_odds,
+    })
+}
+
+fn with_material_odds(board: &Board, random: &mut Random) -> Option<Board> {
+    let side = Color::ALL[random.below(Color::ALL.len())];
+    let class = ODDS_CLASSES[random.below(ODDS_CLASSES.len())];
+    let candidates: Vec<Square> = class
+        .iter()
+        .flat_map(|&piece| board.pieces_of(side, piece))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut removed = vec![candidates[random.below(candidates.len())]];
+    let second_pawn = class == ODDS_CLASSES[3] && candidates.len() > 1 && random.below(2) == 0;
+    if second_pawn {
+        let others: Vec<Square> = candidates
+            .iter()
+            .copied()
+            .filter(|square| !removed.contains(square))
+            .collect();
+        removed.push(others[random.below(others.len())]);
+    }
+    let odds: Board = fen_without(board, &removed).parse().ok()?;
+    let us = odds.state.active_color;
+    let exposed = odds.is_attacked(odds.king_square(us.opponent()), us, odds.occupancy());
+    (!exposed).then_some(odds)
+}
+
+fn fen_without(board: &Board, removed: &[Square]) -> String {
+    let piece_at = |square: Square| {
+        board
+            .colored_piece_on(square)
+            .filter(|_| !removed.contains(&square))
+    };
+    let ranks: Vec<String> = (0..RANKS)
+        .rev()
+        .map(|rank| {
+            let mut text = String::new();
+            let mut empty = 0;
+            for file in 0..FILES {
+                match piece_at(Square::new(file, rank)) {
+                    Some((side, piece)) => {
+                        if empty > 0 {
+                            text.push_str(&empty.to_string());
+                            empty = 0;
+                        }
+                        text.push(piece.symbol(side));
+                    }
+                    None => empty += 1,
+                }
+            }
+            if empty > 0 {
+                text.push_str(&empty.to_string());
+            }
+            text
+        })
+        .collect();
+    let mut castling = CastlingRights::NONE;
+    let castling_rooks = [
+        (CastlingRights::WHITE_KING, Color::White, Square::H1),
+        (CastlingRights::WHITE_QUEEN, Color::White, Square::A1),
+        (CastlingRights::BLACK_KING, Color::Black, Square::H8),
+        (CastlingRights::BLACK_QUEEN, Color::Black, Square::A8),
+    ];
+    for (right, side, rook_square) in castling_rooks {
+        if board.state.castling.has(right) && piece_at(rook_square) == Some((side, Piece::Rook)) {
+            castling.insert(right);
+        }
+    }
+    let side_to_move = match board.state.active_color {
+        Color::White => 'w',
+        Color::Black => 'b',
+    };
+    format!(
+        "{} {side_to_move} {castling} - 0 {}",
+        ranks.join("/"),
+        board.state.fullmove_number
+    )
 }
 
 struct GameSetup<'a> {
@@ -130,7 +231,8 @@ struct GameSetup<'a> {
 }
 
 fn play_game(random: &mut Random, setup: &GameSetup) -> Option<PlayedGame> {
-    play_from(random_opening(random)?, setup, true)
+    let opening = random_opening(random)?;
+    play_from(opening.board, setup, !opening.material_odds)
 }
 
 fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Option<PlayedGame> {
@@ -151,6 +253,7 @@ fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Optio
     let mut searched_nodes = 0;
     let mut adjudication = Adjudication::default();
     let mut settled: Option<(Outcome, usize)> = None;
+    let mut decided: Option<(Outcome, usize)> = None;
     let (white_outcome, ending) = loop {
         if let Some(outcome) = rules_outcome(&mut board) {
             break match settled {
@@ -167,6 +270,11 @@ fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Optio
         if let Some((outcome, 0)) = settled {
             break (outcome, Ending::Tablebase);
         }
+        if settled.is_none()
+            && let Some((outcome, 0)) = decided
+        {
+            break (outcome, Ending::AdjudicatedWin);
+        }
         let (best_move, score) = searcher.search(&mut board, |_| {});
         searched_nodes += searcher.nodes();
         if balanced_start && searched_plies == 0 && score.abs() > OPENING_SCORE_LIMIT {
@@ -176,10 +284,14 @@ fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Optio
         searched_plies += 1;
         let side = board.state.active_color;
         if settled.is_none()
-            && let Some(adjudicated) =
+            && decided.is_none()
+            && let Some((outcome, ending)) =
                 adjudication.observe(board.state.fullmove_number, side, score)
         {
-            break adjudicated;
+            if ending != Ending::AdjudicatedWin {
+                break (outcome, ending);
+            }
+            decided = Some((outcome, WIN_ADJUDICATION_CONTINUATION_PLIES));
         }
         let ply = Ply {
             best_move,
@@ -190,8 +302,8 @@ fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Optio
         }
         plies.push(ply);
         board.make_move(best_move);
-        if let Some((_, remaining)) = &mut settled {
-            *remaining -= 1;
+        for (_, remaining) in [&mut settled, &mut decided].into_iter().flatten() {
+            *remaining = remaining.saturating_sub(1);
         }
     };
     Some(PlayedGame {
@@ -489,6 +601,7 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::KIWIPETE;
     use crate::board::testing::{board, scratch_path};
     use crate::search::MATE_BOUND;
     use crate::syzygy::testing::local_tablebases;
@@ -633,16 +746,137 @@ mod tests {
                 continue;
             };
             assert_eq!(
-                usize::from(opening.state.fullmove_number),
+                usize::from(opening.board.state.fullmove_number),
                 RANDOM_PLIES / 2 + 1,
                 "seed {seed}"
             );
-            to_move[opening.state.active_color.index()] += 1;
+            to_move[opening.board.state.active_color.index()] += 1;
         }
         assert!(
             to_move.iter().all(|&count| count > 0),
             "side to move {to_move:?}"
         );
+    }
+
+    fn castling_matches_rooks(position: &Board) -> bool {
+        let rights = [
+            (CastlingRights::WHITE_KING, Color::White, Square::H1),
+            (CastlingRights::WHITE_QUEEN, Color::White, Square::A1),
+            (CastlingRights::BLACK_KING, Color::Black, Square::H8),
+            (CastlingRights::BLACK_QUEEN, Color::Black, Square::A8),
+        ];
+        rights.iter().all(|&(right, side, square)| {
+            !position.state.castling.has(right)
+                || position.pieces_of(side, Piece::Rook).contains(square)
+        })
+    }
+
+    #[test]
+    fn removes_material_without_breaking_positions() {
+        let cases = [
+            START_POSITION,
+            KIWIPETE,
+            "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1",
+            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+        ];
+        let seeds = 1..=200;
+
+        for fen in cases {
+            let position = board(fen);
+            let mut removals = 0;
+            for seed in seeds.clone() {
+                let mut random = Random::new(seed);
+                let Some(odds) = with_material_odds(&position, &mut random) else {
+                    continue;
+                };
+                removals += 1;
+                let removed = position.occupancy().count() - odds.occupancy().count();
+                assert!((1..=2).contains(&removed), "fen {fen:?}, seed {seed}");
+                assert_eq!(
+                    odds.pieces(Piece::King).count(),
+                    2,
+                    "fen {fen:?}, seed {seed}"
+                );
+                let sides_losing_material = Color::ALL
+                    .iter()
+                    .filter(|&&side| odds.occupied_by(side) != position.occupied_by(side))
+                    .count();
+                assert_eq!(sides_losing_material, 1, "fen {fen:?}, seed {seed}");
+                assert!(castling_matches_rooks(&odds), "fen {fen:?}, seed {seed}");
+                let us = odds.state.active_color;
+                assert!(
+                    !odds.is_attacked(odds.king_square(us.opponent()), us, odds.occupancy()),
+                    "fen {fen:?}, seed {seed}"
+                );
+                assert_eq!(board(&odds.to_fen()), odds, "fen {fen:?}, seed {seed}");
+                assert!(
+                    !odds.clone().legal_moves().is_empty(),
+                    "fen {fen:?}, seed {seed}"
+                );
+            }
+            let bare_kings = position.occupancy().count() == 2;
+            assert_eq!(
+                removals == 0,
+                bare_kings,
+                "fen {fen:?}, {removals} removals"
+            );
+        }
+    }
+
+    #[test]
+    fn gives_material_odds_in_a_share_of_openings() {
+        let seeds = 1..=2_000;
+
+        let mut with_odds = 0;
+        let mut openings = 0;
+        for seed in seeds {
+            let mut random = Random::new(seed);
+            let Some(opening) = random_opening(&mut random) else {
+                continue;
+            };
+            openings += 1;
+            assert!(castling_matches_rooks(&opening.board), "seed {seed}");
+            if opening.material_odds {
+                with_odds += 1;
+            }
+        }
+        let share = 100.0 * f64::from(with_odds) / f64::from(openings);
+        let expected = MATERIAL_ODDS_PERCENT as f64;
+        assert!(
+            (expected * 0.5..=expected * 1.5).contains(&share),
+            "{with_odds} of {openings} openings with odds"
+        );
+    }
+
+    #[test]
+    fn plays_on_after_adjudicating_a_win() {
+        let cases = [
+            (
+                "1nb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w Kk - 0 1",
+                Outcome::Win,
+            ),
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/1NB1KBNR w Kk - 0 1",
+                Outcome::Loss,
+            ),
+        ];
+
+        for (fen, outcome) in cases {
+            let shared = Arc::new(SharedSearch::new(1));
+            let setup = GameSetup {
+                shared: &shared,
+                nodes: 200,
+                tablebases: None,
+            };
+            let played = play_from(board(fen), &setup, false).expect("game played");
+            assert_eq!(played.ending, Ending::AdjudicatedWin, "fen {fen:?}");
+            assert_eq!(played.game.white_outcome, outcome, "fen {fen:?}");
+            let minimum = WIN_ADJUDICATION_PLIES - 1 + WIN_ADJUDICATION_CONTINUATION_PLIES;
+            let plies = played.game.plies.len();
+            assert!(plies >= minimum, "fen {fen:?}, {plies} plies");
+            let records = played.game.records(&Filter::DEFAULT).expect("legal game");
+            assert_eq!(records.len() as u64, played.positions, "fen {fen:?}");
+        }
     }
 
     #[test]
