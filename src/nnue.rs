@@ -629,14 +629,13 @@ mod tests {
             ),
             (
                 "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
-                -2500..=-400,
+                -2500..=-800,
             ),
             (START_POSITION, -60..=60),
             ("8/8/8/8/8/8/8/k6K w - - 0 1", 0..=0),
             ("8/8/8/8/8/8/8/k5NK b - - 0 1", 0..=0),
             ("8/8/3b4/8/8/8/8/k6K w - - 0 1", 0..=0),
         ];
-        // TODO: investigate why net3 scores the queen-down position at -513 with Black to move but +1710 with White to move
 
         for (fen, expected) in cases {
             let score = evaluate(&mut board(fen));
