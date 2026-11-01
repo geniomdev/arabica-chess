@@ -9,6 +9,12 @@ use std::arch::x86_64::{
     _mm512_storeu_si512,
 };
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::{
+    vaddlvq_s32, vdupq_n_s16, vdupq_n_s32, vget_low_s16, vld1q_s16, vmaxq_s16, vminq_s16,
+    vmlal_high_s16, vmlal_s16, vmulq_s16,
+};
+
 pub const MADD_WEIGHT_LIMIT: i16 = 128;
 
 #[cfg(target_arch = "x86_64")]
@@ -32,11 +38,26 @@ const _: () = assert!(
 #[cfg(target_arch = "x86_64")]
 const _: () = assert!(HIDDEN.is_multiple_of(AVX512_LANES));
 
+#[cfg(target_arch = "aarch64")]
+const NEON_LANES: usize = 8;
+#[cfg(target_arch = "aarch64")]
+const NEON_STEP: usize = 2 * NEON_LANES;
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    (HIDDEN / NEON_STEP) as i64 * (QA * QA) as i64 * MADD_WEIGHT_LIMIT as i64 <= i32::MAX as i64
+);
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(HIDDEN.is_multiple_of(NEON_STEP));
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputKernel {
     Portable,
+    #[cfg(target_arch = "x86_64")]
     Avx2,
+    #[cfg(target_arch = "x86_64")]
     Avx512,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
 }
 
 pub static FASTEST_KERNEL: std::sync::LazyLock<OutputKernel> = std::sync::LazyLock::new(|| {
@@ -59,6 +80,8 @@ pub fn supported_kernels() -> Vec<OutputKernel> {
             kernels.push(OutputKernel::Avx512);
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    kernels.push(OutputKernel::Neon);
     kernels
 }
 
@@ -119,12 +142,56 @@ fn screlu_dot_avx512(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
     lanes.iter().map(|&lane| i64::from(lane)).sum()
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+fn screlu_dot_neon(accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
+    assert_eq!(weights.len(), HIDDEN);
+    let zero = vdupq_n_s16(0);
+    let ceiling = vdupq_n_s16(QA as i16);
+    let mut first_low_sum = vdupq_n_s32(0);
+    let mut first_high_sum = vdupq_n_s32(0);
+    let mut second_low_sum = vdupq_n_s32(0);
+    let mut second_high_sum = vdupq_n_s32(0);
+    for offset in (0..HIDDEN).step_by(NEON_STEP) {
+        let (first_values, first_row, second_values, second_row) = unsafe {
+            (
+                vld1q_s16(accumulator.as_ptr().add(offset)),
+                vld1q_s16(weights.as_ptr().add(offset)),
+                vld1q_s16(accumulator.as_ptr().add(offset + NEON_LANES)),
+                vld1q_s16(weights.as_ptr().add(offset + NEON_LANES)),
+            )
+        };
+        let first_clipped = vminq_s16(vmaxq_s16(first_values, zero), ceiling);
+        let second_clipped = vminq_s16(vmaxq_s16(second_values, zero), ceiling);
+        let first_weighted = vmulq_s16(first_clipped, first_row);
+        let second_weighted = vmulq_s16(second_clipped, second_row);
+        first_low_sum = vmlal_s16(
+            first_low_sum,
+            vget_low_s16(first_weighted),
+            vget_low_s16(first_clipped),
+        );
+        first_high_sum = vmlal_high_s16(first_high_sum, first_weighted, first_clipped);
+        second_low_sum = vmlal_s16(
+            second_low_sum,
+            vget_low_s16(second_weighted),
+            vget_low_s16(second_clipped),
+        );
+        second_high_sum = vmlal_high_s16(second_high_sum, second_weighted, second_clipped);
+    }
+    vaddlvq_s32(first_low_sum)
+        + vaddlvq_s32(first_high_sum)
+        + vaddlvq_s32(second_low_sum)
+        + vaddlvq_s32(second_high_sum)
+}
+
 pub fn screlu_dot(kernel: OutputKernel, accumulator: &[i16; HIDDEN], weights: &[i16]) -> i64 {
     match kernel {
         #[cfg(target_arch = "x86_64")]
         OutputKernel::Avx512 => unsafe { screlu_dot_avx512(accumulator, weights) },
         #[cfg(target_arch = "x86_64")]
         OutputKernel::Avx2 => unsafe { screlu_dot_avx2(accumulator, weights) },
+        #[cfg(target_arch = "aarch64")]
+        OutputKernel::Neon => unsafe { screlu_dot_neon(accumulator, weights) },
         _ => screlu_dot_portable(accumulator, weights),
     }
 }

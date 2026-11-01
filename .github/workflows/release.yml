@@ -46,6 +46,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.suffix }}
+      - name: Test on the build target
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test --release --locked --target ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage binary
         shell: bash
