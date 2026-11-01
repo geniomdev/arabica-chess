@@ -4,6 +4,7 @@ pub mod board;
 pub mod cli;
 pub mod datagen;
 mod history;
+mod minimax;
 mod movepick;
 pub mod nnue;
 pub mod progress;

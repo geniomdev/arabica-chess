@@ -7,18 +7,19 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bench;
 use crate::board::{Board, FenError, MoveList, START_POSITION};
 use crate::history::History;
+use crate::minimax::{MAX_PLIES, Minimax, Mode};
 use crate::nnue::{evaluate, load_network, use_embedded_network};
 use crate::progress::per_second;
 use crate::search::{Iteration, SearchLimits, Searcher, SharedSearch, uci_score};
 use crate::strength::{DEFAULT_ELO, EvalNoise, Handicap, MAX_ELO, MIN_ELO, fresh_noise_seed};
 use crate::syzygy::Tablebases;
 use crate::tt::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB};
-use crate::types::{Color, EverySide};
+use crate::types::{Color, EverySide, Move};
 
 const ENGINE_NAME: &str = "Arabica";
 const ENGINE_AUTHOR: &str = "Geniomdev";
@@ -30,6 +31,8 @@ const DEFAULT_MOVES_TO_GO: u32 = 30;
 const HARD_LIMIT_SHARES: u32 = 3;
 const EMBEDDED_NETWORK_NAME: &str = "<embedded>";
 const NO_TABLEBASES_NAME: &str = "<empty>";
+const SEARCH_MODE_NAME: &str = "Search";
+const NNUE_MODE_PREFIX: &str = "NNUE";
 
 pub fn run() {
     println!("{ENGINE_NAME} {}", env!("CARGO_PKG_VERSION"));
@@ -62,6 +65,7 @@ struct Engine {
     elo: u32,
     noise_seed: u64,
     tablebases: Option<Arc<Tablebases>>,
+    mode: Mode,
     search: Option<RunningSearch>,
 }
 
@@ -79,6 +83,7 @@ impl Engine {
             elo: DEFAULT_ELO,
             noise_seed: fresh_noise_seed(),
             tablebases: None,
+            mode: Mode::Search,
             search: None,
         }
     }
@@ -105,6 +110,12 @@ impl Engine {
                 );
                 println!("option name EvalFile type string default {EMBEDDED_NETWORK_NAME}");
                 println!("option name SyzygyPath type string default {NO_TABLEBASES_NAME}");
+                let plies_variants: String = (1..=MAX_PLIES)
+                    .map(|plies| format!(" var {NNUE_MODE_PREFIX}{plies}"))
+                    .collect();
+                println!(
+                    "option name Mode type combo default {SEARCH_MODE_NAME} var {SEARCH_MODE_NAME}{plies_variants}"
+                );
                 println!("uciok");
             }
             ["isready", ..] => println!("readyok"),
@@ -130,6 +141,7 @@ impl Engine {
                     Some(EngineOption::Elo(elo)) => self.elo = elo,
                     Some(EngineOption::EvalFile(path)) => self.set_network(path),
                     Some(EngineOption::SyzygyPath(paths)) => self.set_tablebases(paths),
+                    Some(EngineOption::Mode(mode)) => self.mode = mode,
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
                 }
             }
@@ -173,6 +185,18 @@ impl Engine {
     fn go(&mut self, params: GoParams) {
         if let Some(depth) = params.perft {
             print_perft_divide(&mut self.board, depth);
+            return;
+        }
+        if let Mode::Plies(plies) = self.mode {
+            self.search = Some(RunningSearch::start_minimax(
+                self.board.clone(),
+                plies,
+                SearchMode {
+                    infinite: params.infinite,
+                    pondering: params.ponder,
+                    announce_ponder_move: false,
+                },
+            ));
             return;
         }
         let mut limits = params.limits(self.board.state.active_color, self.move_overhead);
@@ -310,11 +334,7 @@ impl RunningSearch {
             }
             let (best_move, _) =
                 searcher.search_with_helpers(&mut board, &mut helpers, print_iteration);
-            while !searcher_stop.load(Ordering::Acquire)
-                && (mode.infinite || searcher_ponder.load(Ordering::Acquire))
-            {
-                thread::park();
-            }
+            wait_for_release(&searcher_stop, &searcher_ponder, mode.infinite);
             match searcher.ponder_move().filter(|_| mode.announce_ponder_move) {
                 Some(reply) => println!("bestmove {best_move} ponder {reply}"),
                 None => println!("bestmove {best_move}"),
@@ -323,6 +343,39 @@ impl RunningSearch {
                 .chain(helpers)
                 .map(Searcher::into_history)
                 .collect()
+        });
+        Self {
+            stop_signal,
+            ponder_signal,
+            thread,
+        }
+    }
+
+    fn start_minimax(mut board: Board, plies: u8, mode: SearchMode) -> Self {
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let ponder_signal = Arc::new(AtomicBool::new(mode.pondering));
+        let searcher_stop = Arc::clone(&stop_signal);
+        let searcher_ponder = Arc::clone(&ponder_signal);
+        let thread = thread::spawn(move || {
+            let start = Instant::now();
+            let result = Minimax::new(&searcher_stop).search(&mut board, plies);
+            let pv = [result.best_move];
+            print_iteration(&Iteration {
+                depth: plies,
+                score: result.score,
+                nodes: result.nodes,
+                elapsed: start.elapsed(),
+                pv: if result.best_move == Move::NULL {
+                    &[]
+                } else {
+                    &pv
+                },
+                hashfull: 0,
+                tablebase_hits: 0,
+            });
+            wait_for_release(&searcher_stop, &searcher_ponder, mode.infinite);
+            println!("bestmove {}", result.best_move);
+            Vec::new()
         });
         Self {
             stop_signal,
@@ -340,6 +393,14 @@ impl RunningSearch {
         self.stop_signal.store(true, Ordering::Release);
         self.thread.thread().unpark();
         self.thread.join().expect("search thread finished cleanly")
+    }
+}
+
+fn wait_for_release(stop_signal: &AtomicBool, ponder_signal: &AtomicBool, infinite: bool) {
+    while !stop_signal.load(Ordering::Acquire)
+        && (infinite || ponder_signal.load(Ordering::Acquire))
+    {
+        thread::park();
     }
 }
 
@@ -501,6 +562,7 @@ enum EngineOption {
     Elo(u32),
     EvalFile(Option<PathBuf>),
     SyzygyPath(Option<String>),
+    Mode(Mode),
 }
 
 fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
@@ -536,8 +598,22 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
         "syzygypath" => Some(EngineOption::SyzygyPath(
             (!value.eq_ignore_ascii_case(NO_TABLEBASES_NAME)).then(|| value.to_owned()),
         )),
+        "mode" => parse_mode(value).map(EngineOption::Mode),
         _ => None,
     }
+}
+
+fn parse_mode(value: &str) -> Option<Mode> {
+    let value = value.to_ascii_lowercase();
+    if value == SEARCH_MODE_NAME.to_ascii_lowercase() {
+        return Some(Mode::Search);
+    }
+    value
+        .strip_prefix(&NNUE_MODE_PREFIX.to_ascii_lowercase())?
+        .parse()
+        .ok()
+        .filter(|plies| (1..=MAX_PLIES).contains(plies))
+        .map(Mode::Plies)
 }
 
 fn parse_check(value: &str) -> Option<bool> {
@@ -796,6 +872,26 @@ mod tests {
                 Some(EngineOption::SyzygyPath(None)),
             ),
             ("name SyzygyPath value", None),
+            (
+                "name Mode value Search",
+                Some(EngineOption::Mode(Mode::Search)),
+            ),
+            (
+                "name mode value search",
+                Some(EngineOption::Mode(Mode::Search)),
+            ),
+            (
+                "name Mode value NNUE1",
+                Some(EngineOption::Mode(Mode::Plies(1))),
+            ),
+            (
+                "name Mode value nnue4",
+                Some(EngineOption::Mode(Mode::Plies(4))),
+            ),
+            ("name Mode value NNUE0", None),
+            ("name Mode value NNUE5", None),
+            ("name Mode value NNUE", None),
+            ("name Mode value Minimax", None),
         ];
 
         for (command, expected) in cases {
