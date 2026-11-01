@@ -31,7 +31,7 @@ const DRAW_ADJUDICATION_PLIES: usize = 12;
 const FIFTY_MOVE_PLIES: u8 = 100;
 const TABLEBASE_CONTINUATION_PLIES: usize = 16;
 const WIN_ADJUDICATION_CONTINUATION_PLIES: usize = 6;
-const MATERIAL_ODDS_PERCENT: usize = 5;
+const MATERIAL_ODDS_PERCENT: usize = 15;
 const ODDS_CLASSES: [&[Piece]; 4] = [
     &[Piece::Queen],
     &[Piece::Rook],
@@ -247,6 +247,7 @@ fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Optio
         searcher = searcher.with_root_tablebases(Arc::clone(tablebases));
     }
     let start = board.to_fen();
+    let filter = Filter::DEFAULT.for_start(&board);
     let mut plies = Vec::new();
     let mut positions = 0;
     let mut searched_plies = 0;
@@ -297,7 +298,7 @@ fn play_from(mut board: Board, setup: &GameSetup, balanced_start: bool) -> Optio
             best_move,
             score: score as i16,
         };
-        if Filter::DEFAULT.accepts(index, &board, ply) {
+        if filter.accepts(index, &board, ply) {
             positions += 1;
         }
         plies.push(ply);

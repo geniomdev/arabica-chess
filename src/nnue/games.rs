@@ -6,7 +6,7 @@ use super::data::{Outcome, Record};
 use crate::board::Board;
 use crate::cli::invalid_data;
 use crate::search::MATE_BOUND;
-use crate::types::Move;
+use crate::types::{Color, Move, Piece};
 
 pub const MAGIC: &[u8; 8] = b"ARBGAME1";
 pub const EXTENSION: &str = "games";
@@ -31,12 +31,37 @@ impl Filter {
         max_score: MATE_BOUND - 1,
     };
 
+    pub fn for_start(&self, start: &Board) -> Self {
+        let balanced = material(start, Color::White) == material(start, Color::Black);
+        Self {
+            skipped_plies: if balanced { self.skipped_plies } else { 0 },
+            ..*self
+        }
+    }
+
     pub fn accepts(&self, ply_index: usize, board: &Board, ply: Ply) -> bool {
         ply_index >= self.skipped_plies
             && i32::from(ply.score).abs() <= self.max_score
             && !ply.best_move.is_noisy()
             && !board.in_check()
     }
+}
+
+const fn material_value(piece: Piece) -> u32 {
+    match piece {
+        Piece::King => 0,
+        Piece::Queen => 9,
+        Piece::Rook => 5,
+        Piece::Bishop | Piece::Knight => 3,
+        Piece::Pawn => 1,
+    }
+}
+
+fn material(board: &Board, side: Color) -> u32 {
+    Piece::ALL
+        .iter()
+        .map(|&piece| board.pieces_of(side, piece).count() * material_value(piece))
+        .sum()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +139,7 @@ impl Game {
             .start
             .parse()
             .map_err(|error| invalid_data(format!("start position {:?}: {error}", self.start)))?;
+        let filter = filter.for_start(&board);
         let mut records = Vec::new();
         for (index, &ply) in self.plies.iter().enumerate() {
             if filter.accepts(index, &board, ply) {
@@ -195,7 +221,7 @@ pub fn contents(path: &Path) -> io::Result<Contents> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::testing::find_move;
+    use crate::board::testing::{board, find_move};
     use crate::board::{KIWIPETE, START_POSITION};
 
     fn game(start: &str, white_outcome: Outcome, line: &[(&str, i16)]) -> Game {
@@ -339,6 +365,11 @@ mod tests {
                 &check,
                 vec![(500, Outcome::Win), (510, Outcome::Win)],
             ),
+            (
+                Filter::DEFAULT,
+                &check,
+                vec![(500, Outcome::Win), (510, Outcome::Win)],
+            ),
         ];
 
         for (filter, game, expected) in cases {
@@ -348,6 +379,37 @@ mod tests {
                 "{filter:?}, start {:?}",
                 game.start
             );
+        }
+    }
+
+    #[test]
+    fn keeps_opening_plies_of_unequal_material_starts() {
+        let cases = [
+            (START_POSITION, Filter::DEFAULT.skipped_plies),
+            (KIWIPETE, Filter::DEFAULT.skipped_plies),
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1",
+                0,
+            ),
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPP1PPPP/RNBQKBNR w KQkq - 0 1",
+                0,
+            ),
+            (
+                "r1bqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQK1NR w KQkq - 0 1",
+                Filter::DEFAULT.skipped_plies,
+            ),
+            (
+                "rn1qkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKB1R w KQkq - 0 1",
+                Filter::DEFAULT.skipped_plies,
+            ),
+            ("4k3/8/8/8/8/8/8/R3K3 w - - 0 1", 0),
+        ];
+
+        for (fen, skipped_plies) in cases {
+            let filter = Filter::DEFAULT.for_start(&board(fen));
+            assert_eq!(filter.skipped_plies, skipped_plies, "fen {fen:?}");
+            assert_eq!(filter.max_score, Filter::DEFAULT.max_score, "fen {fen:?}");
         }
     }
 
