@@ -15,6 +15,8 @@ pub type RawRecord = [u8; RECORD_BYTES];
 
 pub const COLUMN_BLOCK: usize = 16;
 
+const LANES: usize = 8;
+
 const BLOCKS: usize = HIDDEN / COLUMN_BLOCK;
 const ROWS: usize = INPUTS + 1 + OUTPUT_BUCKETS * SIDES;
 const BIAS_ROW: usize = INPUTS;
@@ -24,6 +26,7 @@ const SPINS_BEFORE_YIELD: u32 = 1 << 14;
 const TILES: [usize; 3] = [64, 32, COLUMN_BLOCK];
 
 const _: () = assert!(HIDDEN.is_multiple_of(COLUMN_BLOCK));
+const _: () = assert!(COLUMN_BLOCK.is_multiple_of(LANES));
 
 pub fn column_ranges(threads: usize) -> Vec<Range<usize>> {
     let shards = threads.clamp(1, BLOCKS);
@@ -75,11 +78,15 @@ impl Layer<'_> {
         }
         *tile_at_mut::<TILE>(accumulators, tile) = sums;
         let weights = tile_at::<TILE>(self.parameters, self.output_row + tile);
-        let mut partials = [0.0; TILE];
-        for ((partial, &sum), weight) in partials.iter_mut().zip(&sums).zip(weights) {
-            *partial = screlu(sum) * weight;
+        let mut lanes = [0.0; LANES];
+        for start in (0..TILE).step_by(LANES) {
+            let sums = tile_at::<LANES>(&sums, start);
+            let weights = tile_at::<LANES>(weights, start);
+            for ((lane, &sum), weight) in lanes.iter_mut().zip(sums).zip(weights) {
+                *lane += screlu(sum) * weight;
+            }
         }
-        partials.iter().sum()
+        lanes.iter().sum()
     }
 
     fn backward<const TILE: usize>(
