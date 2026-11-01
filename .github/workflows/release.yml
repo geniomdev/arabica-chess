@@ -36,6 +36,7 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   cpu: x86-64-v4, suffix: windows-x86-64-v4, ext: .exe, flags: -C target-feature=+crt-static }
           - { os: macos-latest,   target: aarch64-apple-darwin,     cpu: apple-m1,  suffix: macos-arm64, test: true }
           - { os: ubuntu-latest,  target: aarch64-linux-android,    cpu: generic,   suffix: android-arm64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, cpu: generic, suffix: linux-arm64, test: true }
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: -C target-cpu=${{ matrix.cpu }} ${{ matrix.flags }}
