@@ -55,6 +55,7 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 | `x86-64-v3` | AVX2, BMI2 and FMA (Intel Haswell, AMD Zen and later); the build for most machines |
 | `x86-64-v4` | AVX-512 (AMD Zen 4, Intel Skylake-X, Ice Lake, Sapphire Rapids and later); stops with an illegal instruction error on other CPUs |
 | `macos-arm64` | Apple silicon; the output layer uses NEON |
+| `android-arm64` | 64-bit Android (ARMv8-A, Android 5.0 and later); the output layer uses NEON |
 
 Board representation and move generation are summarized in [docs/board.md](docs/board.md).
 
