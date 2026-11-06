@@ -20,6 +20,7 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 | `position fen <fen> [moves g1f3 d7d5]` | Sets up a custom position |
 | `d` | Prints the board, its FEN and Zobrist key |
 | `eval` | Prints the static NNUE evaluation of the current position in centipawns from the side to move's point of view |
+| `eval1` | Prints the board after every legal move, best first, with its static NNUE evaluation in centipawns from the moving side's point of view |
 | `ucinewgame` | Resets the board to the start position, clears the transposition table and move histories and reseeds the evaluation noise |
 | `go` | Starts a search |
 | `go depth 8` | Starts a search with depth 8 |

@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::fmt;
 use std::io::{self, BufRead};
 use std::iter;
@@ -176,6 +177,7 @@ impl Engine {
                 "NNUE evaluation: {:+} cp (side to move)",
                 evaluate(&mut self.board)
             ),
+            ["eval1", ..] => print_move_evaluations(&mut self.board),
             ["quit", ..] => return Flow::Quit,
             _ => {}
         }
@@ -442,6 +444,34 @@ fn print_perft_divide(board: &mut Board, depth: u32) {
     println!("\nNodes searched: {total}");
 }
 
+fn evaluate_moves(board: &mut Board) -> Vec<(Move, i32)> {
+    let mut evaluations: Vec<(Move, i32)> = board
+        .legal_moves()
+        .into_iter()
+        .map(|candidate| {
+            board.make_move(candidate);
+            let score = -evaluate(board);
+            board.unmake_move();
+            (candidate, score)
+        })
+        .collect();
+    evaluations.sort_by_key(|&(_, score)| Reverse(score));
+    evaluations
+}
+
+fn print_move_evaluations(board: &mut Board) {
+    let evaluations = evaluate_moves(board);
+    if evaluations.is_empty() {
+        println!("No legal moves");
+        return;
+    }
+    for (candidate, score) in evaluations {
+        board.make_move(candidate);
+        println!("{board}\n\nMove: {candidate}\nNNUE evaluation: {score:+} cp (mover)\n");
+        board.unmake_move();
+    }
+}
+
 fn start_position() -> Board {
     START_POSITION.parse().expect("start position is valid FEN")
 }
@@ -669,6 +699,29 @@ mod tests {
 
     fn millis(value: u64) -> Option<Duration> {
         Some(Duration::from_millis(value))
+    }
+
+    #[test]
+    fn evaluates_every_legal_move_for_the_mover() {
+        let stalemated = "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1";
+        let cases = [(START_POSITION, 20), (KIWIPETE, 48), (stalemated, 0)];
+
+        for (fen, expected_moves) in cases {
+            let mut position: Board = fen.parse().expect("valid FEN");
+            let evaluations = evaluate_moves(&mut position);
+            assert_eq!(evaluations.len(), expected_moves, "{fen}");
+            assert_eq!(position.to_fen(), fen, "{fen}");
+            assert!(
+                evaluations.is_sorted_by_key(|&(_, score)| Reverse(score)),
+                "{fen}"
+            );
+            for (candidate, score) in evaluations {
+                let mut child = position.clone();
+                child.make_move(candidate);
+                child.invalidate_accumulators();
+                assert_eq!(score, -evaluate(&mut child), "{fen}: {candidate}");
+            }
+        }
     }
 
     #[test]
