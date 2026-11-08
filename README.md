@@ -9,6 +9,13 @@
 
 Arabica is a UCI chess engine written from scratch in Rust, with zero dependencies. The engine plays games against itself to produce training data, a built-in trainer learns from those games, and the resulting NNUE is compiled straight into the engine.
 
+## Rating
+
+| Version | [CCRL Blitz](https://computerchess.org.uk/404/) |
+|---|---|
+| [0.4.1](https://github.com/geniomdev/arabica-chess/releases/tag/v0.4.1) | [3415](https://computerchess.org.uk/404/cgi/engine_details.cgi?print=Details&each_game=1&eng=Arabica%200.4.1%2064-bit#Arabica_0_4_1_64-bit) |
+
+
 ## UCI commands
 
 | Command | Description |
@@ -20,7 +27,7 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 | `position fen <fen> [moves g1f3 d7d5]` | Sets up a custom position |
 | `d` | Prints the board, its FEN and Zobrist key |
 | `eval` | Prints the static NNUE evaluation of the current position in centipawns from the side to move's point of view |
-| `eval1` | Prints the board after every legal move, best first, with its static NNUE evaluation in centipawns from the moving side's point of view |
+| `eval1` | Prints the board after every legal move, best first, with its static NNUE evaluation in centipawns |
 | `ucinewgame` | Resets the board to the start position, clears the transposition table and move histories and reseeds the evaluation noise |
 | `go` | Starts a search |
 | `go depth 8` | Starts a search with depth 8 |
@@ -40,20 +47,20 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 | Option | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `Hash` | spin | 16 | 1-4096 | Transposition table size in MB; setting it reallocates and clears the table |
-| `Threads` | spin | 1 | 1-256 | Number of search threads (Lazy SMP: all threads search the same position and share the transposition table) |
+| `Threads` | spin | 1 | 1-256 | Number of search threads (Lazy SMP) |
 | `Move Overhead` | spin | 50 | 0-5000 | Time in ms reserved per move for GUI and network latency |
 | `Ponder` | check | false | | Appends the expected reply to `bestmove` as `ponder <move>` |
 | `UCI_LimitStrength` | check | false | | Plays at the strength set by `UCI_Elo` |
 | `UCI_Elo` | spin | 1500 | 600-3000 | Target strength when `UCI_LimitStrength` is on |
-| `EvalFile` | string | `<embedded>` | | Loads a `.nnue` network from the given path and clears the transposition table; `<embedded>` restores the built-in network, a file that fails to load keeps the current one |
+| `EvalFile` | string | `<embedded>` | | Loads a `.nnue` network from the given path and clears the transposition table; `<embedded>` restores the built-in network |
 | `SyzygyPath` | string | `<empty>` | | Directories with Syzygy tablebase files, separated by `:` (`;` on Windows); `<empty>` turns tablebases off |
-| `Mode` | combo | `Search` | `Search`, `NNUE1`-`NNUE4` | `Search` is the normal search; `NNUEn` replaces it with a plain minimax over every position exactly n plies deep, scored by the NNUE alone (no pruning, extensions, quiescence or time control) |
+| `Mode` | combo | `Search` | `Search`, `NNUE1`-`NNUE4` | `Search` is the normal search; `NNUEn` plain minimax over n plies deep, scored by the NNUE only |
 
 ## Release builds
 
 | Build | CPUs |
 |---|---|
-| `x86-64-v2` | Any x86-64 CPU with SSE4.2 and POPCNT (about 2009 and later); the output layer still switches to AVX2 or AVX-512 at run time when the CPU has them |
+| `x86-64-v2` | Any x86-64 CPU with SSE4.2 and POPCNT (about 2009 and later) |
 | `x86-64-v3` | AVX2, BMI2 and FMA (Intel Haswell, AMD Zen and later); the build for most machines |
 | `x86-64-v4` | AVX-512 (AMD Zen 4, Intel Skylake-X, Ice Lake, Sapphire Rapids and later); stops with an illegal instruction error on other CPUs |
 | `linux-arm64` | Any 64-bit ARM Linux (ARMv8-A: Raspberry Pi 3 and later, AWS Graviton, Ampere); statically linked against musl; the output layer uses NEON |
