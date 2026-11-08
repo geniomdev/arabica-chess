@@ -6,7 +6,6 @@
 - Aspiration windows
 - Principal variation search
 - Quiescence search
-- Check extension
 - Singular extensions with multi-cut
 - Repetition detection
 - Fifty-move and insufficient material draws

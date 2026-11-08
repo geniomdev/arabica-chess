@@ -540,7 +540,7 @@ fn drawn_by_rule(board: &mut Board) -> bool {
 pub mod testing {
     use super::Tablebases;
 
-    const LOCAL_TABLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bin/syzygy");
+    const LOCAL_TABLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/syzygy");
 
     pub fn local_tablebases() -> Option<Tablebases> {
         let tablebases = Tablebases::open(LOCAL_TABLES)

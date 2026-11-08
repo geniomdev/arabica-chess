@@ -1064,7 +1064,7 @@ mod tests {
 
     #[test]
     fn loads_and_unloads_tablebases() {
-        let tables = concat!(env!("CARGO_MANIFEST_DIR"), "/bin/syzygy");
+        let tables = concat!(env!("CARGO_MANIFEST_DIR"), "/data/syzygy");
         let tables_present = std::path::Path::new(tables).is_dir();
         let load = format!("setoption name SyzygyPath value {tables}");
         let unload = "setoption name SyzygyPath value <empty>";

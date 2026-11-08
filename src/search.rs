@@ -697,7 +697,7 @@ impl Searcher {
         }
     }
 
-    fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32) -> i32 {
+    fn negamax(&mut self, board: &mut Board, mut depth: i32, mut alpha: i32, beta: i32) -> i32 {
         self.pv_len[self.ply] = self.ply;
         let is_root = self.ply == 0;
         let is_pv = beta - alpha > 1;
@@ -708,7 +708,6 @@ impl Searcher {
             return self.static_evaluation(board);
         }
         let in_check = board.in_check();
-        let mut depth = if in_check { depth + 1 } else { depth };
         if depth <= 0 {
             return self.quiescence(board, alpha, beta);
         }
@@ -924,12 +923,13 @@ impl Searcher {
             } else {
                 let gives_check = board.in_check();
                 let mut reduction = 0;
-                if depth >= REDUCTION_DEPTH && is_quiet && !in_check && !gives_check {
+                if depth >= REDUCTION_DEPTH && is_quiet {
                     reduction = late_move_reduction(depth, legal_moves as usize);
                     reduction -= i32::from(is_pv);
                     reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
                     reduction += i32::from(!improving);
                     reduction += i32::from(hash_move_is_noisy);
+                    reduction -= i32::from(gives_check);
                     reduction -= move_history / REDUCTION_HISTORY_DIVISOR;
                     reduction = reduction.clamp(0, (new_depth - 1).max(0));
                 }
