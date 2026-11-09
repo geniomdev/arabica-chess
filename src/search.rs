@@ -39,6 +39,8 @@ const NOISY_SEE_DEPTH: i32 = 6;
 const NOISY_SEE_MARGIN: i32 = 100;
 const REDUCTION_DEPTH: i32 = 3;
 const REDUCTION_HISTORY_DIVISOR: i32 = 16_384;
+const NOISY_REDUCTION_DISCOUNT: i32 = 1;
+const NOISY_REDUCTION_HISTORY_DIVISOR: i32 = 8_192;
 const REDUCTION_TABLE_SIZE: usize = 64;
 const INTERNAL_REDUCTION_DEPTH: i32 = 4;
 const SINGULAR_DEPTH: i32 = 8;
@@ -927,14 +929,19 @@ impl Searcher {
             } else {
                 let gives_check = board.in_check();
                 let mut reduction = 0;
-                if depth >= REDUCTION_DEPTH && is_quiet {
+                if depth >= REDUCTION_DEPTH {
                     reduction = late_move_reduction(depth, legal_moves as usize);
+                    if is_quiet {
+                        reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
+                        reduction += i32::from(hash_move_is_noisy);
+                        reduction -= move_history / REDUCTION_HISTORY_DIVISOR;
+                    } else {
+                        reduction -= NOISY_REDUCTION_DISCOUNT;
+                        reduction -= move_history / NOISY_REDUCTION_HISTORY_DIVISOR;
+                    }
                     reduction -= i32::from(is_pv);
-                    reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
                     reduction += i32::from(!improving);
-                    reduction += i32::from(hash_move_is_noisy);
                     reduction -= i32::from(gives_check);
-                    reduction -= move_history / REDUCTION_HISTORY_DIVISOR;
                     reduction = reduction.clamp(0, (new_depth - 1).max(0));
                 }
                 let mut score = -self.negamax(board, new_depth - reduction, -alpha - 1, -alpha);
