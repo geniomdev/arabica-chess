@@ -5,6 +5,7 @@
 - Lazy SMP
 - Aspiration windows with fail-high depth reduction
 - Principal variation search
+- Expected cut-node tracking
 - Quiescence search
 - Singular extensions with multi-cut
 - Repetition detection
@@ -19,7 +20,7 @@
 - Improving heuristic
 - Null move pruning
 - ProbCut
-- Internal iterative reductions
+- Internal iterative reductions, deeper in expected cut-nodes
 - Late move reductions
 - Reverse futility pruning
 - Futility pruning

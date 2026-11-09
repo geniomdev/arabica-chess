@@ -11,9 +11,9 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 
 ## Rating
 
-| Version | [CCRL Blitz](https://computerchess.org.uk/404/) |
-|---|---|
-| [0.4.1](https://github.com/geniomdev/arabica-chess/releases/tag/v0.4.1) | [3415](https://computerchess.org.uk/404/cgi/engine_details.cgi?print=Details&each_game=1&eng=Arabica%200.4.1%2064-bit#Arabica_0_4_1_64-bit) |
+| Version | [CCRL Blitz](https://computerchess.org.uk/404/) | Date |
+|---|---|---|
+| [0.4.1](https://github.com/geniomdev/arabica-chess/releases/tag/v0.4.1) | [3415 (#140)](https://computerchess.org.uk/404/cgi/engine_details.cgi?print=Details&each_game=1&eng=Arabica%200.4.1%2064-bit#Arabica_0_4_1_64-bit) | Nov 7, 2026 |
 
 
 ## UCI commands

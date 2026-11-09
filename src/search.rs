@@ -469,7 +469,7 @@ impl Searcher {
 
     fn aspiration_search(&mut self, board: &mut Board, depth: i32, previous_score: i32) -> i32 {
         if depth < ASPIRATION_DEPTH || is_mate_score(previous_score) {
-            return self.negamax(board, depth, -INFINITY, INFINITY);
+            return self.negamax(board, depth, -INFINITY, INFINITY, false);
         }
         let mut window = ASPIRATION_WINDOW;
         let mut alpha = previous_score - window;
@@ -477,7 +477,7 @@ impl Searcher {
         let mut fail_highs = 0;
         loop {
             let search_depth = (depth - fail_highs).max(1);
-            let score = self.negamax(board, search_depth, alpha, beta);
+            let score = self.negamax(board, search_depth, alpha, beta, false);
             if self.stopped || (alpha < score && score < beta) {
                 return score;
             }
@@ -647,6 +647,7 @@ impl Searcher {
         probcut_beta: i32,
         static_eval: i32,
         depth: i32,
+        cut_node: bool,
     ) -> Option<(Move, i32)> {
         let continuations = self.continuations();
         let mut picker = MovePicker::good_noisy_only(hash_move);
@@ -666,6 +667,7 @@ impl Searcher {
                     depth - PROBCUT_REDUCTION - 1,
                     -probcut_beta,
                     -probcut_beta + 1,
+                    !cut_node,
                 );
             }
             self.ply -= 1;
@@ -687,10 +689,17 @@ impl Searcher {
         hit: Hit,
         depth: i32,
         beta: i32,
+        cut_node: bool,
     ) -> Result<i32, i32> {
         let singular_beta = hit.score - SINGULAR_BETA_MARGIN * depth;
         self.excluded[self.ply] = candidate;
-        let score = self.negamax(board, (depth - 1) / 2, singular_beta - 1, singular_beta);
+        let score = self.negamax(
+            board,
+            (depth - 1) / 2,
+            singular_beta - 1,
+            singular_beta,
+            cut_node,
+        );
         self.excluded[self.ply] = Move::NULL;
         if score < singular_beta {
             Ok(1)
@@ -703,7 +712,14 @@ impl Searcher {
         }
     }
 
-    fn negamax(&mut self, board: &mut Board, mut depth: i32, mut alpha: i32, beta: i32) -> i32 {
+    fn negamax(
+        &mut self,
+        board: &mut Board,
+        mut depth: i32,
+        mut alpha: i32,
+        beta: i32,
+        cut_node: bool,
+    ) -> i32 {
         self.pv_len[self.ply] = self.ply;
         let is_root = self.ply == 0;
         let is_pv = beta - alpha > 1;
@@ -772,7 +788,7 @@ impl Searcher {
         }
         let hash_move = hit.and_then(|hit| hit.best_move);
         if depth >= INTERNAL_REDUCTION_DEPTH && hash_move.is_none() {
-            depth -= 1;
+            depth -= 1 + i32::from(cut_node);
         }
 
         let us = board.state.active_color;
@@ -804,7 +820,7 @@ impl Searcher {
             self.played[self.ply] = None;
             board.make_null_move();
             self.ply += 1;
-            let score = -self.negamax(board, depth - 1 - reduction, -beta, -beta + 1);
+            let score = -self.negamax(board, depth - 1 - reduction, -beta, -beta + 1, !cut_node);
             self.ply -= 1;
             board.unmake_null_move();
             if self.stopped {
@@ -825,7 +841,7 @@ impl Searcher {
             })
         {
             if let Some((best_move, score)) =
-                self.probcut(board, hash_move, probcut_beta, static_eval, depth)
+                self.probcut(board, hash_move, probcut_beta, static_eval, depth, cut_node)
             {
                 self.shared.table.store(Store {
                     key,
@@ -909,7 +925,7 @@ impl Searcher {
                 && i32::from(hit.depth) >= depth - SINGULAR_TABLE_DEPTH_MARGIN
                 && !is_mate_score(hit.score)
             {
-                match self.singular_extension(board, candidate, hit, depth, beta) {
+                match self.singular_extension(board, candidate, hit, depth, beta, cut_node) {
                     _ if self.stopped => return 0,
                     Ok(singular_extension) => extension = singular_extension,
                     Err(multi_cut_score) => return multi_cut_score,
@@ -925,7 +941,7 @@ impl Searcher {
             self.ply += 1;
             let new_depth = depth - 1 + extension;
             let score = if legal_moves == 1 {
-                -self.negamax(board, new_depth, -beta, -alpha)
+                -self.negamax(board, new_depth, -beta, -alpha, !is_pv && !cut_node)
             } else {
                 let gives_check = board.in_check();
                 let mut reduction = 0;
@@ -944,12 +960,19 @@ impl Searcher {
                     reduction -= i32::from(gives_check);
                     reduction = reduction.clamp(0, (new_depth - 1).max(0));
                 }
-                let mut score = -self.negamax(board, new_depth - reduction, -alpha - 1, -alpha);
+                let child_cut_node = is_pv || !cut_node;
+                let mut score = -self.negamax(
+                    board,
+                    new_depth - reduction,
+                    -alpha - 1,
+                    -alpha,
+                    child_cut_node,
+                );
                 if !self.stopped && score > alpha && reduction > 0 {
-                    score = -self.negamax(board, new_depth, -alpha - 1, -alpha);
+                    score = -self.negamax(board, new_depth, -alpha - 1, -alpha, child_cut_node);
                 }
                 if !self.stopped && score > alpha && score < beta {
-                    score = -self.negamax(board, new_depth, -beta, -alpha);
+                    score = -self.negamax(board, new_depth, -beta, -alpha, false);
                 }
                 score
             };
