@@ -2,7 +2,7 @@
 
 - Negamax
 - Iterative deepening
-- Lazy SMP
+- Lazy SMP with best-thread voting
 - Aspiration windows with fail-high depth reduction
 - Principal variation search
 - Expected cut-node tracking

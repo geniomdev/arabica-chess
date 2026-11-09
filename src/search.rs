@@ -1,3 +1,4 @@
+use std::iter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread;
@@ -20,6 +21,8 @@ pub const MAX_DEPTH: u8 = 64;
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 pub const TABLEBASE_WIN: i32 = MATE_BOUND - 1 - MAX_PLY as i32;
 const TABLEBASE_DEPTH_BONUS: i32 = 6;
+const DECISIVE_BOUND: i32 = TABLEBASE_WIN - MAX_PLY as i32;
+const VOTE_SCORE_OFFSET: i64 = 14;
 const TIME_CHECK_INTERVAL: u64 = 2048;
 const QUIESCENCE_DEPTH: u8 = 0;
 const QUIESCENCE_FUTILITY_MARGIN: i32 = 200;
@@ -100,11 +103,24 @@ pub struct Iteration<'a> {
     pub tablebase_hits: u64,
 }
 
+#[repr(C, align(64))]
+#[derive(Default)]
+struct Counters {
+    nodes: AtomicU64,
+    tablebase_hits: AtomicU64,
+}
+
 pub struct SharedSearch {
     pub table: TranspositionTable,
     helpers_stop: AtomicBool,
-    nodes: AtomicU64,
-    tablebase_hits: AtomicU64,
+    counters: Counters,
+}
+
+#[derive(Clone)]
+struct Completed {
+    depth: u8,
+    score: i32,
+    pv: Vec<Move>,
 }
 
 impl SharedSearch {
@@ -112,8 +128,7 @@ impl SharedSearch {
         Self {
             table: TranspositionTable::new(hash_megabytes),
             helpers_stop: AtomicBool::new(false),
-            nodes: AtomicU64::new(0),
-            tablebase_hits: AtomicU64::new(0),
+            counters: Counters::default(),
         }
     }
 
@@ -126,12 +141,14 @@ impl SharedSearch {
     fn begin(&self) {
         self.table.new_search();
         self.helpers_stop.store(false, Ordering::Relaxed);
-        self.nodes.store(0, Ordering::Relaxed);
-        self.tablebase_hits.store(0, Ordering::Relaxed);
+        self.counters.nodes.store(0, Ordering::Relaxed);
+        self.counters.tablebase_hits.store(0, Ordering::Relaxed);
     }
 
     fn count_tablebase_hits(&self, hits: u64) {
-        self.tablebase_hits.fetch_add(hits, Ordering::Relaxed);
+        self.counters
+            .tablebase_hits
+            .fetch_add(hits, Ordering::Relaxed);
     }
 
     fn stop_helpers(&self) {
@@ -155,6 +172,9 @@ pub struct Searcher {
     ponder_move: Option<Move>,
     nodes: u64,
     flushed_nodes: u64,
+    tablebase_hits: u64,
+    flushed_tablebase_hits: u64,
+    completed: Option<Completed>,
     ply: usize,
     stopped: bool,
     first_iteration_completed: bool,
@@ -181,6 +201,39 @@ fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_sha
     let node_share = (BEST_MOVE_NODES_PIVOT - best_move_node_share) * BEST_MOVE_NODES_SCALE;
     let (lowest, highest) = SOFT_TIME_SCALE_RANGE;
     (stability * score_trend * node_share).clamp(lowest, highest)
+}
+
+fn is_decisive(score: i32) -> bool {
+    score.abs() >= DECISIVE_BOUND
+}
+
+fn elected_index(results: &[&Completed]) -> usize {
+    let lowest = results.iter().map(|result| result.score).min().unwrap_or(0);
+    let weight = |result: &Completed| {
+        (i64::from(result.score - lowest) + VOTE_SCORE_OFFSET) * i64::from(result.depth)
+    };
+    let votes_for = |candidate: Move| -> i64 {
+        results
+            .iter()
+            .filter(|result| result.pv[0] == candidate)
+            .map(|result| weight(result))
+            .sum()
+    };
+    let mut chosen = 0;
+    for (index, candidate) in results.iter().enumerate().skip(1) {
+        let current = results[chosen];
+        let better = if is_decisive(current.score) {
+            candidate.score > current.score
+        } else {
+            candidate.score >= DECISIVE_BOUND
+                || (candidate.score > -DECISIVE_BOUND
+                    && votes_for(candidate.pv[0]) > votes_for(current.pv[0]))
+        };
+        if better {
+            chosen = index;
+        }
+    }
+    chosen
 }
 
 fn has_non_pawn_material(board: &Board, side: Color) -> bool {
@@ -238,6 +291,9 @@ impl Searcher {
             ponder_move: None,
             nodes: 0,
             flushed_nodes: 0,
+            tablebase_hits: 0,
+            flushed_tablebase_hits: 0,
+            completed: None,
             ply: 0,
             stopped: false,
             first_iteration_completed: false,
@@ -286,11 +342,11 @@ impl Searcher {
         &mut self,
         board: &mut Board,
         helpers: &mut [Searcher],
-        report: impl FnMut(&Iteration),
+        mut report: impl FnMut(&Iteration),
     ) -> (Move, i32) {
         self.shared.begin();
         self.prepare_tablebase_root(board);
-        thread::scope(|scope| {
+        let main_best = thread::scope(|scope| {
             for helper in helpers.iter_mut() {
                 helper.tablebases.clone_from(&self.tablebases);
                 helper
@@ -300,10 +356,57 @@ impl Searcher {
                 let mut helper_board = board.clone();
                 scope.spawn(move || helper.search_as_helper(&mut helper_board));
             }
-            let best = self.search_as_main(board, report);
+            let best = self.search_as_main(board, &mut report);
             self.shared.stop_helpers();
             best
-        })
+        });
+        match self.elected_helper_result(helpers) {
+            Some(elected) => self.adopt_elected(board, &elected, report),
+            None => main_best,
+        }
+    }
+
+    fn elected_helper_result(&self, helpers: &[Searcher]) -> Option<Completed> {
+        let main_result = self
+            .completed
+            .as_ref()
+            .filter(|result| !result.pv.is_empty())?;
+        let results: Vec<&Completed> = iter::once(main_result)
+            .chain(
+                helpers
+                    .iter()
+                    .filter_map(|helper| helper.completed.as_ref())
+                    .filter(|result| !result.pv.is_empty()),
+            )
+            .collect();
+        match elected_index(&results) {
+            0 => None,
+            chosen => Some(results[chosen].clone()),
+        }
+    }
+
+    fn adopt_elected(
+        &mut self,
+        board: &mut Board,
+        elected: &Completed,
+        mut report: impl FnMut(&Iteration),
+    ) -> (Move, i32) {
+        let best_move = elected.pv[0];
+        report(&Iteration {
+            depth: elected.depth,
+            score: elected.score,
+            nodes: self.nodes(),
+            elapsed: self.start.elapsed(),
+            pv: &elected.pv,
+            hashfull: self.shared.table.hashfull(),
+            tablebase_hits: self.tablebase_hits(),
+        });
+        self.ponder_move = elected
+            .pv
+            .get(1)
+            .copied()
+            .or_else(|| self.table_reply(board, best_move));
+        (best_move, elected.score)
     }
 
     fn prepare_tablebase_root(&mut self, board: &mut Board) {
@@ -326,7 +429,7 @@ impl Searcher {
 
     fn probe_tablebase(&mut self, board: &mut Board) -> Option<(i32, Bound)> {
         let wdl = self.tablebases.as_ref()?.probe_wdl(board)?;
-        self.shared.count_tablebase_hits(1);
+        self.tablebase_hits += 1;
         let ply = self.ply as i32;
         Some(match wdl {
             Wdl::Win => (TABLEBASE_WIN - ply, Bound::Lower),
@@ -343,6 +446,9 @@ impl Searcher {
         self.ponder_move = None;
         self.nodes = 0;
         self.flushed_nodes = 0;
+        self.tablebase_hits = 0;
+        self.flushed_tablebase_hits = 0;
+        self.completed = None;
         self.ply = 0;
         self.stopped = false;
         self.first_iteration_completed = false;
@@ -351,8 +457,9 @@ impl Searcher {
 
     fn search_as_helper(&mut self, board: &mut Board) {
         self.reset(true);
+        let max_depth = self.limits.depth.unwrap_or(MAX_DEPTH).clamp(1, MAX_DEPTH);
         let mut score = 0;
-        for depth in 1..=MAX_DEPTH {
+        for depth in 1..=max_depth {
             if self.shared.helpers_stopped() {
                 break;
             }
@@ -361,6 +468,7 @@ impl Searcher {
                 break;
             }
             score = iteration_score;
+            self.record_completed(depth, score);
         }
         self.flush_nodes();
     }
@@ -397,8 +505,10 @@ impl Searcher {
                 elapsed: self.start.elapsed(),
                 pv,
                 hashfull: self.shared.table.hashfull(),
-                tablebase_hits: self.shared.tablebase_hits.load(Ordering::Relaxed),
+                tablebase_hits: self.tablebase_hits(),
             });
+            let completed_depth = if self.stopped { depth - 1 } else { depth };
+            self.record_completed(completed_depth, score);
             let score_drop = if depth == 1 { 0 } else { previous.1 - score };
             let time_scale = soft_time_scale(
                 stable_iterations,
@@ -458,13 +568,34 @@ impl Searcher {
     }
 
     pub fn nodes(&self) -> u64 {
-        self.shared.nodes.load(Ordering::Relaxed) + self.nodes - self.flushed_nodes
+        self.shared.counters.nodes.load(Ordering::Relaxed) + self.nodes - self.flushed_nodes
+    }
+
+    fn tablebase_hits(&self) -> u64 {
+        self.shared.counters.tablebase_hits.load(Ordering::Relaxed) + self.tablebase_hits
+            - self.flushed_tablebase_hits
     }
 
     fn flush_nodes(&mut self) {
         let unflushed = self.nodes - self.flushed_nodes;
-        self.shared.nodes.fetch_add(unflushed, Ordering::Relaxed);
+        self.shared
+            .counters
+            .nodes
+            .fetch_add(unflushed, Ordering::Relaxed);
         self.flushed_nodes = self.nodes;
+        let unflushed_hits = self.tablebase_hits - self.flushed_tablebase_hits;
+        if unflushed_hits > 0 {
+            self.shared.count_tablebase_hits(unflushed_hits);
+            self.flushed_tablebase_hits = self.tablebase_hits;
+        }
+    }
+
+    fn record_completed(&mut self, depth: u8, score: i32) {
+        self.completed = Some(Completed {
+            depth,
+            score,
+            pv: self.pv[0][..self.pv_len[0]].to_vec(),
+        });
     }
 
     fn aspiration_search(&mut self, board: &mut Board, depth: i32, previous_score: i32) -> i32 {
@@ -1167,6 +1298,7 @@ mod tests {
     use crate::board::testing::board;
     use crate::board::{KIWIPETE, START_POSITION};
     use crate::syzygy::testing::local_tablebases;
+    use crate::types::{MoveKind, Square};
 
     fn small_shared() -> Arc<SharedSearch> {
         Arc::new(SharedSearch::new(1))
@@ -1203,6 +1335,46 @@ mod tests {
                 corrected, expected,
                 "raw eval {raw_eval}, search error {search_error:?}"
             );
+        }
+    }
+
+    #[test]
+    fn elects_thread_by_depth_score_and_mates() {
+        let first = Move::new(Square::new(4, 1), Square::new(4, 3), MoveKind::DoublePush);
+        let second = Move::new(Square::new(3, 1), Square::new(3, 3), MoveKind::DoublePush);
+        let third = Move::new(Square::new(6, 0), Square::new(5, 2), MoveKind::Quiet);
+        type ThreadResult = (u8, i32, Move);
+        let cases: [(&[ThreadResult], usize); 10] = [
+            (&[(10, 20, first)], 0),
+            (&[(10, 20, first), (14, 20, first)], 0),
+            (&[(10, 20, first), (14, 20, second)], 1),
+            (&[(10, 20, first), (10, 20, second)], 0),
+            (&[(10, 20, first), (12, 20, second), (9, 20, first)], 0),
+            (&[(10, 0, first), (10, 50, second)], 1),
+            (&[(20, 30, first), (8, MATE - 9, second)], 1),
+            (
+                &[
+                    (12, MATE - 9, first),
+                    (8, MATE - 5, second),
+                    (14, MATE - 7, third),
+                ],
+                1,
+            ),
+            (&[(12, MATE - 5, first), (16, MATE - 9, second)], 0),
+            (&[(10, 0, first), (20, -MATE + 4, second)], 0),
+        ];
+
+        for (threads, expected) in cases {
+            let results: Vec<Completed> = threads
+                .iter()
+                .map(|&(depth, score, best)| Completed {
+                    depth,
+                    score,
+                    pv: vec![best],
+                })
+                .collect();
+            let borrowed: Vec<&Completed> = results.iter().collect();
+            assert_eq!(elected_index(&borrowed), expected, "threads {threads:?}");
         }
     }
 
