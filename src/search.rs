@@ -472,16 +472,20 @@ impl Searcher {
         let mut window = ASPIRATION_WINDOW;
         let mut alpha = previous_score - window;
         let mut beta = previous_score + window;
+        let mut fail_highs = 0;
         loop {
-            let score = self.negamax(board, depth, alpha, beta);
+            let search_depth = (depth - fail_highs).max(1);
+            let score = self.negamax(board, search_depth, alpha, beta);
             if self.stopped || (alpha < score && score < beta) {
                 return score;
             }
             if score <= alpha {
                 beta = (alpha + beta) / 2;
                 alpha = (score - window).max(-INFINITY);
+                fail_highs = 0;
             } else {
                 beta = (score + window).min(INFINITY);
+                fail_highs += 1;
             }
             window += window / 2;
             if window > ASPIRATION_FULL_WINDOW_THRESHOLD {
