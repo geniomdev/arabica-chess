@@ -10,7 +10,9 @@ pub const MAX_HASH_MB: usize = 4096;
 const BUCKET_SIZE: usize = 4;
 const BOUND_BITS: u8 = 2;
 const BOUND_MASK: u8 = (1 << BOUND_BITS) - 1;
-const GENERATION_CYCLE: u8 = 1 << (u8::BITS as u8 - BOUND_BITS);
+const PV_FLAG: u8 = 1 << BOUND_BITS;
+const GENERATION_SHIFT: u8 = BOUND_BITS + 1;
+const GENERATION_CYCLE: u8 = 1 << (u8::BITS as u8 - GENERATION_SHIFT);
 const AGE_PENALTY: i32 = 8;
 const SAME_POSITION_DEPTH_MARGIN: u8 = 4;
 const MISSING_EVAL: i16 = i16::MIN;
@@ -58,7 +60,11 @@ impl Entry {
     }
 
     fn generation(self) -> u8 {
-        self.generation_and_bound >> BOUND_BITS
+        self.generation_and_bound >> GENERATION_SHIFT
+    }
+
+    fn was_pv(self) -> bool {
+        self.generation_and_bound & PV_FLAG != 0
     }
 
     fn holds(self, key: u64) -> bool {
@@ -133,6 +139,7 @@ pub struct Hit {
     pub score: i32,
     pub depth: u8,
     pub bound: Bound,
+    pub was_pv: bool,
 }
 
 impl Hit {
@@ -168,6 +175,7 @@ pub struct Store {
     pub static_eval: Option<i32>,
     pub depth: u8,
     pub bound: Bound,
+    pub was_pv: bool,
     pub ply: usize,
 }
 
@@ -210,6 +218,7 @@ impl TranspositionTable {
             score: score_from_table(entry.score.into(), ply),
             depth: entry.depth,
             bound: entry.bound()?,
+            was_pv: entry.was_pv(),
         })
     }
 
@@ -248,7 +257,9 @@ impl TranspositionTable {
                 .static_eval
                 .map_or(MISSING_EVAL, |static_eval| static_eval as i16),
             depth: store.depth,
-            generation_and_bound: generation << BOUND_BITS | store.bound.code(),
+            generation_and_bound: generation << GENERATION_SHIFT
+                | if store.was_pv { PV_FLAG } else { 0 }
+                | store.bound.code(),
         });
     }
 
@@ -322,6 +333,7 @@ mod tests {
             static_eval: Some(0),
             depth,
             bound,
+            was_pv: false,
             ply: 0,
         }
     }
@@ -412,6 +424,28 @@ mod tests {
                     generation_and_bound
                 ),
                 "score {score}, eval {static_eval}, depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn remembers_pv_flag() {
+        let cases = [(false, 0), (true, 0), (true, GENERATION_CYCLE - 1)];
+
+        for (was_pv, searches_before) in cases {
+            let table = TranspositionTable::new(1);
+            for _ in 0..searches_before {
+                table.new_search();
+            }
+            table.store(Store {
+                was_pv,
+                ..entry(SAMPLE_KEY, 3, Bound::Upper)
+            });
+            let hit = table.probe(SAMPLE_KEY, 0).expect("entry stored");
+            assert_eq!(
+                (hit.was_pv, hit.bound, hit.depth),
+                (was_pv, Bound::Upper, 3),
+                "pv {was_pv}, generation {searches_before}"
             );
         }
     }

@@ -749,6 +749,7 @@ impl Searcher {
         {
             return score;
         }
+        let was_pv = is_pv || hit.is_some_and(|hit| hit.was_pv);
         let original_alpha = alpha;
         let mut tablebase_floor = -INFINITY;
         let mut tablebase_ceiling = INFINITY;
@@ -771,6 +772,7 @@ impl Searcher {
                     static_eval: None,
                     depth: table_depth(depth + TABLEBASE_DEPTH_BONUS),
                     bound,
+                    was_pv,
                     ply: self.ply,
                 });
                 return score;
@@ -850,6 +852,7 @@ impl Searcher {
                     static_eval: unrefined_eval,
                     depth: probcut_depth as u8,
                     bound: Bound::Lower,
+                    was_pv,
                     ply: self.ply,
                 });
                 return score;
@@ -956,6 +959,7 @@ impl Searcher {
                         reduction -= move_history / NOISY_REDUCTION_HISTORY_DIVISOR;
                     }
                     reduction -= i32::from(is_pv);
+                    reduction -= i32::from(was_pv);
                     reduction += i32::from(!improving);
                     reduction -= i32::from(gives_check);
                     reduction = reduction.clamp(0, (new_depth - 1).max(0));
@@ -1046,6 +1050,7 @@ impl Searcher {
             static_eval: unrefined_eval,
             depth: table_depth(depth),
             bound,
+            was_pv,
             ply: self.ply,
         });
         score
@@ -1068,6 +1073,7 @@ impl Searcher {
         {
             return score;
         }
+        let was_pv = is_pv || hit.is_some_and(|hit| hit.was_pv);
         let hash_move = hit.and_then(|hit| hit.best_move);
         let in_check = board.in_check();
         let mut unrefined_eval = None;
@@ -1088,6 +1094,7 @@ impl Searcher {
                         static_eval: unrefined_eval,
                         depth: QUIESCENCE_DEPTH,
                         bound: Bound::Lower,
+                        was_pv,
                         ply: self.ply,
                     });
                 }
@@ -1147,6 +1154,7 @@ impl Searcher {
             } else {
                 Bound::Upper
             },
+            was_pv,
             ply: self.ply,
         });
         best_score
