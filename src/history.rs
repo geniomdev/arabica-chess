@@ -1,10 +1,11 @@
-use crate::types::{Color, Move, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
+use crate::types::{Bitboard, Color, Move, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
 
 pub const CONTINUATION_PLIES: usize = 2;
 
 const MAX_HISTORY: i32 = 16_384;
 const MAX_HISTORY_BONUS: i32 = 1_200;
 const PIECE_TO_SLOTS: usize = SIDES * PIECE_TYPES * SQUARES;
+const THREAT_BUCKETS: usize = 4;
 const VICTIM_SLOTS: usize = PIECE_TYPES + 1;
 const CORRECTION_BITS: u32 = 14;
 const CORRECTION_SLOTS: usize = 1 << CORRECTION_BITS;
@@ -38,7 +39,7 @@ pub struct History {
 impl Default for History {
     fn default() -> Self {
         Self {
-            butterfly: vec![0; SIDES * SQUARES * SQUARES],
+            butterfly: vec![0; SIDES * THREAT_BUCKETS * SQUARES * SQUARES],
             continuation: std::array::from_fn(|_| vec![0; PIECE_TO_SLOTS * PIECE_TO_SLOTS]),
             capture: vec![0; PIECE_TO_SLOTS * VICTIM_SLOTS],
             correction: vec![0; SIDES * CORRECTION_SLOTS],
@@ -54,8 +55,11 @@ fn apply_gravity(entry: &mut i32, bonus: i32) {
     *entry += bonus - *entry * bonus.abs() / MAX_HISTORY;
 }
 
-fn butterfly_index(side: Color, quiet: Move) -> usize {
-    (side.index() * SQUARES + quiet.from().index()) * SQUARES + quiet.to().index()
+fn butterfly_index(side: Color, quiet: Move, threats: Bitboard) -> usize {
+    let from_threatened = usize::from(threats.contains(quiet.from()));
+    let to_threatened = usize::from(threats.contains(quiet.to()));
+    let bucket = side.index() * THREAT_BUCKETS + from_threatened * 2 + to_threatened;
+    (bucket * SQUARES + quiet.from().index()) * SQUARES + quiet.to().index()
 }
 
 fn continuation_index(previous: PieceTo, moved: PieceTo) -> usize {
@@ -80,7 +84,13 @@ impl History {
         self.correction.fill(0);
     }
 
-    pub fn quiet_score(&self, quiet: Move, moved: PieceTo, continuations: Continuations) -> i32 {
+    pub fn quiet_score(
+        &self,
+        quiet: Move,
+        moved: PieceTo,
+        continuations: Continuations,
+        threats: Bitboard,
+    ) -> i32 {
         let continuation_score: i32 = self
             .continuation
             .iter()
@@ -89,7 +99,7 @@ impl History {
                 previous.map(|previous| table[continuation_index(previous, moved)])
             })
             .sum();
-        self.butterfly[butterfly_index(moved.side, quiet)] + continuation_score
+        self.butterfly[butterfly_index(moved.side, quiet, threats)] + continuation_score
     }
 
     pub fn capture_score(&self, moved: PieceTo, victim: Option<Piece>) -> i32 {
@@ -101,10 +111,11 @@ impl History {
         quiet: Move,
         moved: PieceTo,
         continuations: Continuations,
+        threats: Bitboard,
         bonus: i32,
     ) {
         apply_gravity(
-            &mut self.butterfly[butterfly_index(moved.side, quiet)],
+            &mut self.butterfly[butterfly_index(moved.side, quiet, threats)],
             bonus,
         );
         for (table, previous) in self.continuation.iter_mut().zip(continuations) {
@@ -156,22 +167,44 @@ mod tests {
     fn accumulates_quiet_history_per_context() {
         let knight_move = Move::new(Square::G1, Square::F3, MoveKind::Quiet);
         let full_context = [Some(PAWN_TO_E5), Some(BISHOP_TO_C4)];
+        let landing_attacked = Bitboard::from_square(Square::F3);
+        let origin_attacked = Bitboard::from_square(Square::G1);
+        let unrelated_attacked = Bitboard::from_square(Square::E4);
         let bonus = history_bonus(4);
         let cases = [
-            (full_context, 3 * bonus),
-            ([Some(PAWN_TO_E5), None], 2 * bonus),
-            ([None, Some(BISHOP_TO_C4)], 2 * bonus),
-            ([None, None], bonus),
-            ([Some(BISHOP_TO_C4), Some(PAWN_TO_E5)], bonus),
+            (full_context, landing_attacked, 3 * bonus),
+            ([Some(PAWN_TO_E5), None], landing_attacked, 2 * bonus),
+            ([None, Some(BISHOP_TO_C4)], landing_attacked, 2 * bonus),
+            ([None, None], landing_attacked, bonus),
+            (
+                [Some(BISHOP_TO_C4), Some(PAWN_TO_E5)],
+                landing_attacked,
+                bonus,
+            ),
+            (full_context, Bitboard::empty(), 2 * bonus),
+            (full_context, origin_attacked, 2 * bonus),
+            (full_context, landing_attacked | origin_attacked, 2 * bonus),
+            (
+                full_context,
+                landing_attacked | unrelated_attacked,
+                3 * bonus,
+            ),
+            ([None, None], Bitboard::empty(), 0),
         ];
 
-        for (probe_context, expected) in cases {
+        for (probe_context, probe_threats, expected) in cases {
             let mut history = History::default();
-            history.update_quiet(knight_move, KNIGHT_TO_F3, full_context, bonus);
+            history.update_quiet(
+                knight_move,
+                KNIGHT_TO_F3,
+                full_context,
+                landing_attacked,
+                bonus,
+            );
             assert_eq!(
-                history.quiet_score(knight_move, KNIGHT_TO_F3, probe_context),
+                history.quiet_score(knight_move, KNIGHT_TO_F3, probe_context, probe_threats),
                 expected,
-                "context {probe_context:?}"
+                "context {probe_context:?}, threats {probe_threats:?}"
             );
         }
     }

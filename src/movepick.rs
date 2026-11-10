@@ -1,9 +1,12 @@
-use crate::board::{Board, MAX_MOVES, MoveList, see_value};
+use crate::board::{Board, MAX_MOVES, MoveList, Threats, see_value};
 use crate::history::{Continuations, History, PieceTo};
 use crate::types::{Move, MoveKind, Piece};
 
 const CAPTURE_HISTORY_ORDER_DIVISOR: i32 = 8;
 const KING_ATTACKER_RANK: i32 = 1_000;
+const MINOR_ESCAPE_WEIGHT: i32 = 6_000;
+const ROOK_ESCAPE_WEIGHT: i32 = 12_000;
+const QUEEN_ESCAPE_WEIGHT: i32 = 18_000;
 
 pub fn moved_piece(board: &Board, candidate: Move) -> PieceTo {
     PieceTo {
@@ -37,6 +40,37 @@ fn noisy_score(board: &Board, candidate: Move, history: &History) -> i32 {
     promotion
         + victim_attacker_score
         + history.capture_score(moved, victim) / CAPTURE_HISTORY_ORDER_DIVISOR
+}
+
+fn threat_escape_weight(piece: Piece) -> i32 {
+    match piece {
+        Piece::Queen => QUEEN_ESCAPE_WEIGHT,
+        Piece::Rook => ROOK_ESCAPE_WEIGHT,
+        Piece::Knight | Piece::Bishop => MINOR_ESCAPE_WEIGHT,
+        Piece::Pawn | Piece::King => 0,
+    }
+}
+
+fn threat_escape_score(piece: Piece, quiet: Move, threats: Threats) -> i32 {
+    if threats.escapes(piece, quiet) {
+        threat_escape_weight(piece)
+    } else if threats.walks_into(piece, quiet) {
+        -threat_escape_weight(piece)
+    } else {
+        0
+    }
+}
+
+fn quiet_order_score(
+    board: &Board,
+    quiet: Move,
+    history: &History,
+    continuations: Continuations,
+    threats: Threats,
+) -> i32 {
+    let moved = moved_piece(board, quiet);
+    history.quiet_score(quiet, moved, continuations, threats.all)
+        + threat_escape_score(moved.piece, quiet, threats)
 }
 
 fn attacker_rank(attacker: Piece) -> i32 {
@@ -105,6 +139,7 @@ impl MovePicker {
         board: &Board,
         history: &History,
         continuations: Continuations,
+        threats: Threats,
     ) -> Option<Move> {
         loop {
             match self.stage {
@@ -139,11 +174,7 @@ impl MovePicker {
                         let first_quiet = self.moves.len();
                         board.generate_quiets(&mut self.moves);
                         self.score_from(first_quiet, |candidate| {
-                            history.quiet_score(
-                                candidate,
-                                moved_piece(board, candidate),
-                                continuations,
-                            )
+                            quiet_order_score(board, candidate, history, continuations, threats)
                         });
                     }
                     self.stage = Stage::Quiets;
@@ -236,7 +267,7 @@ mod tests {
         if skip_after == Some(0) {
             picker.skip_quiets();
         }
-        while let Some(candidate) = picker.next_move(board, &history, [None; 2]) {
+        while let Some(candidate) = picker.next_move(board, &history, [None; 2], board.threats()) {
             moves.push(candidate);
             if Some(moves.len()) == skip_after {
                 picker.skip_quiets();
@@ -374,6 +405,47 @@ mod tests {
             if let Some(hash_move) = hash_move.filter(|&hash_move| order.contains(&hash_move)) {
                 assert_eq!(order[0], hash_move, "fen {fen:?}: hash first");
             }
+        }
+    }
+
+    #[test]
+    fn rewards_escaping_cheaper_attackers_and_punishes_walking_into_them() {
+        let cases = [
+            (
+                "4k3/8/8/3p4/4N3/8/8/4K3 w - - 0 1",
+                "e4g5",
+                MINOR_ESCAPE_WEIGHT,
+            ),
+            (
+                "4k3/8/8/8/3p4/8/8/4KN2 w - - 0 1",
+                "f1e3",
+                -MINOR_ESCAPE_WEIGHT,
+            ),
+            ("4k3/8/8/4p3/2p5/3N4/8/4K3 w - - 0 1", "d3f4", 0),
+            (
+                "4k3/8/8/8/8/8/1b6/R3K3 w - - 0 1",
+                "a1a5",
+                ROOK_ESCAPE_WEIGHT,
+            ),
+            ("q3k3/8/8/8/8/8/8/R3K3 w - - 0 1", "a1b1", 0),
+            (
+                "r3k3/8/8/8/8/8/8/Q3K3 w - - 0 1",
+                "a1b2",
+                QUEEN_ESCAPE_WEIGHT,
+            ),
+            ("4k3/8/8/2p5/3P4/8/8/4K3 w - - 0 1", "d4d5", 0),
+            ("4k3/8/8/8/8/8/3p4/4K3 w - - 0 1", "e1f1", 0),
+        ];
+
+        for (fen, notation, expected) in cases {
+            let position = board(fen);
+            let quiet = find_move(&position, notation);
+            let piece = moved_piece(&position, quiet).piece;
+            assert_eq!(
+                threat_escape_score(piece, quiet, position.threats()),
+                expected,
+                "{fen}: {notation}"
+            );
         }
     }
 }

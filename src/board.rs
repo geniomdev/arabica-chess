@@ -4,12 +4,14 @@ mod makemove;
 mod movegen;
 mod perft;
 mod see;
+mod threats;
 mod zobrist;
 
 pub use fen::KIWIPETE;
 pub use fen::{FenError, START_POSITION, color_flipped_fen};
 pub use movegen::{MAX_MOVES, MoveList};
 pub use see::see_value;
+pub use threats::Threats;
 
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
 use crate::nnue::{self, Accumulator, AccumulatorStack};

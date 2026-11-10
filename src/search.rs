@@ -4,14 +4,14 @@ use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::board::{Board, see_value};
+use crate::board::{Board, Threats, see_value};
 use crate::history::{Continuations, History, PieceTo, history_bonus};
 use crate::movepick::{MovePicker, captured_piece, moved_piece};
 use crate::nnue;
 use crate::strength::EvalNoise;
 use crate::syzygy::{Tablebases, Wdl};
 use crate::tt::{Bound, Hit, Store, TranspositionTable};
-use crate::types::{Color, Move, Piece, SQUARES};
+use crate::types::{Bitboard, Color, Move, Piece, SQUARES};
 
 pub const INFINITY: i32 = 32_000;
 pub const MATE: i32 = 31_000;
@@ -736,6 +736,7 @@ impl Searcher {
     fn reward_cutoff(
         &mut self,
         board: &Board,
+        threats: Bitboard,
         cutoff: Move,
         tried_quiets: &[Move],
         tried_noisy: &[Move],
@@ -755,11 +756,21 @@ impl Searcher {
                 killers[0] = cutoff;
             }
             let continuations = self.continuations();
-            self.history
-                .update_quiet(cutoff, moved_piece(board, cutoff), continuations, bonus);
+            self.history.update_quiet(
+                cutoff,
+                moved_piece(board, cutoff),
+                continuations,
+                threats,
+                bonus,
+            );
             for &quiet in tried_quiets {
-                self.history
-                    .update_quiet(quiet, moved_piece(board, quiet), continuations, -bonus);
+                self.history.update_quiet(
+                    quiet,
+                    moved_piece(board, quiet),
+                    continuations,
+                    threats,
+                    -bonus,
+                );
             }
         }
         for &noisy in tried_noisy {
@@ -782,7 +793,9 @@ impl Searcher {
     ) -> Option<(Move, i32)> {
         let continuations = self.continuations();
         let mut picker = MovePicker::good_noisy_only(hash_move);
-        while let Some(candidate) = picker.next_move(board, &self.history, continuations) {
+        while let Some(candidate) =
+            picker.next_move(board, &self.history, continuations, Threats::default())
+        {
             if !board.see(candidate, probcut_beta - static_eval) {
                 continue;
             }
@@ -994,6 +1007,7 @@ impl Searcher {
         }
 
         let continuations = self.continuations();
+        let threats = board.threats();
         let mut picker = MovePicker::new(hash_move, self.killers[self.ply]);
         let hash_move_is_noisy = hash_move.is_some_and(Move::is_noisy);
 
@@ -1004,14 +1018,16 @@ impl Searcher {
         let mut tried_quiet_count = 0;
         let mut tried_noisy = [Move::NULL; TRACKED_NOISY];
         let mut tried_noisy_count = 0;
-        while let Some(candidate) = picker.next_move(board, &self.history, continuations) {
+        while let Some(candidate) = picker.next_move(board, &self.history, continuations, threats) {
             if candidate == excluded || (is_root && self.excluded_at_root(candidate)) {
                 continue;
             }
             let is_quiet = !candidate.is_noisy();
             let moved = moved_piece(board, candidate);
+            let escapes_threat = is_quiet && threats.escapes(moved.piece, candidate);
             let move_history = if is_quiet {
-                self.history.quiet_score(candidate, moved, continuations)
+                self.history
+                    .quiet_score(candidate, moved, continuations, threats.all)
             } else {
                 self.history
                     .capture_score(moved, captured_piece(board, candidate))
@@ -1085,6 +1101,7 @@ impl Searcher {
                         reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
                         reduction += i32::from(hash_move_is_noisy);
                         reduction -= move_history / REDUCTION_HISTORY_DIVISOR;
+                        reduction -= i32::from(escapes_threat);
                     } else {
                         reduction -= NOISY_REDUCTION_DISCOUNT;
                         reduction -= move_history / NOISY_REDUCTION_HISTORY_DIVISOR;
@@ -1128,6 +1145,7 @@ impl Searcher {
                 if alpha >= beta {
                     self.reward_cutoff(
                         board,
+                        threats.all,
                         candidate,
                         &tried_quiets[..tried_quiet_count],
                         &tried_noisy[..tried_noisy_count],
@@ -1238,9 +1256,14 @@ impl Searcher {
 
         let futility_base = best_score + QUIESCENCE_FUTILITY_MARGIN;
         let continuations = self.continuations();
+        let threats = if in_check {
+            board.threats()
+        } else {
+            Threats::default()
+        };
         let mut best_move = Move::NULL;
         let mut legal_moves = 0;
-        while let Some(candidate) = picker.next_move(board, &self.history, continuations) {
+        while let Some(candidate) = picker.next_move(board, &self.history, continuations, threats) {
             if !in_check && candidate.promotion().is_none() {
                 let victim_value = captured_piece(board, candidate).map_or(0, see_value);
                 if futility_base + victim_value <= alpha {

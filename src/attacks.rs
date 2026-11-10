@@ -180,6 +180,17 @@ pub fn pawn_attacks(side: Color, square: Square) -> Bitboard {
     Bitboard(PAWN_ATTACKS[side.index()][square.index()])
 }
 
+pub fn pawn_attacks_from(side: Color, pawns: Bitboard) -> Bitboard {
+    const FILE_A: u64 = 0x0101_0101_0101_0101;
+    const FILE_H: u64 = FILE_A << 7;
+    let leaving_west = pawns.0 & !FILE_A;
+    let leaving_east = pawns.0 & !FILE_H;
+    match side {
+        Color::White => Bitboard((leaving_west << 7) | (leaving_east << 9)),
+        Color::Black => Bitboard((leaving_west >> 9) | (leaving_east >> 7)),
+    }
+}
+
 pub fn rook_attacks(square: Square, occupancy: Bitboard) -> Bitboard {
     Bitboard(SLIDERS.attacks[SLIDERS.rook[square.index()].index(occupancy.0)])
 }
@@ -341,6 +352,27 @@ mod tests {
                 assert_eq!(
                     bishop_attacks(square, board).0,
                     sliding_attacks(square, occupancy, BISHOP_DIRECTIONS)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pawn_set_attacks_match_per_square_union() {
+        let mut random = Random::new(7);
+        let mut cases = vec![0, u64::MAX, 0x0101_0101_0101_0101, 0x8080_8080_8080_8080];
+        cases.extend((0..1000).map(|_| random.next_u64() & random.next_u64()));
+        for pawns in cases {
+            for side in [Color::White, Color::Black] {
+                let expected = Bitboard(pawns)
+                    .into_iter()
+                    .fold(Bitboard::empty(), |attacked, square| {
+                        attacked | pawn_attacks(side, square)
+                    });
+                assert_eq!(
+                    pawn_attacks_from(side, Bitboard(pawns)),
+                    expected,
+                    "{side:?} pawns {pawns:#018x}"
                 );
             }
         }

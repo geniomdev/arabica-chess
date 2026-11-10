@@ -13,7 +13,8 @@
 - Transposition table
 - Static eval in transposition table
 - Killer moves
-- History heuristic
+- History heuristic bucketed by threats on the from and to squares
+- Threat escape bonus in quiet move ordering
 - Continuation history
 - Capture history
 - Correction history
@@ -21,7 +22,7 @@
 - Null move pruning
 - ProbCut
 - Internal iterative reductions, deeper in expected cut-nodes
-- Late move reductions
+- Late move reductions, shallower for threat escapes
 - Reverse futility pruning
 - Futility pruning
 - Late move pruning
