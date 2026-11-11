@@ -1,3 +1,4 @@
+use std::iter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -5,9 +6,10 @@ use crate::history::History;
 use crate::progress::per_second;
 use crate::search::{SearchLimits, Searcher, SharedSearch};
 use crate::tt::DEFAULT_HASH_MB;
-use crate::uci::parse_position;
+use crate::uci::{MAX_THREADS, parse_position};
 
 const DEFAULT_BENCH_DEPTH: u8 = 13;
+const DEFAULT_BENCH_THREADS: usize = 1;
 
 const BENCH_POSITIONS: [&str; 49] = [
     "fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -61,24 +63,45 @@ const BENCH_POSITIONS: [&str; 49] = [
     "fen 7k/7P/6K1/8/3B4/8/8/8 b - -",
 ];
 
-pub fn run(arguments: &[&str]) {
+struct BenchSettings {
+    depth: u8,
+    threads: usize,
+}
+
+fn parse_arguments(arguments: &[&str]) -> Result<BenchSettings, String> {
     let depth = match arguments.first() {
-        Some(text) => match text.parse() {
-            Ok(depth) => depth,
-            Err(_) => {
-                println!("info string invalid bench depth: {text}");
-                return;
-            }
-        },
+        Some(text) => text
+            .parse()
+            .map_err(|_| format!("invalid bench depth: {text}"))?,
         None => DEFAULT_BENCH_DEPTH,
+    };
+    let threads = match arguments.get(1) {
+        Some(text) => text
+            .parse::<usize>()
+            .map_err(|_| format!("invalid bench threads: {text}"))?
+            .clamp(1, MAX_THREADS),
+        None => DEFAULT_BENCH_THREADS,
+    };
+    Ok(BenchSettings { depth, threads })
+}
+
+pub fn run(arguments: &[&str]) {
+    let settings = match parse_arguments(arguments) {
+        Ok(settings) => settings,
+        Err(error) => {
+            println!("info string {error}");
+            return;
+        }
     };
 
     let limits = SearchLimits {
-        depth: Some(depth),
+        depth: Some(settings.depth),
         ..SearchLimits::default()
     };
     let mut shared = Arc::new(SharedSearch::new(DEFAULT_HASH_MB));
-    let mut history = History::default();
+    let mut histories: Vec<History> = iter::repeat_with(History::default)
+        .take(settings.threads)
+        .collect();
     let mut total_nodes = 0;
     let mut total_time = Duration::ZERO;
 
@@ -94,16 +117,23 @@ pub fn run(arguments: &[&str]) {
         let tokens: Vec<&str> = setup.split_whitespace().collect();
         let mut board = parse_position(&tokens).expect("bench position is valid");
         SharedSearch::exclusive_table(&mut shared).clear();
-        history.clear();
 
-        let mut nodes = 0;
+        let mut searchers: Vec<Searcher> = histories
+            .drain(..)
+            .map(|mut history| {
+                history.clear();
+                Searcher::new(limits, Arc::default(), Arc::clone(&shared)).with_history(history)
+            })
+            .collect();
+        let (main, helpers) = searchers
+            .split_first_mut()
+            .expect("bench runs at least one thread");
         let started = Instant::now();
-        let mut searcher =
-            Searcher::new(limits, Arc::default(), Arc::clone(&shared)).with_history(history);
-        let (best_move, _) = searcher.search(&mut board, |iteration| nodes = iteration.nodes);
+        let (best_move, _) = main.search_with_helpers(&mut board, helpers, |_| {});
         let elapsed = started.elapsed();
+        let nodes = main.nodes();
         total_time += elapsed;
-        history = searcher.into_history();
+        histories = searchers.into_iter().map(Searcher::into_history).collect();
 
         total_nodes += nodes;
         println!(
@@ -130,6 +160,31 @@ mod tests {
         for setup in BENCH_POSITIONS {
             let tokens: Vec<&str> = setup.split_whitespace().collect();
             assert!(parse_position(&tokens).is_ok(), "position {setup:?}");
+        }
+    }
+
+    type ParsedSettings = Result<(u8, usize), &'static str>;
+
+    #[test]
+    fn parses_bench_arguments() {
+        let cases: [(&[&str], ParsedSettings); 8] = [
+            (&[], Ok((DEFAULT_BENCH_DEPTH, DEFAULT_BENCH_THREADS))),
+            (&["9"], Ok((9, DEFAULT_BENCH_THREADS))),
+            (&["9", "4"], Ok((9, 4))),
+            (&["9", "0"], Ok((9, 1))),
+            (&["9", "100000"], Ok((9, MAX_THREADS))),
+            (&["deep"], Err("invalid bench depth: deep")),
+            (&["9", "many"], Err("invalid bench threads: many")),
+            (&["9", "-2"], Err("invalid bench threads: -2")),
+        ];
+        for (arguments, expected) in cases {
+            let parsed =
+                parse_arguments(arguments).map(|settings| (settings.depth, settings.threads));
+            assert_eq!(
+                parsed,
+                expected.map_err(str::to_string),
+                "arguments {arguments:?}"
+            );
         }
     }
 }

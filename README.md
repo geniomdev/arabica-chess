@@ -36,7 +36,7 @@ Arabica is a UCI chess engine written from scratch in Rust, with zero dependenci
 | `go movetime 1000` | Searches for 1000 ms |
 | `go wtime <ms> btime <ms> [winc <ms>] [binc <ms>] [movestogo <n>]` | Searches with clock-based time management |
 | `go perft <depth>` | Perft divide and the total node count |
-| `bench [depth]` | Searches the Stockfish bench positions to a fixed depth (default 13) and prints total nodes and nps |
+| `bench [depth] [threads]` | Searches the Stockfish bench positions to a fixed depth (default 13) with the given number of threads (default 1) and prints total nodes and nps; only the single-threaded node count is deterministic |
 | `go ponder ...` | Searches on the opponent's time with the clock paused and holds `bestmove` until `ponderhit` or `stop` |
 | `ponderhit` | The expected reply was played: the clock starts now and the ongoing search continues under the usual time limits |
 | `stop` | Stops the search |
