@@ -32,3 +32,9 @@
 - Quiescence futility pruning
 - Time management
 - Syzygy tablebases (WDL and DTZ)
+
+## Multithreaded search
+
+| Threads | 2 | 4 | 8 |
+|---|---|---|---|
+| Elo vs 1 thread | +85 ± 23 | +158 ±35 | +214 ±35 |
