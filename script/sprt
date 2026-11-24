@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+if [ $# -lt 2 ]; then
+  echo "usage: script/sprt <new engine> <base engine> [elo0] [elo1]" >&2
+  echo "env:   TC=8+0.08 HASH=16 CONCURRENCY=10 BOOK=data/UHO_Lichess_4852_v1.epd" >&2
+  exit 1
+fi
+
+elo0=${3:-0}
+elo1=${4:-5}
+tc=${TC:-8+0.08}
+hash=${HASH:-16}
+concurrency=${CONCURRENCY:-10}
+book=${BOOK:-$root/data/UHO_Lichess_4852_v1.epd}
+fastchess=${FASTCHESS:-$root/bin/fastchess}
+
+new_name=$(basename "$1")
+base_name=$(basename "$2")
+if [ "$new_name" = "$base_name" ]; then
+  new_name=$new_name-new
+  base_name=$base_name-base
+fi
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/sprt.XXXXXX")
+log=$work/fastchess.log
+cp "$1" "$work/$new_name"
+cp "$2" "$work/$base_name"
+
+cd "$work"
+setsid "$fastchess" \
+  -engine cmd="$work/$new_name" name="$new_name" \
+  -engine cmd="$work/$base_name" name="$base_name" \
+  -each tc="$tc" option.Hash="$hash" \
+  -openings file="$book" format=epd order=random \
+  -sprt elo0="$elo0" elo1="$elo1" alpha=0.05 beta=0.05 model=normalized \
+  -rounds 50000 -games 2 -repeat -concurrency "$concurrency" -ratinginterval 10 -recover \
+  -pgnout file="$work/games.pgn" -config outname="$work/config.json" \
+  > "$log" 2>&1 &
+pid=$!
+started=$(date +%s)
+stopped=false
+trap 'stopped=true; kill -INT "$pid" 2>/dev/null || true' INT TERM
+
+if [ -t 1 ]; then
+  erase=$'\033[K'
+  table_up=$'\033[8A'
+else
+  erase=
+  table_up=
+fi
+
+latest() {
+  grep -E "^$1" "$log" | tail -1 || true
+}
+
+running() {
+  kill -0 "$pid" 2>/dev/null
+}
+
+status() {
+  if grep -q "H1 was accepted" "$log"; then
+    echo "H1 accepted, the change is stronger"
+  elif grep -q "H0 was accepted" "$log"; then
+    echo "H0 accepted, no gain"
+  elif running; then
+    if $stopped; then echo "stopping"; else echo "running"; fi
+  elif $stopped; then
+    echo "stopped"
+  else
+    echo "finished"
+  fi
+}
+
+row() {
+  printf '%s%-9s %s\n' "$erase" "$1" "$2"
+}
+
+table() {
+  local elapsed=$(( $(date +%s) - started ))
+  local count rate
+  count=$(grep -c '^Finished game' "$log" || true)
+  rate=$(( elapsed > 0 ? count * 3600 / elapsed : 0 ))
+  row "Match" "$new_name vs $base_name"
+  row "Settings" "tc $tc, hash $hash, concurrency $concurrency, SPRT [$elo0, $elo1]"
+  row "Elapsed" "$(printf '%02d:%02d:%02d' $((elapsed / 3600)) $((elapsed % 3600 / 60)) $((elapsed % 60))), $count games finished, $rate games/h"
+  row "Games" "$(latest 'Games:' | sed -E 's/Games: ([0-9]+), Wins: ([0-9]+), Losses: ([0-9]+), Draws: ([0-9]+), Points: [0-9.]+ \(([0-9.]+) %\)/\1 (+\2 -\3 =\4)  \5 %/')"
+  row "Elo" "$(latest 'Elo:' | sed -E 's/Elo: ([-0-9.]+) \+\/- ([0-9.]+), nElo: ([-0-9.]+) \+\/- ([0-9.]+)/\1 ± \2  (nElo \3 ± \4)/')"
+  row "Ptnml" "$(latest 'Ptnml' | sed -E 's/Ptnml\(0-2\): (\[[^]]*\]).*/\1/')"
+  row "LLR" "$(latest 'LLR:' | sed -E 's/LLR: ([-0-9.]+) \(([-0-9.]+%)\) \(([-0-9.]+), ([-0-9.]+)\).*/\1 (\2)  bounds \3 … \4/')"
+  row "Status" "$(status)"
+}
+
+echo "Log: $log"
+if [ -t 1 ]; then
+  table
+  while running; do
+    sleep 5 & wait $! || true
+    printf '%s' "$table_up"
+    table
+  done
+fi
+while running; do
+  wait "$pid" || true
+done
+printf '%s' "$table_up"
+table
