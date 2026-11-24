@@ -41,10 +41,24 @@ const FUTILITY_MARGIN: i32 = 100;
 const NOISY_SEE_DEPTH: i32 = 6;
 const NOISY_SEE_MARGIN: i32 = 100;
 const REDUCTION_DEPTH: i32 = 3;
-const REDUCTION_HISTORY_DIVISOR: i32 = 16_384;
-const NOISY_REDUCTION_DISCOUNT: i32 = 1;
-const NOISY_REDUCTION_HISTORY_DIVISOR: i32 = 8_192;
+const REDUCTION_GRAIN: i32 = 1_024;
 const REDUCTION_TABLE_SIZE: usize = 64;
+const QUIET_REDUCTION_HISTORY_DIVISOR: i32 = 16;
+const NOISY_REDUCTION_HISTORY_DIVISOR: i32 = 8;
+const NOISY_REDUCTION_DISCOUNT: i32 = 1_024;
+const KILLER_REDUCTION_DISCOUNT: i32 = 1_024;
+const NOISY_HASH_MOVE_REDUCTION: i32 = 1_024;
+const THREAT_ESCAPE_REDUCTION_DISCOUNT: i32 = 1_024;
+const PV_REDUCTION_DISCOUNT: i32 = 1_024;
+const WAS_PV_REDUCTION_DISCOUNT: i32 = 1_024;
+const NOT_IMPROVING_REDUCTION: i32 = 1_024;
+const CHECK_REDUCTION_DISCOUNT: i32 = 1_024;
+const CUT_NODE_REDUCTION: i32 = 1_536;
+const CHILD_CUTOFFS_THRESHOLD: u32 = 2;
+const CHILD_CUTOFFS_REDUCTION: i32 = 1_024;
+const PV_HASH_SCORE_ABOVE_ALPHA_DISCOUNT: i32 = 512;
+const PV_HASH_DEPTH_DISCOUNT: i32 = 512;
+const CORRECTION_REDUCTION_SCALE: i32 = 3;
 const INTERNAL_REDUCTION_DEPTH: i32 = 4;
 const SINGULAR_DEPTH: i32 = 8;
 const SINGULAR_TABLE_DEPTH_MARGIN: i32 = 3;
@@ -78,7 +92,7 @@ static REDUCTIONS: LazyLock<[[i32; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE]>
         for (depth, row) in table.iter_mut().enumerate().skip(1) {
             for (move_number, reduction) in row.iter_mut().enumerate().skip(1) {
                 let scaled = (depth as f64).ln() * (move_number as f64).ln() / 2.25;
-                *reduction = (0.75 + scaled) as i32;
+                *reduction = ((0.75 + scaled) * f64::from(REDUCTION_GRAIN)) as i32;
             }
         }
         table
@@ -184,6 +198,7 @@ pub struct Searcher {
     eval_stack: [i32; MAX_PLY],
     excluded: [Move; MAX_PLY],
     killers: [[Move; 2]; MAX_PLY],
+    cutoff_counts: [u32; MAX_PLY + 2],
     history: History,
     played: [Option<PieceTo>; MAX_PLY],
     root_move_nodes: Box<RootMoveNodes>,
@@ -303,6 +318,7 @@ impl Searcher {
             eval_stack: [-INFINITY; MAX_PLY],
             excluded: [Move::NULL; MAX_PLY],
             killers: [[Move::NULL; 2]; MAX_PLY],
+            cutoff_counts: [0; MAX_PLY + 2],
             history: History::default(),
             played: [None; MAX_PLY],
             root_move_nodes: Box::new([[0; SQUARES]; SQUARES]),
@@ -882,6 +898,10 @@ impl Searcher {
             return 0;
         }
         self.killers[self.ply + 1] = [Move::NULL; 2];
+        self.cutoff_counts[self.ply + 2] = 0;
+        if is_root {
+            self.cutoff_counts[1] = 0;
+        }
         let excluded = self.excluded[self.ply];
         let singular_search = excluded != Move::NULL;
 
@@ -940,6 +960,9 @@ impl Searcher {
         let us = board.state.active_color;
         let unrefined_eval = (!in_check).then(|| self.cached_static_evaluation(board, hit));
         let corrected_eval = unrefined_eval.map(|eval| self.corrected_evaluation(board, eval));
+        let correction_magnitude = corrected_eval
+            .zip(unrefined_eval)
+            .map_or(0, |(corrected, raw)| (corrected - raw).abs());
         let static_eval =
             corrected_eval.map_or(-INFINITY, |eval| hit.map_or(eval, |hit| hit.refine(eval)));
         self.eval_stack[self.ply] = corrected_eval.unwrap_or(-INFINITY);
@@ -1094,33 +1117,61 @@ impl Searcher {
                 -self.negamax(board, new_depth, -beta, -alpha, !is_pv && !cut_node)
             } else {
                 let gives_check = board.in_check();
-                let mut reduction = 0;
+                let mut reduced_depth = new_depth;
                 if depth >= REDUCTION_DEPTH {
-                    reduction = late_move_reduction(depth, legal_moves as usize);
+                    let mut reduction = late_move_reduction(depth, legal_moves as usize);
                     if is_quiet {
-                        reduction -= i32::from(self.killers[self.ply - 1].contains(&candidate));
-                        reduction += i32::from(hash_move_is_noisy);
-                        reduction -= move_history / REDUCTION_HISTORY_DIVISOR;
-                        reduction -= i32::from(escapes_threat);
+                        if self.killers[self.ply - 1].contains(&candidate) {
+                            reduction -= KILLER_REDUCTION_DISCOUNT;
+                        }
+                        if hash_move_is_noisy {
+                            reduction += NOISY_HASH_MOVE_REDUCTION;
+                        }
+                        if escapes_threat {
+                            reduction -= THREAT_ESCAPE_REDUCTION_DISCOUNT;
+                        }
+                        reduction -= move_history / QUIET_REDUCTION_HISTORY_DIVISOR;
                     } else {
                         reduction -= NOISY_REDUCTION_DISCOUNT;
                         reduction -= move_history / NOISY_REDUCTION_HISTORY_DIVISOR;
                     }
-                    reduction -= i32::from(is_pv);
-                    reduction -= i32::from(was_pv);
-                    reduction += i32::from(!improving);
-                    reduction -= i32::from(gives_check);
-                    reduction = reduction.clamp(0, (new_depth - 1).max(0));
+                    if is_pv {
+                        reduction -= PV_REDUCTION_DISCOUNT;
+                    }
+                    if was_pv {
+                        reduction -= WAS_PV_REDUCTION_DISCOUNT;
+                        if hit.is_some_and(|hit| hit.score > alpha) {
+                            reduction -= PV_HASH_SCORE_ABOVE_ALPHA_DISCOUNT;
+                        }
+                        if hit.is_some_and(|hit| i32::from(hit.depth) >= depth) {
+                            reduction -= PV_HASH_DEPTH_DISCOUNT;
+                        }
+                    }
+                    if cut_node && !was_pv {
+                        reduction += CUT_NODE_REDUCTION;
+                    }
+                    if !improving {
+                        reduction += NOT_IMPROVING_REDUCTION;
+                    }
+                    if gives_check {
+                        reduction -= CHECK_REDUCTION_DISCOUNT;
+                    }
+                    if self.cutoff_counts[self.ply] > CHILD_CUTOFFS_THRESHOLD {
+                        reduction += CHILD_CUTOFFS_REDUCTION;
+                    }
+                    reduction -= CORRECTION_REDUCTION_SCALE * correction_magnitude;
+                    reduced_depth =
+                        (new_depth - reduction / REDUCTION_GRAIN).clamp(1, new_depth + 1);
                 }
                 let child_cut_node = is_pv || !cut_node;
                 let mut score = -self.negamax(
                     board,
-                    new_depth - reduction,
+                    reduced_depth,
                     -alpha - 1,
                     -alpha,
                     child_cut_node,
                 );
-                if !self.stopped && score > alpha && reduction > 0 {
+                if !self.stopped && score > alpha && reduced_depth < new_depth {
                     score = -self.negamax(board, new_depth, -alpha - 1, -alpha, child_cut_node);
                 }
                 if !self.stopped && score > alpha && score < beta {
@@ -1143,6 +1194,7 @@ impl Searcher {
                 best_move = candidate;
                 self.update_pv(candidate);
                 if alpha >= beta {
+                    self.cutoff_counts[self.ply] += 1;
                     self.reward_cutoff(
                         board,
                         threats.all,
