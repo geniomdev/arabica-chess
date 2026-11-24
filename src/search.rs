@@ -68,6 +68,15 @@ const PV_DOUBLE_EXTENSION_MARGIN: i32 = 200;
 const PV_TRIPLE_EXTENSION_MARGIN: i32 = 288;
 const QUIET_EXTENSION_MARGIN_DISCOUNT: i32 = 16;
 const NEGATIVE_EXTENSION: i32 = -2;
+const STRONG_CUTOFF_MARGIN: i32 = 80;
+const PRIOR_FAIL_LOW_GRAIN: i32 = 128;
+const PRIOR_FAIL_LOW_BASE_FACTOR: i32 = 96;
+const PRIOR_FAIL_LOW_DEEP_FACTOR: i32 = 128;
+const PRIOR_FAIL_LOW_DEEP_DEPTH: i32 = 5;
+const PRIOR_FAIL_LOW_EVAL_FACTOR: i32 = 128;
+const PRIOR_FAIL_LOW_EVAL_MARGIN: i32 = 100;
+const EVAL_SWING_HISTORY_SCALE: i32 = 16;
+const EVAL_SWING_HISTORY_RANGE: (i32, i32) = (-320, 800);
 const PROBCUT_DEPTH: i32 = 5;
 const PROBCUT_MARGIN: i32 = 200;
 const PROBCUT_REDUCTION: i32 = 4;
@@ -214,6 +223,7 @@ pub struct Searcher {
     cutoff_counts: [u32; MAX_PLY + 2],
     history: History,
     played: [Option<PieceTo>; MAX_PLY],
+    threats_at: [Bitboard; MAX_PLY],
     root_move_nodes: Box<RootMoveNodes>,
     tablebases: Option<Arc<Tablebases>>,
     tablebase_root_moves: Vec<Move>,
@@ -335,6 +345,7 @@ impl Searcher {
             cutoff_counts: [0; MAX_PLY + 2],
             history: History::default(),
             played: [None; MAX_PLY],
+            threats_at: [Bitboard::default(); MAX_PLY],
             root_move_nodes: Box::new([[0; SQUARES]; SQUARES]),
             tablebases: None,
             tablebase_root_moves: Vec::new(),
@@ -757,11 +768,63 @@ impl Searcher {
     }
 
     fn continuations(&self) -> Continuations {
+        self.continuations_at(self.ply)
+    }
+
+    fn continuations_at(&self, ply: usize) -> Continuations {
         std::array::from_fn(|plies_back| {
-            self.ply
-                .checked_sub(plies_back + 1)
-                .and_then(|ply| self.played[ply])
+            ply.checked_sub(plies_back + 1)
+                .and_then(|earlier| self.played[earlier])
         })
+    }
+
+    fn prior_quiet(&self, board: &Board) -> Option<(Move, PieceTo, usize)> {
+        let parent = self.ply.checked_sub(1)?;
+        let prior = board.state.played_move;
+        if prior == Move::NULL || prior.is_noisy() {
+            return None;
+        }
+        Some((prior, self.played[parent]?, parent))
+    }
+
+    fn reward_prior_quiet(&mut self, board: &Board, bonus: i32) {
+        if let Some((prior, moved, parent)) = self.prior_quiet(board) {
+            let continuations = self.continuations_at(parent);
+            self.history
+                .update_quiet(prior, moved, continuations, self.threats_at[parent], bonus);
+        }
+    }
+
+    fn reward_prior_quiet_by_eval_swing(&mut self, board: &Board, corrected_eval: i32) {
+        let Some(parent) = self.ply.checked_sub(1) else {
+            return;
+        };
+        let parent_eval = self.eval_stack[parent];
+        if parent_eval == -INFINITY {
+            return;
+        }
+        if let Some((prior, moved, parent)) = self.prior_quiet(board) {
+            let (lowest, highest) = EVAL_SWING_HISTORY_RANGE;
+            let bonus =
+                (-EVAL_SWING_HISTORY_SCALE * (corrected_eval + parent_eval)).clamp(lowest, highest);
+            self.history
+                .update_butterfly(prior, moved.side, self.threats_at[parent], bonus);
+        }
+    }
+
+    fn reward_hash_cutoff(&mut self, board: &Board, hash_move: Move, depth: i32) {
+        if hash_move.is_noisy() || !board.is_pseudo_legal(hash_move) {
+            return;
+        }
+        let moved = moved_piece(board, hash_move);
+        let continuations = self.continuations();
+        self.history.update_quiet(
+            hash_move,
+            moved,
+            continuations,
+            board.threats().all,
+            history_bonus(depth),
+        );
     }
 
     fn reward_cutoff(
@@ -937,6 +1000,11 @@ impl Searcher {
             .filter(|_| !is_pv && !singular_search)
             .and_then(|hit| hit.cutoff_score(table_depth(depth), alpha, beta))
         {
+            if score >= beta
+                && let Some(hash_move) = hit.and_then(|hit| hit.best_move)
+            {
+                self.reward_hash_cutoff(board, hash_move, depth);
+            }
             return score;
         }
         let was_pv = is_pv || hit.is_some_and(|hit| hit.was_pv);
@@ -992,6 +1060,9 @@ impl Searcher {
         let static_eval =
             corrected_eval.map_or(-INFINITY, |eval| hit.map_or(eval, |hit| hit.refine(eval)));
         self.eval_stack[self.ply] = corrected_eval.unwrap_or(-INFINITY);
+        if !singular_search && let Some(eval) = corrected_eval {
+            self.reward_prior_quiet_by_eval_swing(board, eval);
+        }
         let improving = self.improving(corrected_eval);
         let prunable = !is_pv && !in_check && !singular_search;
 
@@ -1057,6 +1128,7 @@ impl Searcher {
 
         let continuations = self.continuations();
         let threats = board.threats();
+        self.threats_at[self.ply] = threats.all;
         let mut picker = MovePicker::new(hash_move, self.killers[self.ply]);
         let hash_move_is_noisy = hash_move.is_some_and(Move::is_noisy);
 
@@ -1228,7 +1300,7 @@ impl Searcher {
                         candidate,
                         &tried_quiets[..tried_quiet_count],
                         &tried_noisy[..tried_noisy_count],
-                        depth,
+                        depth + i32::from(score > beta + STRONG_CUTOFF_MARGIN),
                     );
                     break;
                 }
@@ -1259,6 +1331,15 @@ impl Searcher {
         } else {
             Bound::Exact
         };
+        if !is_root && legal_moves > 0 && bound == Bound::Upper {
+            let deep = depth > PRIOR_FAIL_LOW_DEEP_DEPTH;
+            let far_below_eval =
+                corrected_eval.is_some_and(|eval| score <= eval - PRIOR_FAIL_LOW_EVAL_MARGIN);
+            let factor = PRIOR_FAIL_LOW_BASE_FACTOR
+                + PRIOR_FAIL_LOW_DEEP_FACTOR * i32::from(deep)
+                + PRIOR_FAIL_LOW_EVAL_FACTOR * i32::from(far_below_eval);
+            self.reward_prior_quiet(board, history_bonus(depth) * factor / PRIOR_FAIL_LOW_GRAIN);
+        }
         if let (Some(raw_eval), Some(corrected_eval)) = (unrefined_eval, corrected_eval) {
             let quiet_best = best_move == Move::NULL || !best_move.is_noisy();
             let consistent = match bound {

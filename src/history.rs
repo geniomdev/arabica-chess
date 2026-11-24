@@ -125,6 +125,13 @@ impl History {
         }
     }
 
+    pub fn update_butterfly(&mut self, quiet: Move, side: Color, threats: Bitboard, bonus: i32) {
+        apply_gravity(
+            &mut self.butterfly[butterfly_index(side, quiet, threats)],
+            bonus,
+        );
+    }
+
     pub fn update_capture(&mut self, moved: PieceTo, victim: Option<Piece>, bonus: i32) {
         apply_gravity(&mut self.capture[capture_index(moved, victim)], bonus);
     }
