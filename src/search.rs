@@ -60,9 +60,14 @@ const PV_HASH_SCORE_ABOVE_ALPHA_DISCOUNT: i32 = 512;
 const PV_HASH_DEPTH_DISCOUNT: i32 = 512;
 const CORRECTION_REDUCTION_SCALE: i32 = 3;
 const INTERNAL_REDUCTION_DEPTH: i32 = 4;
-const SINGULAR_DEPTH: i32 = 8;
+const SINGULAR_DEPTH: i32 = 6;
 const SINGULAR_TABLE_DEPTH_MARGIN: i32 = 3;
-const SINGULAR_BETA_MARGIN: i32 = 2;
+const DOUBLE_EXTENSION_MARGIN: i32 = 0;
+const TRIPLE_EXTENSION_MARGIN: i32 = 32;
+const PV_DOUBLE_EXTENSION_MARGIN: i32 = 200;
+const PV_TRIPLE_EXTENSION_MARGIN: i32 = 288;
+const QUIET_EXTENSION_MARGIN_DISCOUNT: i32 = 16;
+const NEGATIVE_EXTENSION: i32 = -2;
 const PROBCUT_DEPTH: i32 = 5;
 const PROBCUT_MARGIN: i32 = 200;
 const PROBCUT_REDUCTION: i32 = 4;
@@ -130,6 +135,13 @@ pub struct SharedSearch {
     counters: Counters,
 }
 
+#[derive(Clone, Copy)]
+struct NodeKind {
+    is_pv: bool,
+    was_pv: bool,
+    cut_node: bool,
+}
+
 #[derive(Clone)]
 struct Completed {
     depth: u8,
@@ -190,6 +202,7 @@ pub struct Searcher {
     flushed_tablebase_hits: u64,
     completed: Option<Completed>,
     ply: usize,
+    root_depth: i32,
     stopped: bool,
     first_iteration_completed: bool,
     eval_noise: EvalNoise,
@@ -310,6 +323,7 @@ impl Searcher {
             flushed_tablebase_hits: 0,
             completed: None,
             ply: 0,
+            root_depth: 0,
             stopped: false,
             first_iteration_completed: false,
             eval_noise: EvalNoise::default(),
@@ -615,6 +629,7 @@ impl Searcher {
     }
 
     fn aspiration_search(&mut self, board: &mut Board, depth: i32, previous_score: i32) -> i32 {
+        self.root_depth = depth;
         if depth < ASPIRATION_DEPTH || is_mate_score(previous_score) {
             return self.negamax(board, depth, -INFINITY, INFINITY, false);
         }
@@ -849,24 +864,35 @@ impl Searcher {
         hit: Hit,
         depth: i32,
         beta: i32,
-        cut_node: bool,
+        node: NodeKind,
     ) -> Result<i32, i32> {
-        let singular_beta = hit.score - SINGULAR_BETA_MARGIN * depth;
+        let pv_tracked_non_pv = node.was_pv && !node.is_pv;
+        let singular_beta = hit.score - depth - depth * i32::from(pv_tracked_non_pv);
+        let singular_depth = (depth - 1) / 2;
         self.excluded[self.ply] = candidate;
         let score = self.negamax(
             board,
-            (depth - 1) / 2,
+            singular_depth,
             singular_beta - 1,
             singular_beta,
-            cut_node,
+            node.cut_node,
         );
         self.excluded[self.ply] = Move::NULL;
         if score < singular_beta {
-            Ok(1)
-        } else if singular_beta >= beta {
-            Err(singular_beta)
-        } else if hit.score >= beta {
-            Ok(-1)
+            let quiet_discount = QUIET_EXTENSION_MARGIN_DISCOUNT * i32::from(!candidate.is_noisy());
+            let (double_margin, triple_margin) = if node.is_pv {
+                (PV_DOUBLE_EXTENSION_MARGIN, PV_TRIPLE_EXTENSION_MARGIN)
+            } else {
+                (DOUBLE_EXTENSION_MARGIN, TRIPLE_EXTENSION_MARGIN)
+            };
+            Ok(
+                1 + i32::from(score < singular_beta - double_margin + quiet_discount)
+                    + i32::from(score < singular_beta - triple_margin + quiet_discount),
+            )
+        } else if score >= beta && !is_decisive(score) {
+            Err((score * singular_depth + beta) / (singular_depth + 1))
+        } else if hit.score >= beta || node.cut_node {
+            Ok(NEGATIVE_EXTENSION)
         } else {
             Ok(0)
         }
@@ -1092,13 +1118,19 @@ impl Searcher {
             if let Some(hit) = hit
                 && !is_root
                 && !singular_search
-                && depth >= SINGULAR_DEPTH
+                && depth >= SINGULAR_DEPTH + i32::from(was_pv)
+                && (self.ply as i32) < 2 * self.root_depth
                 && Some(candidate) == hash_move
                 && hit.bound != Bound::Upper
                 && i32::from(hit.depth) >= depth - SINGULAR_TABLE_DEPTH_MARGIN
-                && !is_mate_score(hit.score)
+                && !is_decisive(hit.score)
             {
-                match self.singular_extension(board, candidate, hit, depth, beta, cut_node) {
+                let node = NodeKind {
+                    is_pv,
+                    was_pv,
+                    cut_node,
+                };
+                match self.singular_extension(board, candidate, hit, depth, beta, node) {
                     _ if self.stopped => return 0,
                     Ok(singular_extension) => extension = singular_extension,
                     Err(multi_cut_score) => return multi_cut_score,
@@ -1164,13 +1196,8 @@ impl Searcher {
                         (new_depth - reduction / REDUCTION_GRAIN).clamp(1, new_depth + 1);
                 }
                 let child_cut_node = is_pv || !cut_node;
-                let mut score = -self.negamax(
-                    board,
-                    reduced_depth,
-                    -alpha - 1,
-                    -alpha,
-                    child_cut_node,
-                );
+                let mut score =
+                    -self.negamax(board, reduced_depth, -alpha - 1, -alpha, child_cut_node);
                 if !self.stopped && score > alpha && reduced_depth < new_depth {
                     score = -self.negamax(board, new_depth, -alpha - 1, -alpha, child_cut_node);
                 }
