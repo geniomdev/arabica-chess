@@ -68,6 +68,9 @@ const PV_DOUBLE_EXTENSION_MARGIN: i32 = 200;
 const PV_TRIPLE_EXTENSION_MARGIN: i32 = 288;
 const QUIET_EXTENSION_MARGIN_DISCOUNT: i32 = 16;
 const NEGATIVE_EXTENSION: i32 = -2;
+const DEEPER_RESEARCH_MARGIN: i32 = 40;
+const DEEPER_RESEARCH_DEPTH_SCALE: i32 = 2;
+const SHALLOWER_RESEARCH_MARGIN: i32 = 10;
 const STRONG_CUTOFF_MARGIN: i32 = 80;
 const PRIOR_FAIL_LOW_GRAIN: i32 = 128;
 const PRIOR_FAIL_LOW_BASE_FACTOR: i32 = 96;
@@ -1270,11 +1273,19 @@ impl Searcher {
                 let child_cut_node = is_pv || !cut_node;
                 let mut score =
                     -self.negamax(board, reduced_depth, -alpha - 1, -alpha, child_cut_node);
+                let mut full_depth = new_depth;
                 if !self.stopped && score > alpha && reduced_depth < new_depth {
-                    score = -self.negamax(board, new_depth, -alpha - 1, -alpha, child_cut_node);
+                    let deeper_margin =
+                        DEEPER_RESEARCH_MARGIN + DEEPER_RESEARCH_DEPTH_SCALE * new_depth;
+                    full_depth += i32::from(score > best_score + deeper_margin);
+                    full_depth -= i32::from(score < best_score + SHALLOWER_RESEARCH_MARGIN);
+                    if full_depth > reduced_depth {
+                        score =
+                            -self.negamax(board, full_depth, -alpha - 1, -alpha, child_cut_node);
+                    }
                 }
                 if !self.stopped && score > alpha && score < beta {
-                    score = -self.negamax(board, new_depth, -beta, -alpha, false);
+                    score = -self.negamax(board, full_depth, -beta, -alpha, false);
                 }
                 score
             };
