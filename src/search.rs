@@ -38,6 +38,7 @@ const LATE_MOVE_PRUNING_DEPTH: i32 = 8;
 const FUTILITY_DEPTH: i32 = 6;
 const FUTILITY_BASE: i32 = 100;
 const FUTILITY_MARGIN: i32 = 100;
+const FUTILITY_HISTORY_DIVISOR: i32 = 128;
 const NOISY_SEE_DEPTH: i32 = 6;
 const NOISY_SEE_MARGIN: i32 = 100;
 const REDUCTION_DEPTH: i32 = 3;
@@ -1166,8 +1167,15 @@ impl Searcher {
                         continue;
                     }
                     if !board.gives_check(candidate) {
-                        let futile = depth <= FUTILITY_DEPTH
-                            && static_eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha;
+                        let reduction = late_move_reduction(depth, legal_moves as usize + 1)
+                            - move_history / QUIET_REDUCTION_HISTORY_DIVISOR;
+                        let lmr_depth = (depth - 1 - reduction / REDUCTION_GRAIN).max(0);
+                        let futile = lmr_depth <= FUTILITY_DEPTH
+                            && static_eval
+                                + FUTILITY_BASE
+                                + FUTILITY_MARGIN * lmr_depth
+                                + move_history / FUTILITY_HISTORY_DIVISOR
+                                <= alpha;
                         if futile {
                             continue;
                         }

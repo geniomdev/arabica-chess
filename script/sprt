@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 
 if [ $# -lt 2 ]; then
   echo "usage: script/sprt <new engine> <base engine> [elo0] [elo1]" >&2
-  echo "env:   TC=8+0.08 HASH=16 CONCURRENCY=10 BOOK=data/UHO_Lichess_4852_v1.epd" >&2
+  echo "env:   TC=8+0.08 HASH=16 CONCURRENCY=11 BOOK=data/UHO_Lichess_4852_v1.epd" >&2
   exit 1
 fi
 
@@ -13,7 +13,7 @@ elo0=${3:-0}
 elo1=${4:-5}
 tc=${TC:-8+0.08}
 hash=${HASH:-16}
-concurrency=${CONCURRENCY:-10}
+concurrency=${CONCURRENCY:-11}
 book=${BOOK:-$root/data/UHO_Lichess_4852_v1.epd}
 fastchess=${FASTCHESS:-$root/bin/fastchess}
 
