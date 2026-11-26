@@ -139,6 +139,10 @@ mod tests {
             "3r3k/4P3/8/8/8/8/8/K7 w - - 0 1",
             "k7/8/8/8/8/8/3p4/4R2K b - - 0 1",
             "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+            "4k3/8/8/8/8/8/8/qRK4R w KQ - 0 1",
+            "1r4kr/8/8/8/8/8/8/1R4KR w KQkq - 0 1",
+            "rk5r/8/8/8/8/8/8/RK5R b KQkq - 0 1",
+            "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w KQkq - 2 9",
         ];
 
         for fen in fens {

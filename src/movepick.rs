@@ -14,7 +14,7 @@ pub fn moved_piece(board: &Board, candidate: Move) -> PieceTo {
         piece: board
             .piece_on(candidate.from())
             .expect("piece on origin square"),
-        to: candidate.to(),
+        to: candidate.landing(),
     }
 }
 

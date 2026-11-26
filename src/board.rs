@@ -1,3 +1,4 @@
+mod castling;
 mod check;
 mod fen;
 mod makemove;
@@ -19,6 +20,7 @@ use crate::types::{
     Bitboard, CastlingRights, Color, EveryPiece, EverySide, EverySquare, FILES, Move, Piece, RANKS,
     SIDES, Square,
 };
+use castling::CastlingSetup;
 
 pub const MAX_GAME_MOVES: usize = 2048;
 
@@ -55,6 +57,7 @@ pub struct Board {
     colors: EverySide<Bitboard>,
     mailbox: EverySquare<Option<Piece>>,
     nnue: AccumulatorStack,
+    castling_setup: CastlingSetup,
     pub state: GameState,
     pub history: Vec<GameState>,
 }
@@ -66,6 +69,7 @@ impl Board {
             colors: EverySide::new(Bitboard::empty()),
             mailbox: EverySquare::new(None),
             nnue: AccumulatorStack::new(),
+            castling_setup: CastlingSetup::new(),
             state: GameState::new(),
             history: Vec::with_capacity(MAX_GAME_MOVES),
         }
@@ -200,6 +204,7 @@ impl PartialEq for Board {
         self.pieces == other.pieces
             && self.colors == other.colors
             && self.mailbox == other.mailbox
+            && self.castling_setup == other.castling_setup
             && self.state == other.state
             && self.history == other.history
     }

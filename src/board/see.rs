@@ -35,7 +35,7 @@ pub const fn see_value(piece: Piece) -> i32 {
 
 impl Board {
     pub fn see(&self, played: Move, threshold: i32) -> bool {
-        if matches!(played.kind(), MoveKind::KingCastle | MoveKind::QueenCastle) {
+        if played.is_castle() {
             return threshold <= 0;
         }
         let (from, to) = (played.from(), played.to());

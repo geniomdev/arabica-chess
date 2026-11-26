@@ -25,7 +25,7 @@ mod tests {
 
     #[test]
     fn matches_reference_counts() {
-        let cases: [(&str, &[u64]); 5] = [
+        let cases: [(&str, &[u64]); 10] = [
             (START_POSITION, &[20, 400, 8_902, 197_281]),
             (KIWIPETE, &[48, 2_039, 97_862]),
             (
@@ -40,6 +40,17 @@ mod tests {
                 "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
                 &[44, 1_486, 62_379],
             ),
+            (
+                "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9",
+                &[21, 528, 12_189],
+            ),
+            (
+                "2nnrbkr/p1qppppp/8/1ppb4/6PP/3PP3/PPP2P2/BQNNRBKR w HEhe - 1 9",
+                &[21, 807, 18_002],
+            ),
+            ("4k3/8/8/8/8/8/8/qRK4R w BH - 0 1", &[16, 265, 5_087]),
+            ("1r4kr/8/8/8/8/8/8/1R4KR w BHbh - 0 1", &[24, 479, 10_954]),
+            ("rk5r/8/8/8/8/8/8/RK5R w AHah - 0 1", &[24, 479, 11_099]),
         ];
 
         for (fen, expected) in cases {

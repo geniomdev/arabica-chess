@@ -136,10 +136,7 @@ impl Board {
         let allies = self.occupied_by(side);
         let enemies = self.occupied_by(side.opponent());
         let occupancy = allies | enemies;
-        let castles = matches!(
-            candidate.kind(),
-            MoveKind::KingCastle | MoveKind::QueenCastle
-        );
+        let castles = candidate.is_castle();
         if piece == Piece::Pawn || castles {
             let mut moves = MoveList::new();
             if piece == Piece::Pawn {
@@ -164,11 +161,14 @@ impl Board {
     pub fn parse_move(&self, notation: &str) -> Option<Move> {
         let mut moves = MoveList::new();
         self.generate_pseudo_legal(&mut moves);
-        moves
-            .as_slice()
-            .iter()
-            .copied()
-            .find(|candidate| candidate.to_string() == notation)
+        let moves = moves.as_slice();
+        let spelled = |chess960: bool| {
+            moves
+                .iter()
+                .copied()
+                .find(|candidate| candidate.uci(chess960).to_string() == notation)
+        };
+        spelled(true).or_else(|| spelled(false))
     }
 
     pub fn is_legal(&mut self, candidate: Move) -> bool {
@@ -278,24 +278,24 @@ impl Board {
     }
 
     fn generate_castling(&self, moves: &mut MoveList, side: Color, occupancy: Bitboard) {
-        let (base, king_side, queen_side) = match side {
-            Color::White => (0, CastlingRights::WHITE_KING, CastlingRights::WHITE_QUEEN),
-            Color::Black => (56, CastlingRights::BLACK_KING, CastlingRights::BLACK_QUEEN),
-        };
-        let enemy = side.opponent();
-        let square = |file: u8| Square::from_index(base + file);
-        let is_free = |files: &[u8]| files.iter().all(|&file| !occupancy.contains(square(file)));
-        let is_safe = |files: &[u8]| {
-            files
-                .iter()
-                .all(|&file| !self.is_attacked(square(file), enemy, occupancy))
-        };
-
-        if self.state.castling.has(king_side) && is_free(&[5, 6]) && is_safe(&[4, 5, 6]) {
-            moves.push(Move::new(square(4), square(6), MoveKind::KingCastle));
-        }
-        if self.state.castling.has(queen_side) && is_free(&[1, 2, 3]) && is_safe(&[2, 3, 4]) {
-            moves.push(Move::new(square(4), square(2), MoveKind::QueenCastle));
+        for right in [
+            CastlingRights::king_side(side),
+            CastlingRights::queen_side(side),
+        ] {
+            if !self.state.castling.has(right) {
+                continue;
+            }
+            let path = self.castling_setup.path(right);
+            if !(occupancy & path.must_be_empty).is_empty() {
+                continue;
+            }
+            let safe_path = path
+                .king_path
+                .into_iter()
+                .all(|square| !self.is_attacked(square, side.opponent(), occupancy));
+            if safe_path {
+                moves.push(path.castle);
+            }
         }
     }
 }
@@ -371,22 +371,52 @@ mod tests {
                 "e4d3",
                 MoveKind::EnPassant,
             ),
-            (BOTH_CASTLES, "e1g1", MoveKind::KingCastle),
-            (BOTH_CASTLES, "e1c1", MoveKind::QueenCastle),
+            (BOTH_CASTLES, "e1h1", MoveKind::KingCastle),
+            (BOTH_CASTLES, "e1a1", MoveKind::QueenCastle),
             (
                 "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
-                "e8g8",
+                "e8h8",
                 MoveKind::KingCastle,
             ),
             (
                 "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
-                "e8c8",
+                "e8a8",
                 MoveKind::QueenCastle,
             ),
-            (F1_ATTACKED, "e1c1", MoveKind::QueenCastle),
+            (F1_ATTACKED, "e1a1", MoveKind::QueenCastle),
             (
                 "4k3/8/8/8/8/8/1r6/R3K2R w KQ - 0 1",
-                "e1c1",
+                "e1a1",
+                MoveKind::QueenCastle,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/6KR w K - 0 1",
+                "g1h1",
+                MoveKind::KingCastle,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/RK6 w Q - 0 1",
+                "b1a1",
+                MoveKind::QueenCastle,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/1RK5 w Q - 0 1",
+                "c1b1",
+                MoveKind::QueenCastle,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/KR6 w K - 0 1",
+                "a1b1",
+                MoveKind::KingCastle,
+            ),
+            (
+                "1r4kr/8/8/8/8/8/8/1R4KR b kq - 0 1",
+                "g8b8",
+                MoveKind::QueenCastle,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/qRK4R w Q - 0 1",
+                "c1b1",
                 MoveKind::QueenCastle,
             ),
         ];
@@ -404,13 +434,33 @@ mod tests {
     fn omits_moves() {
         let cases = [
             (WHITE_EN_PASSANT, "e5d6", MoveKind::EnPassant),
-            (F1_ATTACKED, "e1g1", MoveKind::KingCastle),
-            (KING_IN_CHECK, "e1g1", MoveKind::KingCastle),
-            (KING_IN_CHECK, "e1c1", MoveKind::QueenCastle),
-            (CASTLING_BLOCKED, "e1g1", MoveKind::KingCastle),
-            (CASTLING_BLOCKED, "e1c1", MoveKind::QueenCastle),
-            (NO_CASTLING_RIGHTS, "e1g1", MoveKind::KingCastle),
-            (NO_CASTLING_RIGHTS, "e1c1", MoveKind::QueenCastle),
+            (F1_ATTACKED, "e1h1", MoveKind::KingCastle),
+            (KING_IN_CHECK, "e1h1", MoveKind::KingCastle),
+            (KING_IN_CHECK, "e1a1", MoveKind::QueenCastle),
+            (CASTLING_BLOCKED, "e1h1", MoveKind::KingCastle),
+            (CASTLING_BLOCKED, "e1a1", MoveKind::QueenCastle),
+            (NO_CASTLING_RIGHTS, "e1h1", MoveKind::KingCastle),
+            (NO_CASTLING_RIGHTS, "e1a1", MoveKind::QueenCastle),
+            (
+                "4k3/8/8/8/8/8/8/5BKR w K - 0 1",
+                "g1h1",
+                MoveKind::KingCastle,
+            ),
+            (
+                "3r3k/8/8/8/8/8/8/1K5R w K - 0 1",
+                "b1h1",
+                MoveKind::KingCastle,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/R2bK3 w Q - 0 1",
+                "e1a1",
+                MoveKind::QueenCastle,
+            ),
+            (
+                "4k3/8/8/8/8/8/8/1RKN4 w Q - 0 1",
+                "c1b1",
+                MoveKind::QueenCastle,
+            ),
         ];
 
         for (fen, notation, kind) in cases {
@@ -422,7 +472,30 @@ mod tests {
         }
     }
 
-    const STAGED_FENS: [&str; 9] = [
+    #[test]
+    fn checks_castling_legality_after_rook_moves() {
+        let cases = [
+            ("4k3/8/8/8/8/8/8/qRK4R w KQ - 0 1", "c1b1", false),
+            ("4k3/8/8/8/8/8/8/qRK4R w KQ - 0 1", "c1h1", true),
+            ("4k3/8/8/8/8/8/8/1RK4R w KQ - 0 1", "c1b1", true),
+            ("4k3/8/8/8/8/8/8/rRK5 w Q - 0 1", "c1b1", false),
+        ];
+
+        for (fen, notation, expected) in cases {
+            let mut position = board(fen);
+            let candidate = position
+                .parse_move(notation)
+                .unwrap_or_else(|| panic!("fen {fen:?}, move {notation} not generated"));
+            assert!(candidate.is_castle(), "fen {fen:?}, move {notation}");
+            assert_eq!(
+                position.is_legal(candidate),
+                expected,
+                "fen {fen:?}, move {notation}"
+            );
+        }
+    }
+
+    const STAGED_FENS: [&str; 11] = [
         START_POSITION,
         KIWIPETE,
         WHITE_EN_PASSANT,
@@ -432,6 +505,8 @@ mod tests {
         "3r3k/4P3/8/8/8/8/8/K7 w - - 0 1",
         "k7/8/8/8/8/8/3p4/4R2K b - - 0 1",
         "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "1r4kr/8/8/8/8/8/8/1R4KR w BHbh - 0 1",
+        "4k3/8/8/8/8/8/8/qRK4R w BH - 0 1",
     ];
 
     fn sorted(mut moves: Vec<Move>) -> Vec<Move> {

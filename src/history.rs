@@ -63,11 +63,11 @@ fn apply_gravity(entry: &mut i32, bonus: i32) {
     *entry += bonus - *entry * bonus.abs() / MAX_HISTORY;
 }
 
-fn butterfly_index(side: Color, quiet: Move, threats: Bitboard) -> usize {
-    let from_threatened = usize::from(threats.contains(quiet.from()));
-    let to_threatened = usize::from(threats.contains(quiet.to()));
+fn butterfly_index(side: Color, from: Square, to: Square, threats: Bitboard) -> usize {
+    let from_threatened = usize::from(threats.contains(from));
+    let to_threatened = usize::from(threats.contains(to));
     let bucket = side.index() * THREAT_BUCKETS + from_threatened * 2 + to_threatened;
-    (bucket * SQUARES + quiet.from().index()) * SQUARES + quiet.to().index()
+    (bucket * SQUARES + from.index()) * SQUARES + to.index()
 }
 
 fn continuation_index(previous: PieceTo, moved: PieceTo) -> usize {
@@ -115,7 +115,8 @@ impl History {
                 previous.map(|previous| table[continuation_index(previous, moved)])
             })
             .sum();
-        self.butterfly[butterfly_index(moved.side, quiet, threats)] + continuation_score
+        self.butterfly[butterfly_index(moved.side, quiet.from(), moved.to, threats)]
+            + continuation_score
     }
 
     pub fn capture_score(&self, moved: PieceTo, victim: Option<Piece>) -> i32 {
@@ -131,7 +132,7 @@ impl History {
         bonus: i32,
     ) {
         apply_gravity(
-            &mut self.butterfly[butterfly_index(moved.side, quiet, threats)],
+            &mut self.butterfly[butterfly_index(moved.side, quiet.from(), moved.to, threats)],
             bonus,
         );
         for (table, previous) in self.continuation.iter_mut().zip(continuations) {
@@ -143,7 +144,7 @@ impl History {
 
     pub fn update_butterfly(&mut self, quiet: Move, side: Color, threats: Bitboard, bonus: i32) {
         apply_gravity(
-            &mut self.butterfly[butterfly_index(side, quiet, threats)],
+            &mut self.butterfly[butterfly_index(side, quiet.from(), quiet.landing(), threats)],
             bonus,
         );
     }

@@ -47,8 +47,9 @@ impl FromStr for Board {
 
         let mut board = Board::new();
         board.parse_placement(fields[0])?;
+        board.validate_placement(fields[0])?;
         board.state.active_color = parse_active_color(fields[1])?;
-        board.state.castling = parse_castling(fields[2])?;
+        board.parse_castling(fields[2])?;
         board.state.en_passant = parse_en_passant(fields[3])?;
         board.state.halfmove_clock = match fields.get(4) {
             Some(text) => text
@@ -64,7 +65,9 @@ impl FromStr for Board {
                 .ok_or_else(|| FenError::FullmoveNumber(text.to_string()))?,
             None => 1,
         };
-        board.validate(&fields)?;
+        if !board.en_passant_matches_placement() {
+            return Err(FenError::EnPassant(fields[3].to_string()));
+        }
         board.state.zobrist_key = board.compute_zobrist_key();
         Ok(board)
     }
@@ -103,57 +106,99 @@ impl Board {
         Ok(())
     }
 
-    fn validate(&self, fields: &[&str]) -> Result<(), FenError> {
-        let placement_error = || FenError::Placement(fields[0].to_string());
-        for side in Color::ALL {
-            if self.pieces_of(side, Piece::King).count() != 1 {
-                return Err(placement_error());
-            }
-        }
-        if !(self.pieces(Piece::Pawn) & BACK_RANKS).is_empty() {
-            return Err(placement_error());
-        }
-        if !self.castling_matches_placement() {
-            return Err(FenError::Castling(fields[2].to_string()));
-        }
-        if !self.en_passant_matches_placement() {
-            return Err(FenError::EnPassant(fields[3].to_string()));
+    fn validate_placement(&self, placement: &str) -> Result<(), FenError> {
+        let single_kings = Color::ALL
+            .into_iter()
+            .all(|side| self.pieces_of(side, Piece::King).count() == 1);
+        if !single_kings || !(self.pieces(Piece::Pawn) & BACK_RANKS).is_empty() {
+            return Err(FenError::Placement(placement.to_string()));
         }
         Ok(())
     }
 
-    fn castling_matches_placement(&self) -> bool {
-        let requirements = [
-            (
-                CastlingRights::WHITE_KING,
-                Color::White,
-                Square::E1,
-                Square::H1,
-            ),
-            (
-                CastlingRights::WHITE_QUEEN,
-                Color::White,
-                Square::E1,
-                Square::A1,
-            ),
-            (
-                CastlingRights::BLACK_KING,
-                Color::Black,
-                Square::E8,
-                Square::H8,
-            ),
-            (
-                CastlingRights::BLACK_QUEEN,
-                Color::Black,
-                Square::E8,
-                Square::A8,
-            ),
-        ];
-        requirements.into_iter().all(|(right, side, king, rook)| {
-            !self.state.castling.has(right)
-                || (self.pieces_of(side, Piece::King).contains(king)
-                    && self.pieces_of(side, Piece::Rook).contains(rook))
-        })
+    fn parse_castling(&mut self, text: &str) -> Result<(), FenError> {
+        if text == "-" {
+            return Ok(());
+        }
+        for symbol in text.chars() {
+            let (right, king, rook) = self
+                .castling_right(symbol)
+                .ok_or_else(|| FenError::Castling(text.to_string()))?;
+            if self.state.castling.has(right) && self.castling_setup.rook(right) != rook {
+                return Err(FenError::Castling(text.to_string()));
+            }
+            self.state.castling.insert(right);
+            self.castling_setup.enable(right, king, rook);
+        }
+        Ok(())
+    }
+
+    fn castling_right(&self, symbol: char) -> Option<(CastlingRights, Square, Square)> {
+        let side = if symbol.is_ascii_uppercase() {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let king = self.king_square(side);
+        if king.rank() != back_rank(side) {
+            return None;
+        }
+        let rooks = self.pieces_of(side, Piece::Rook) & Bitboard::rank(king.rank());
+        let rook_on = |file: u8| {
+            Some(Square::new(file, king.rank())).filter(|&square| rooks.contains(square))
+        };
+        let rook = match symbol.to_ascii_lowercase() {
+            'k' => (king.file() + 1..FILES).rev().find_map(rook_on),
+            'q' => (0..king.file()).find_map(rook_on),
+            file @ 'a'..='h' => rook_on(file as u8 - b'a'),
+            _ => None,
+        }?;
+        let right = if rook.file() > king.file() {
+            CastlingRights::king_side(side)
+        } else {
+            CastlingRights::queen_side(side)
+        };
+        Some((right, king, rook))
+    }
+
+    fn castling_field(&self) -> String {
+        let symbols: String = CastlingRights::SINGLES
+            .into_iter()
+            .filter(|&right| self.state.castling.has(right))
+            .map(|right| self.castling_symbol(right))
+            .collect();
+        if symbols.is_empty() {
+            "-".to_string()
+        } else {
+            symbols
+        }
+    }
+
+    fn castling_symbol(&self, right: CastlingRights) -> char {
+        let side = if right.has(CastlingRights::WHITE_KING.union(CastlingRights::WHITE_QUEEN)) {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let king_side = right == CastlingRights::king_side(side);
+        let rook = self.castling_setup.rook(right);
+        let rooks = self.pieces_of(side, Piece::Rook) & Bitboard::rank(rook.rank());
+        let outermost = rooks.into_iter().all(|other| {
+            if king_side {
+                other.file() <= rook.file()
+            } else {
+                other.file() >= rook.file()
+            }
+        });
+        let symbol = match (outermost, king_side) {
+            (true, true) => 'k',
+            (true, false) => 'q',
+            (false, _) => (b'a' + rook.file()) as char,
+        };
+        match side {
+            Color::White => symbol.to_ascii_uppercase(),
+            Color::Black => symbol,
+        }
     }
 
     fn en_passant_matches_placement(&self) -> bool {
@@ -206,8 +251,17 @@ impl Board {
 
         format!(
             "{placement} {active_color} {} {en_passant} {} {}",
-            self.state.castling, self.state.halfmove_clock, self.state.fullmove_number
+            self.castling_field(),
+            self.state.halfmove_clock,
+            self.state.fullmove_number
         )
+    }
+}
+
+const fn back_rank(side: Color) -> u8 {
+    match side {
+        Color::White => 0,
+        Color::Black => RANKS - 1,
     }
 }
 
@@ -217,24 +271,6 @@ fn parse_active_color(text: &str) -> Result<Color, FenError> {
         "b" => Ok(Color::Black),
         _ => Err(FenError::ActiveColor(text.to_string())),
     }
-}
-
-fn parse_castling(text: &str) -> Result<CastlingRights, FenError> {
-    if text == "-" {
-        return Ok(CastlingRights::NONE);
-    }
-    let mut rights = CastlingRights::NONE;
-    for symbol in text.chars() {
-        let right = match symbol {
-            'K' => CastlingRights::WHITE_KING,
-            'Q' => CastlingRights::WHITE_QUEEN,
-            'k' => CastlingRights::BLACK_KING,
-            'q' => CastlingRights::BLACK_QUEEN,
-            _ => return Err(FenError::Castling(text.to_string())),
-        };
-        rights.insert(right);
-    }
-    Ok(rights)
 }
 
 fn parse_en_passant(text: &str) -> Result<Option<Square>, FenError> {
@@ -262,7 +298,7 @@ pub fn color_flipped_fen(fen: &str) -> String {
     let placement: Vec<String> = fields[0].split('/').rev().map(swap_case).collect();
     let side = if fields[1] == "w" { "b" } else { "w" };
     let mut castling: Vec<char> = swap_case(fields[2]).chars().collect();
-    castling.sort_by_key(|&right| "KQkq-".find(right));
+    castling.sort_by_key(char::is_ascii_lowercase);
     let en_passant = match fields[3].as_bytes() {
         [file, b'3'] => format!("{}6", *file as char),
         [file, b'6'] => format!("{}3", *file as char),
@@ -298,6 +334,10 @@ mod tests {
                 "4k3/8/8/8/8/8/4P3/4K3 b - - 7 40",
                 "4k3/4p3/8/8/8/8/8/4K3 w - - 7 40".to_string(),
             ),
+            (
+                "r3k3/8/8/8/8/8/8/R1R1K3 w Cq - 0 1",
+                "r1r1k3/8/8/8/8/8/8/R3K3 b Qc - 0 1".to_string(),
+            ),
         ];
 
         for (fen, expected) in cases {
@@ -323,6 +363,26 @@ mod tests {
             (
                 "  4k3/8/8/8/8/8/8/4K3   w - - 0 1 ",
                 "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R w HAha - 0 1",
+                "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            ),
+            (
+                "1r4kr/8/8/8/8/8/8/1R4KR w BHbh - 0 1",
+                "1r4kr/8/8/8/8/8/8/1R4KR w KQkq - 0 1",
+            ),
+            (
+                "r3k3/8/8/8/8/8/8/R1R1K3 w qC - 0 1",
+                "r3k3/8/8/8/8/8/8/R1R1K3 w Cq - 0 1",
+            ),
+            (
+                "4k3/8/8/8/8/8/8/R1R1K3 w C - 0 1",
+                "4k3/8/8/8/8/8/8/R1R1K3 w C - 0 1",
+            ),
+            (
+                "4k3/8/8/8/8/8/8/R1K1R1R1 w QE - 0 1",
+                "4k3/8/8/8/8/8/8/R1K1R1R1 w EQ - 0 1",
             ),
         ];
 
@@ -368,6 +428,18 @@ mod tests {
             (
                 &format!("{lone_kings} w K - 0 1"),
                 FenError::Castling("K".to_string()),
+            ),
+            (
+                &format!("{lone_kings} w A - 0 1"),
+                FenError::Castling("A".to_string()),
+            ),
+            (
+                "4k3/8/8/8/8/8/4K3/R7 w Q - 0 1",
+                FenError::Castling("Q".to_string()),
+            ),
+            (
+                "4k3/8/8/8/8/8/8/4K1RR w GK - 0 1",
+                FenError::Castling("GK".to_string()),
             ),
             (
                 &format!("{lone_kings} w - z9 0 1"),

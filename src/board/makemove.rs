@@ -1,22 +1,45 @@
 use crate::attacks::pawn_attacks;
 use crate::board::Board;
 use crate::board::zobrist::{castling_key, en_passant_key, side_key};
-use crate::types::{Color, Move, MoveKind, Piece, Square};
+use crate::types::{Castle, Color, Move, MoveKind, Piece, Square};
 
 pub(super) fn en_passant_victim(target: Square) -> Square {
     Square::from_index(target.raw() ^ 8)
 }
 
-pub(super) fn castling_rook_path(played: Move) -> Option<(Square, Square)> {
-    let king = played.from().raw();
-    match played.kind() {
-        MoveKind::KingCastle => Some((Square::from_index(king + 3), Square::from_index(king + 1))),
-        MoveKind::QueenCastle => Some((Square::from_index(king - 4), Square::from_index(king - 1))),
-        _ => None,
-    }
-}
-
 impl Board {
+    fn relocate_castling_pieces(
+        &mut self,
+        side: Color,
+        (king_from, king_to): (Square, Square),
+        (rook_from, rook_to): (Square, Square),
+    ) {
+        self.remove_piece(side, Piece::King, king_from);
+        self.remove_piece(side, Piece::Rook, rook_from);
+        self.put_piece(side, Piece::King, king_to);
+        self.put_piece(side, Piece::Rook, rook_to);
+    }
+
+    fn make_castle(&mut self, side: Color, castle: Castle) {
+        self.relocate_castling_pieces(
+            side,
+            (castle.king_from, castle.king_to),
+            (castle.rook_from, castle.rook_to),
+        );
+        self.nnue
+            .shift(side, Piece::King, castle.king_from, castle.king_to);
+        self.nnue
+            .shift(side, Piece::Rook, castle.rook_from, castle.rook_to);
+    }
+
+    fn unmake_castle(&mut self, side: Color, castle: Castle) {
+        self.relocate_castling_pieces(
+            side,
+            (castle.king_to, castle.king_from),
+            (castle.rook_to, castle.rook_from),
+        );
+    }
+
     pub fn make_move(&mut self, played: Move) -> bool {
         let us = self.state.active_color;
         let them = us.opponent();
@@ -39,28 +62,28 @@ impl Board {
             }
             _ => None,
         };
-        match played.promotion() {
-            Some(promoted) => {
+        match (Castle::of(played), played.promotion()) {
+            (Some(castle), _) => self.make_castle(us, castle),
+            (None, Some(promoted)) => {
                 self.remove_piece(us, Piece::Pawn, from);
                 self.put_piece(us, promoted, to);
                 self.nnue.remove(us, Piece::Pawn, from);
                 self.nnue.add(us, promoted, to);
             }
-            None => {
+            (None, None) => {
                 self.move_piece(us, moving, from, to);
                 self.nnue.shift(us, moving, from, to);
             }
         }
-        if let Some((rook_from, rook_to)) = castling_rook_path(played) {
-            self.move_piece(us, Piece::Rook, rook_from, rook_to);
-            self.nnue.shift(us, Piece::Rook, rook_from, rook_to);
-        }
 
         let passed = Square::from_index((from.raw() + to.raw()) / 2);
         let capturable = !(pawn_attacks(us, passed) & self.pieces_of(them, Piece::Pawn)).is_empty();
+        let castling = self
+            .castling_setup
+            .rights_after(self.state.castling, from, to);
         let state = &mut self.state;
         state.zobrist_key ^= castling_key(state.castling) ^ en_passant_key(state.en_passant);
-        state.castling = state.castling.after_move(from, to);
+        state.castling = castling;
         state.en_passant = (played.kind() == MoveKind::DoublePush && capturable).then_some(passed);
         state.zobrist_key ^= castling_key(state.castling)
             ^ en_passant_key(state.en_passant)
@@ -113,15 +136,13 @@ impl Board {
         let played = undone.played_move;
         let (from, to) = (played.from(), played.to());
 
-        if let Some((rook_from, rook_to)) = castling_rook_path(played) {
-            self.move_piece(us, Piece::Rook, rook_to, rook_from);
-        }
-        match played.promotion() {
-            Some(promoted) => {
+        match (Castle::of(played), played.promotion()) {
+            (Some(castle), _) => self.unmake_castle(us, castle),
+            (None, Some(promoted)) => {
                 self.remove_piece(us, promoted, to);
                 self.put_piece(us, Piece::Pawn, from);
             }
-            None => {
+            (None, None) => {
                 let moving = self.mailbox[to].expect("piece on target square");
                 self.move_piece(us, moving, to, from);
             }
@@ -149,6 +170,10 @@ mod tests {
             "3r3k/4P3/8/8/8/8/8/K7 w - - 0 1",
             "k7/8/8/8/8/8/3p4/4R2K b - - 0 1",
             "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+            "4k3/8/8/8/8/8/8/qRK4R w KQ - 0 1",
+            "1r4kr/8/8/8/8/8/8/1R4KR w KQkq - 0 1",
+            "rk5r/8/8/8/8/8/8/RK5R b KQkq - 0 1",
+            "bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w KQkq - 2 9",
         ];
 
         for fen in fens {
@@ -221,6 +246,31 @@ mod tests {
                 "3r3k/4P3/8/8/8/8/8/K7 w - - 0 1",
                 "e7d8n",
                 "3N3k/8/8/8/8/8/8/K7 b - - 0 1",
+            ),
+            (
+                "1r4kr/8/8/8/8/8/8/1R4KR w KQkq - 0 1",
+                "g1h1",
+                "1r4kr/8/8/8/8/8/8/1R3RK1 b kq - 1 1",
+            ),
+            (
+                "rk5r/8/8/8/8/8/8/RK5R w KQkq - 0 1",
+                "b1a1",
+                "rk5r/8/8/8/8/8/8/2KR3R b kq - 1 1",
+            ),
+            (
+                "rk5r/8/8/8/8/8/8/RK5R w KQkq - 0 1",
+                "b1c1",
+                "rk5r/8/8/8/8/8/8/R1K4R b kq - 1 1",
+            ),
+            (
+                "1r4kr/8/8/8/8/8/8/1R4KR w KQkq - 0 1",
+                "h1h2",
+                "1r4kr/8/8/8/8/8/7R/1R4K1 b Qkq - 1 1",
+            ),
+            (
+                "1r4kr/8/8/8/8/8/8/1R4KR w KQkq - 0 1",
+                "b1b8",
+                "1R4kr/8/8/8/8/8/8/6KR b Kk - 0 1",
             ),
         ];
 

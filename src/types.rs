@@ -149,6 +149,27 @@ impl Move {
         }
     }
 
+    pub const fn is_castle(self) -> bool {
+        self.flags() >> 1 == MoveKind::KingCastle as u8 >> 1
+    }
+
+    pub const fn landing(self) -> Square {
+        let castled_file = 6 - 4 * (self.flags() & 1);
+        let castled = self.from().raw() & !(FILES - 1) | castled_file;
+        if self.is_castle() {
+            Square::from_index(castled)
+        } else {
+            self.to()
+        }
+    }
+
+    pub const fn uci(self, chess960: bool) -> UciMove {
+        UciMove {
+            played: self,
+            chess960,
+        }
+    }
+
     pub const fn promotion(self) -> Option<Piece> {
         if !self.is_promotion() {
             return None;
@@ -160,15 +181,59 @@ impl Move {
 
 impl std::fmt::Display for Move {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if *self == Self::NULL {
+        self.uci(false).fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UciMove {
+    played: Move,
+    chess960: bool,
+}
+
+impl std::fmt::Display for UciMove {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let played = self.played;
+        if played == Move::NULL {
             return write!(f, "0000");
         }
-        write!(f, "{}{}", self.from(), self.to())?;
-        if self.is_promotion() {
-            let symbol = ['n', 'b', 'r', 'q'][(self.flags() & 3) as usize];
-            write!(f, "{symbol}")?;
+        let to = match Castle::of(played) {
+            Some(castle) if !self.chess960 => castle.king_to,
+            _ => played.to(),
+        };
+        write!(f, "{}{to}", played.from())?;
+        if let Some(promoted) = played.promotion() {
+            write!(f, "{}", promoted.symbol(Color::Black))?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Castle {
+    pub king_from: Square,
+    pub king_to: Square,
+    pub rook_from: Square,
+    pub rook_to: Square,
+}
+
+impl Castle {
+    pub const fn of(played: Move) -> Option<Self> {
+        if !played.is_castle() {
+            return None;
+        }
+        let king_to = played.landing();
+        let rook_to = if played.flags() == MoveKind::KingCastle as u8 {
+            king_to.raw() - 1
+        } else {
+            king_to.raw() + 1
+        };
+        Some(Self {
+            king_from: played.from(),
+            king_to,
+            rook_from: played.to(),
+            rook_to: Square::from_index(rook_to),
+        })
     }
 }
 
@@ -447,6 +512,27 @@ impl CastlingRights {
     pub const ALL: Self =
         Self(Self::WHITE_KING.0 | Self::WHITE_QUEEN.0 | Self::BLACK_KING.0 | Self::BLACK_QUEEN.0);
 
+    pub const SINGLES: [Self; 4] = [
+        Self::WHITE_KING,
+        Self::WHITE_QUEEN,
+        Self::BLACK_KING,
+        Self::BLACK_QUEEN,
+    ];
+
+    pub const fn king_side(side: Color) -> Self {
+        match side {
+            Color::White => Self::WHITE_KING,
+            Color::Black => Self::BLACK_KING,
+        }
+    }
+
+    pub const fn queen_side(side: Color) -> Self {
+        match side {
+            Color::White => Self::WHITE_QUEEN,
+            Color::Black => Self::BLACK_QUEEN,
+        }
+    }
+
     pub const fn has(self, rights: Self) -> bool {
         self.0 & rights.0 != 0
     }
@@ -455,29 +541,23 @@ impl CastlingRights {
         self.0 |= rights.0;
     }
 
+    pub const fn union(self, rights: Self) -> Self {
+        Self(self.0 | rights.0)
+    }
+
+    pub const fn without(self, rights: Self) -> Self {
+        Self(self.0 & !rights.0)
+    }
+
     pub const fn index(self) -> usize {
         self.0 as usize
     }
 
-    pub const fn after_move(self, from: Square, to: Square) -> Self {
-        Self(
-            self.0
-                & CASTLING_KEPT_AFTER_TOUCH[from.index()]
-                & CASTLING_KEPT_AFTER_TOUCH[to.index()],
-        )
+    pub const fn slot(self) -> usize {
+        debug_assert!(self.0.count_ones() == 1);
+        self.0.trailing_zeros() as usize
     }
 }
-
-const CASTLING_KEPT_AFTER_TOUCH: [u8; SQUARES] = {
-    let mut kept = [CastlingRights::ALL.0; SQUARES];
-    kept[0] = !CastlingRights::WHITE_QUEEN.0;
-    kept[4] = !(CastlingRights::WHITE_KING.0 | CastlingRights::WHITE_QUEEN.0);
-    kept[7] = !CastlingRights::WHITE_KING.0;
-    kept[56] = !CastlingRights::BLACK_QUEEN.0;
-    kept[60] = !(CastlingRights::BLACK_KING.0 | CastlingRights::BLACK_QUEEN.0);
-    kept[63] = !CastlingRights::BLACK_KING.0;
-    kept
-};
 
 impl std::fmt::Display for CastlingRights {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

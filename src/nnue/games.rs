@@ -146,7 +146,8 @@ impl Game {
                 let outcome = self.white_outcome.for_side(board.state.active_color);
                 records.push(Record::new(&board, ply.score, outcome));
             }
-            let legal = board.is_pseudo_legal(ply.best_move) && board.make_move(ply.best_move);
+            let played = board.with_castling_rook(ply.best_move);
+            let legal = board.is_pseudo_legal(played) && board.make_move(played);
             if !legal {
                 return Err(invalid_data(format!(
                     "illegal move {} at ply {index} after {:?}",
@@ -419,10 +420,24 @@ mod tests {
         broken.plies.swap(0, 1);
         let mut bad_start = games()[0].clone();
         bad_start.start = "not a fen".to_owned();
+        let castles = game(KIWIPETE, Outcome::Draw, &[("e1g1", 10), ("e8c8", -10)]);
+        let mut legacy_castles = castles.clone();
+        for ply in &mut legacy_castles.plies {
+            let played = ply.best_move;
+            ply.best_move = Move::new(played.from(), played.landing(), played.kind());
+        }
+        let chess960_castles = game(
+            "1r4kr/8/8/8/8/8/8/1R4KR w BHbh - 0 1",
+            Outcome::Draw,
+            &[("g1h1", 10), ("g8h8", -10)],
+        );
         let cases = [
             (games()[0].clone(), true),
             (broken, false),
             (bad_start, false),
+            (castles, true),
+            (legacy_castles, true),
+            (chess960_castles, true),
         ];
 
         for (game, valid) in cases {

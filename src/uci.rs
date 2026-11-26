@@ -62,6 +62,7 @@ struct Engine {
     histories: Vec<History>,
     move_overhead: Duration,
     ponder: bool,
+    chess960: bool,
     limit_strength: bool,
     elo: u32,
     noise_seed: u64,
@@ -80,6 +81,7 @@ impl Engine {
                 .collect(),
             move_overhead: DEFAULT_MOVE_OVERHEAD,
             ponder: false,
+            chess960: false,
             limit_strength: false,
             elo: DEFAULT_ELO,
             noise_seed: fresh_noise_seed(),
@@ -105,6 +107,7 @@ impl Engine {
                     DEFAULT_MOVE_OVERHEAD.as_millis()
                 );
                 println!("option name Ponder type check default false");
+                println!("option name UCI_Chess960 type check default false");
                 println!("option name UCI_LimitStrength type check default false");
                 println!(
                     "option name UCI_Elo type spin default {DEFAULT_ELO} min {MIN_ELO} max {MAX_ELO}"
@@ -140,6 +143,7 @@ impl Engine {
                     }
                     Some(EngineOption::MoveOverhead(overhead)) => self.move_overhead = overhead,
                     Some(EngineOption::Ponder(enabled)) => self.ponder = enabled,
+                    Some(EngineOption::Chess960(enabled)) => self.chess960 = enabled,
                     Some(EngineOption::LimitStrength(enabled)) => self.limit_strength = enabled,
                     Some(EngineOption::Elo(elo)) => self.elo = elo,
                     Some(EngineOption::EvalFile(path)) => self.set_network(path),
@@ -180,7 +184,7 @@ impl Engine {
                 "NNUE evaluation: {:+} cp (side to move)",
                 evaluate(&mut self.board)
             ),
-            ["eval1", ..] => print_move_evaluations(&mut self.board),
+            ["eval1", ..] => print_move_evaluations(&mut self.board, self.chess960),
             ["quit", ..] => return Flow::Quit,
             _ => {}
         }
@@ -189,7 +193,7 @@ impl Engine {
 
     fn go(&mut self, params: GoParams) {
         if let Some(depth) = params.perft {
-            print_perft_divide(&mut self.board, depth);
+            print_perft_divide(&mut self.board, depth, self.chess960);
             return;
         }
         if let Mode::Plies(plies) = self.mode {
@@ -200,6 +204,7 @@ impl Engine {
                     infinite: params.infinite,
                     pondering: params.ponder,
                     announce_ponder_move: false,
+                    chess960: self.chess960,
                 },
             ));
             return;
@@ -236,6 +241,7 @@ impl Engine {
                 infinite: params.infinite,
                 pondering: params.ponder,
                 announce_ponder_move: self.ponder,
+                chess960: self.chess960,
             },
         ));
     }
@@ -300,6 +306,7 @@ struct SearchMode {
     infinite: bool,
     pondering: bool,
     announce_ponder_move: bool,
+    chess960: bool,
 }
 
 struct RunningSearch {
@@ -338,10 +345,13 @@ impl RunningSearch {
                 searcher = searcher.with_tablebases(tablebases);
             }
             let (best_move, _) =
-                searcher.search_with_helpers(&mut board, &mut helpers, print_iteration);
+                searcher.search_with_helpers(&mut board, &mut helpers, |iteration| {
+                    print_iteration(iteration, mode.chess960);
+                });
             wait_for_release(&searcher_stop, &searcher_ponder, mode.infinite);
+            let best_move = best_move.uci(mode.chess960);
             match searcher.ponder_move().filter(|_| mode.announce_ponder_move) {
-                Some(reply) => println!("bestmove {best_move} ponder {reply}"),
+                Some(reply) => println!("bestmove {best_move} ponder {}", reply.uci(mode.chess960)),
                 None => println!("bestmove {best_move}"),
             }
             iter::once(searcher)
@@ -365,21 +375,24 @@ impl RunningSearch {
             let start = Instant::now();
             let result = Minimax::new(&searcher_stop).search(&mut board, plies);
             let pv = [result.best_move];
-            print_iteration(&Iteration {
-                depth: plies,
-                score: result.score,
-                nodes: result.nodes,
-                elapsed: start.elapsed(),
-                pv: if result.best_move == Move::NULL {
-                    &[]
-                } else {
-                    &pv
+            print_iteration(
+                &Iteration {
+                    depth: plies,
+                    score: result.score,
+                    nodes: result.nodes,
+                    elapsed: start.elapsed(),
+                    pv: if result.best_move == Move::NULL {
+                        &[]
+                    } else {
+                        &pv
+                    },
+                    hashfull: 0,
+                    tablebase_hits: 0,
                 },
-                hashfull: 0,
-                tablebase_hits: 0,
-            });
+                mode.chess960,
+            );
             wait_for_release(&searcher_stop, &searcher_ponder, mode.infinite);
-            println!("bestmove {}", result.best_move);
+            println!("bestmove {}", result.best_move.uci(mode.chess960));
             Vec::new()
         });
         Self {
@@ -409,11 +422,11 @@ fn wait_for_release(stop_signal: &AtomicBool, ponder_signal: &AtomicBool, infini
     }
 }
 
-fn print_iteration(iteration: &Iteration) {
+fn print_iteration(iteration: &Iteration, chess960: bool) {
     let pv: String = iteration
         .pv
         .iter()
-        .map(|played| format!(" {played}"))
+        .map(|played| format!(" {}", played.uci(chess960)))
         .collect();
     let pv_section = if pv.is_empty() {
         pv
@@ -432,7 +445,7 @@ fn print_iteration(iteration: &Iteration) {
     );
 }
 
-fn print_perft_divide(board: &mut Board, depth: u32) {
+fn print_perft_divide(board: &mut Board, depth: u32, chess960: bool) {
     let mut moves = MoveList::new();
     board.generate_pseudo_legal(&mut moves);
     let mut total = 0;
@@ -440,7 +453,7 @@ fn print_perft_divide(board: &mut Board, depth: u32) {
         if board.make_move(candidate) {
             let nodes = board.perft(depth.saturating_sub(1));
             board.unmake_move();
-            println!("{candidate}: {nodes}");
+            println!("{}: {nodes}", candidate.uci(chess960));
             total += nodes;
         }
     }
@@ -462,7 +475,7 @@ fn evaluate_moves(board: &mut Board) -> Vec<(Move, i32)> {
     evaluations
 }
 
-fn print_move_evaluations(board: &mut Board) {
+fn print_move_evaluations(board: &mut Board, chess960: bool) {
     let evaluations = evaluate_moves(board);
     if evaluations.is_empty() {
         println!("No legal moves");
@@ -470,6 +483,7 @@ fn print_move_evaluations(board: &mut Board) {
     }
     for (candidate, score) in evaluations {
         board.make_move(candidate);
+        let candidate = candidate.uci(chess960);
         println!("{board}\n\nMove: {candidate}\nNNUE evaluation: {score:+} cp (mover)\n");
         board.unmake_move();
     }
@@ -591,6 +605,7 @@ enum EngineOption {
     Threads(usize),
     MoveOverhead(Duration),
     Ponder(bool),
+    Chess960(bool),
     LimitStrength(bool),
     Elo(u32),
     EvalFile(Option<PathBuf>),
@@ -670,6 +685,7 @@ fn parse_option(arguments: &[&str]) -> Option<EngineOption> {
             Some(EngineOption::MoveOverhead(overhead))
         }
         "ponder" => parse_check(value).map(EngineOption::Ponder),
+        "uci_chess960" => parse_check(value).map(EngineOption::Chess960),
         "uci_limitstrength" => parse_check(value).map(EngineOption::LimitStrength),
         "uci_elo" => {
             let elo: u32 = value.parse().ok()?;
@@ -780,7 +796,20 @@ mod tests {
     #[test]
     fn parses_position_commands() {
         let kiwipete_moves = format!("fen {KIWIPETE} moves e1g1");
-        let cases: [(&str, Result<&str, PositionError>); 9] = [
+        let kiwipete_960_moves = format!("fen {KIWIPETE} moves e1h1");
+        let cases: [(&str, Result<&str, PositionError>); 12] = [
+            (
+                &kiwipete_960_moves,
+                Ok("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R4RK1 b kq - 1 1"),
+            ),
+            (
+                "fen 1r4kr/8/8/8/8/8/8/1R4KR w BHbh - 0 1 moves g1h1 g8h8",
+                Ok("1r3rk1/8/8/8/8/8/8/1R3RK1 w - - 2 2"),
+            ),
+            (
+                "fen 1r4kr/8/8/8/8/8/8/1R4KR w BHbh - 0 1 moves g1g1",
+                Ok("1r4kr/8/8/8/8/8/8/1R3RK1 b kq - 1 1"),
+            ),
             ("startpos", Ok(START_POSITION)),
             (
                 "startpos moves e2e4 e7e5",
@@ -927,6 +956,10 @@ mod tests {
             ("name Ponder value true", Some(EngineOption::Ponder(true))),
             ("name ponder value FALSE", Some(EngineOption::Ponder(false))),
             ("name Ponder value 1", None),
+            (
+                "name UCI_Chess960 value true",
+                Some(EngineOption::Chess960(true)),
+            ),
             (
                 "name UCI_LimitStrength value true",
                 Some(EngineOption::LimitStrength(true)),
