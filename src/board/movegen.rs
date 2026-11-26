@@ -59,12 +59,8 @@ impl MoveList {
         self.len += 1;
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     pub fn as_slice(&self) -> &[Move] {
@@ -140,7 +136,15 @@ impl Board {
         if piece == Piece::Pawn || castles {
             let mut moves = MoveList::new();
             if piece == Piece::Pawn {
-                self.generate_pawn_moves(&mut moves, side, enemies, occupancy, Generation::All);
+                let pawn = Bitboard::from_square(candidate.from());
+                self.generate_pawn_moves(
+                    &mut moves,
+                    side,
+                    pawn,
+                    enemies,
+                    occupancy,
+                    Generation::All,
+                );
             } else if piece == Piece::King {
                 self.generate_castling(&mut moves, side, occupancy);
             }
@@ -201,7 +205,8 @@ impl Board {
             Generation::Quiet => !occupancy,
         };
 
-        self.generate_pawn_moves(moves, side, enemies, occupancy, generation);
+        let pawns = self.pieces_of(side, Piece::Pawn);
+        self.generate_pawn_moves(moves, side, pawns, enemies, occupancy, generation);
         for from in self.pieces_of(side, Piece::Knight) {
             push_targets(moves, from, knight_attacks(from) & targets, enemies);
         }
@@ -232,11 +237,11 @@ impl Board {
         &self,
         moves: &mut MoveList,
         side: Color,
+        pawns: Bitboard,
         enemies: Bitboard,
         occupancy: Bitboard,
         generation: Generation,
     ) {
-        let pawns = self.pieces_of(side, Piece::Pawn);
         let empty = !occupancy;
         let (step, double_push_rank, promotion_rank) = match side {
             Color::White => (8i8, Bitboard::rank(2), Bitboard::rank(7)),

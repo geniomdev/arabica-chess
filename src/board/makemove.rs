@@ -8,6 +8,11 @@ pub(super) fn en_passant_victim(target: Square) -> Square {
 }
 
 impl Board {
+    pub(super) fn en_passant_capturable(&self, pusher: Color, passed: Square) -> bool {
+        let capturers = self.pieces_of(pusher.opponent(), Piece::Pawn);
+        !(pawn_attacks(pusher, passed) & capturers).is_empty()
+    }
+
     fn relocate_castling_pieces(
         &mut self,
         side: Color,
@@ -77,7 +82,7 @@ impl Board {
         }
 
         let passed = Square::from_index((from.raw() + to.raw()) / 2);
-        let capturable = !(pawn_attacks(us, passed) & self.pieces_of(them, Piece::Pawn)).is_empty();
+        let capturable = self.en_passant_capturable(us, passed);
         let castling = self
             .castling_setup
             .rights_after(self.state.castling, from, to);

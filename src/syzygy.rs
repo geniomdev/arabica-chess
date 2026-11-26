@@ -304,7 +304,9 @@ impl Tablebases {
             size += 1;
         }
         let side = usize::from(flipped) ^ usize::from(black_to_move);
-        encoded.lookup(&table.material, kind, &placement[..size], side, wdl.value())
+        encoded
+            .lookup(&table.material, kind, &placement[..size], side, wdl.value())
+            .unwrap_or(Lookup::Unavailable)
     }
 
     fn table_wdl(&self, board: &Board) -> Option<Wdl> {
@@ -324,7 +326,8 @@ impl Tablebases {
         let mut searched = 0;
         for &candidate in &moves {
             let pawn_move = board.piece_on(candidate.from()) == Some(Piece::Pawn);
-            if !candidate.is_capture() && !(pawn_moves_zero && pawn_move) {
+            let zeroing = candidate.is_capture() || (pawn_moves_zero && pawn_move);
+            if !zeroing {
                 continue;
             }
             searched += 1;

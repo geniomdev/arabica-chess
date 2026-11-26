@@ -16,7 +16,7 @@ use crate::search::{SearchLimits, Searcher, SharedSearch};
 use crate::strength::fresh_noise_seed;
 use crate::syzygy::{Tablebases, Wdl};
 use crate::tt::DEFAULT_HASH_MB;
-use crate::types::{CastlingRights, Color, FILES, Piece, RANKS, Square};
+use crate::types::{Color, Piece, Square};
 
 const DEFAULT_NODES: u64 = 2_000;
 const HARD_NODE_FACTOR: u64 = 10;
@@ -166,62 +166,10 @@ fn with_material_odds(board: &Board, random: &mut Random) -> Option<Board> {
             .collect();
         removed.push(others[random.below(others.len())]);
     }
-    let odds: Board = fen_without(board, &removed).parse().ok()?;
+    let odds: Board = board.fen_without(&removed).parse().ok()?;
     let us = odds.state.active_color;
     let exposed = odds.is_attacked(odds.king_square(us.opponent()), us, odds.occupancy());
     (!exposed).then_some(odds)
-}
-
-fn fen_without(board: &Board, removed: &[Square]) -> String {
-    let piece_at = |square: Square| {
-        board
-            .colored_piece_on(square)
-            .filter(|_| !removed.contains(&square))
-    };
-    let ranks: Vec<String> = (0..RANKS)
-        .rev()
-        .map(|rank| {
-            let mut text = String::new();
-            let mut empty = 0;
-            for file in 0..FILES {
-                match piece_at(Square::new(file, rank)) {
-                    Some((side, piece)) => {
-                        if empty > 0 {
-                            text.push_str(&empty.to_string());
-                            empty = 0;
-                        }
-                        text.push(piece.symbol(side));
-                    }
-                    None => empty += 1,
-                }
-            }
-            if empty > 0 {
-                text.push_str(&empty.to_string());
-            }
-            text
-        })
-        .collect();
-    let mut castling = CastlingRights::NONE;
-    let castling_rooks = [
-        (CastlingRights::WHITE_KING, Color::White, Square::H1),
-        (CastlingRights::WHITE_QUEEN, Color::White, Square::A1),
-        (CastlingRights::BLACK_KING, Color::Black, Square::H8),
-        (CastlingRights::BLACK_QUEEN, Color::Black, Square::A8),
-    ];
-    for (right, side, rook_square) in castling_rooks {
-        if board.state.castling.has(right) && piece_at(rook_square) == Some((side, Piece::Rook)) {
-            castling.insert(right);
-        }
-    }
-    let side_to_move = match board.state.active_color {
-        Color::White => 'w',
-        Color::Black => 'b',
-    };
-    format!(
-        "{} {side_to_move} {castling} - 0 {}",
-        ranks.join("/"),
-        board.state.fullmove_number
-    )
 }
 
 struct GameSetup<'a> {
@@ -606,7 +554,7 @@ mod tests {
     use crate::board::testing::{board, scratch_path};
     use crate::search::MATE_BOUND;
     use crate::syzygy::testing::local_tablebases;
-    use crate::types::Piece;
+    use crate::types::{CastlingRights, Piece};
 
     #[test]
     fn detects_game_end_by_rules() {

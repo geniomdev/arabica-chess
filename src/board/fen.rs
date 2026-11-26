@@ -68,6 +68,11 @@ impl FromStr for Board {
         if !board.en_passant_matches_placement() {
             return Err(FenError::EnPassant(fields[3].to_string()));
         }
+        let pusher = board.state.active_color.opponent();
+        board.state.en_passant = board
+            .state
+            .en_passant
+            .filter(|&target| board.en_passant_capturable(pusher, target));
         board.state.zobrist_key = board.compute_zobrist_key();
         Ok(board)
     }
@@ -216,6 +221,23 @@ impl Board {
                 .contains(Square::new(square.file(), pawn_rank))
     }
 
+    pub fn fen_without(&self, removed: &[Square]) -> String {
+        let mut stripped = self.clone();
+        for &square in removed {
+            if let Some((side, piece)) = stripped.colored_piece_on(square) {
+                stripped.remove_piece(side, piece, square);
+            }
+        }
+        for right in CastlingRights::SINGLES {
+            if removed.contains(&self.castling_setup.rook(right)) {
+                stripped.state.castling = stripped.state.castling.without(right);
+            }
+        }
+        stripped.state.en_passant = None;
+        stripped.state.halfmove_clock = 0;
+        stripped.to_fen()
+    }
+
     pub fn to_fen(&self) -> String {
         let mut placement = String::new();
         for rank in (0..RANKS).rev() {
@@ -355,6 +377,10 @@ mod tests {
             (START_POSITION, START_POSITION),
             (KIWIPETE, KIWIPETE),
             (EN_PASSANT, EN_PASSANT),
+            (
+                "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+                "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+            ),
             (
                 "4k3/8/8/8/8/8/8/4K3 b - - 12 40",
                 "4k3/8/8/8/8/8/8/4K3 b - - 12 40",

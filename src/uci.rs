@@ -747,7 +747,7 @@ fn next_number<'a, T: FromStr>(tokens: &mut impl Iterator<Item = &'a str>) -> Op
 
 fn next_millis<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<Duration> {
     let millis: i64 = next_number(tokens)?;
-    Some(Duration::from_millis(millis.max(0).unsigned_abs()))
+    Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0)))
 }
 
 #[cfg(test)]

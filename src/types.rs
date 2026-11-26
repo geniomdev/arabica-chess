@@ -554,7 +554,7 @@ impl CastlingRights {
     }
 
     pub const fn slot(self) -> usize {
-        debug_assert!(self.0.count_ones() == 1);
+        debug_assert!(self.0.is_power_of_two());
         self.0.trailing_zeros() as usize
     }
 }

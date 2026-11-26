@@ -1,21 +1,4 @@
-use crate::board::Board;
 use crate::types::{Bitboard, Castle, CastlingRights, Move, MoveKind, SQUARES, Square};
-
-impl Board {
-    pub fn with_castling_rook(&self, stored: Move) -> Move {
-        let side = self.state.active_color;
-        let right = match stored.kind() {
-            MoveKind::KingCastle => CastlingRights::king_side(side),
-            MoveKind::QueenCastle => CastlingRights::queen_side(side),
-            _ => return stored,
-        };
-        Move::new(
-            stored.from(),
-            self.castling_setup.rook(right),
-            stored.kind(),
-        )
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CastlingPath {

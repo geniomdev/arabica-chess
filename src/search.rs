@@ -407,10 +407,10 @@ impl Searcher {
             self.shared.stop_helpers();
             best
         });
-        match self.elected_helper_result(helpers) {
-            Some(elected) => self.adopt_elected(board, &elected, report),
-            None => main_best,
-        }
+        self.elected_helper_result(helpers)
+            .map_or(main_best, |elected| {
+                self.adopt_elected(board, &elected, report)
+            })
     }
 
     fn elected_helper_result(&self, helpers: &[Searcher]) -> Option<Completed> {
@@ -463,7 +463,7 @@ impl Searcher {
             .and_then(|tablebases| tablebases.root_moves(board));
         self.tablebase_probing =
             self.tablebases.is_some() && root.is_none() && self.tablebases_in_search;
-        self.tablebase_root_moves = root.map(|root| root.moves).unwrap_or_default();
+        self.tablebase_root_moves = root.map_or_default(|root| root.moves);
         if !self.tablebase_root_moves.is_empty() {
             self.shared
                 .count_tablebase_hits(self.tablebase_root_moves.len() as u64);
@@ -985,16 +985,24 @@ impl Searcher {
         self.pv_len[self.ply] = self.ply;
         let is_root = self.ply == 0;
         let is_pv = beta - alpha > 1;
-        if !is_root && (board.state.halfmove_clock >= 100 || board.is_repetition(self.ply)) {
+        if !is_root && board.state.halfmove_clock >= 100 {
+            let checkmated = board.in_check() && board.legal_moves().is_empty();
+            return if checkmated {
+                -MATE + self.ply as i32
+            } else {
+                0
+            };
+        }
+        if !is_root && board.is_repetition(self.ply) {
             return 0;
         }
         if self.ply >= MAX_PLY - 1 {
             return self.static_evaluation(board);
         }
-        let in_check = board.in_check();
         if depth <= 0 {
             return self.quiescence(board, alpha, beta);
         }
+        let in_check = board.in_check();
         self.visit_node();
         if self.stopped {
             return 0;
@@ -1691,6 +1699,12 @@ mod tests {
             ),
             ("4k3/8/8/8/8/8/8/RR4K1 w - - 0 1", 5, None, Some(MATE - 3)),
             ("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1", 3, Some("d1d5"), None),
+            (
+                "7k/8/6K1/8/8/8/8/R7 w - - 99 80",
+                3,
+                Some("a1a8"),
+                Some(MATE - 1),
+            ),
             ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", 3, Some("0000"), Some(0)),
             (
                 "R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1",

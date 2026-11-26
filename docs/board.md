@@ -13,8 +13,8 @@
 | Castling generation | All squares the king and the rook cross must be empty except the two of them, and the king's path must not be attacked; a check revealed by the rook leaving its square is caught by the legality test in `make_move` |
 | Legality | `make_move` plays the move and undoes it if the own king is left in check, returning `false` |
 | Unmake | Previous `GameState` is popped from the history stack, pieces are moved back |
-| Zobrist | Keys from a fixed-seed SplitMix64, updated incrementally; en passant is hashed only when a pawn can actually capture |
-| History indexing | Quiet histories index castling by the king's landing square (g or c), so classical games search exactly as before the Chess960 encoding |
+| Zobrist | Keys from a fixed-seed SplitMix64, updated incrementally; en passant is hashed only when a pawn can actually capture, and a FEN en passant square no pawn can capture is dropped, so a position set up from FEN hashes like the same position reached by moves |
+| History indexing | Quiet histories index castling by the king's landing square (g or c), not by the rook square stored in the move |
 | Repetitions | Scans reversible plies back by two; a repeat inside the search tree or a third occurrence counts as a draw |
 | SEE | Swap algorithm with x-rays through the updated occupancy, answers `see(move) >= threshold` |
 | NNUE | Every piece change is also pushed onto the accumulator stack |

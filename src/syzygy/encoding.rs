@@ -531,14 +531,14 @@ impl EncodedTable {
             };
             let orders = [[first & 0xF, second & 0xF], [first >> 4, second >> 4]];
             at += 1 + usize::from(both_sides_have_pawns);
-            for piece in 0..material.piece_count {
-                let byte = reader.byte(at)?;
-                for side in 0..sides {
-                    pairs[slot(side, file)].pieces[piece] =
-                        if side == 1 { byte >> 4 } else { byte & 0xF };
+            for side in 0..sides {
+                let shift = if side == 1 { 4 } else { 0 };
+                let pieces = pairs[slot(side, file)].pieces.iter_mut();
+                for (offset, piece) in pieces.take(material.piece_count).enumerate() {
+                    *piece = (reader.byte(at + offset)? >> shift) & 0xF;
                 }
-                at += 1;
             }
+            at += material.piece_count;
             for (side, order) in orders.into_iter().enumerate().take(sides) {
                 set_groups(material, &mut pairs[slot(side, file)], order, file)?;
             }
@@ -616,20 +616,6 @@ impl EncodedTable {
         placement: &[(usize, u8)],
         side: usize,
         wdl: i32,
-    ) -> Lookup {
-        match self.try_lookup(material, kind, placement, side, wdl) {
-            Some(lookup) => lookup,
-            None => Lookup::Unavailable,
-        }
-    }
-
-    fn try_lookup(
-        &self,
-        material: &Material,
-        kind: Kind,
-        placement: &[(usize, u8)],
-        side: usize,
-        wdl: i32,
     ) -> Option<Lookup> {
         let indexing = &*INDEXING;
         if placement.len() != material.piece_count {
@@ -661,7 +647,7 @@ impl EncodedTable {
         if kind == Kind::Dtz {
             let flags = self.pairs(0, file).flags;
             let stored_side = usize::from(flags & STM_FLAG);
-            if stored_side != side && !(material.symmetric && !material.has_pawns) {
+            if stored_side != side && (!material.symmetric || material.has_pawns) {
                 return Some(Lookup::OtherSideToMove);
             }
         }
@@ -676,13 +662,11 @@ impl EncodedTable {
         }
 
         let data = self.pairs(side, file);
-        for i in lead_pawns..size.saturating_sub(1) {
-            for j in i + 1..size {
-                if data.pieces[i] == pieces[j] {
-                    pieces.swap(i, j);
-                    squares.swap(i, j);
-                    break;
-                }
+        let ordered = data.pieces.iter().enumerate();
+        for (i, &wanted) in ordered.take(size.saturating_sub(1)).skip(lead_pawns) {
+            if let Some(j) = (i + 1..size).find(|&j| pieces[j] == wanted) {
+                pieces.swap(i, j);
+                squares.swap(i, j);
             }
         }
 

@@ -207,8 +207,7 @@ impl TranspositionTable {
     }
 
     pub fn probe(&self, key: u64, ply: usize) -> Option<Hit> {
-        let bucket = self.buckets.get(self.index(key))?;
-        let entry = bucket
+        let entry = self.buckets[self.index(key)]
             .entries()
             .into_iter()
             .find(|entry| entry.holds(key))?;
@@ -224,9 +223,7 @@ impl TranspositionTable {
 
     pub fn store(&self, store: Store) {
         let generation = self.generation();
-        let Some(bucket) = self.buckets.get(self.index(store.key)) else {
-            return;
-        };
+        let bucket = &self.buckets[self.index(store.key)];
         let entries = bucket.entries();
         let slot = entries
             .iter()
