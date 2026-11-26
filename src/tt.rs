@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use crate::search::{MATE_BOUND, is_mate_score};
+use crate::search::{DECISIVE_BOUND, is_decisive};
 use crate::types::Move;
 
 pub const DEFAULT_HASH_MB: usize = 16;
@@ -156,7 +156,7 @@ impl Hit {
     }
 
     pub fn refine(&self, static_eval: i32) -> i32 {
-        if is_mate_score(self.score) {
+        if is_decisive(self.score) {
             return static_eval;
         }
         let tighter = match self.bound {
@@ -292,9 +292,9 @@ impl TranspositionTable {
 
 fn score_to_table(score: i32, ply: usize) -> i16 {
     let ply = ply as i32;
-    let adjusted = if score >= MATE_BOUND {
+    let adjusted = if score >= DECISIVE_BOUND {
         score + ply
-    } else if score <= -MATE_BOUND {
+    } else if score <= -DECISIVE_BOUND {
         score - ply
     } else {
         score
@@ -304,9 +304,9 @@ fn score_to_table(score: i32, ply: usize) -> i16 {
 
 fn score_from_table(score: i32, ply: usize) -> i32 {
     let ply = ply as i32;
-    if score >= MATE_BOUND {
+    if score >= DECISIVE_BOUND {
         score - ply
-    } else if score <= -MATE_BOUND {
+    } else if score <= -DECISIVE_BOUND {
         score + ply
     } else {
         score
@@ -316,7 +316,7 @@ fn score_from_table(score: i32, ply: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::MATE;
+    use crate::search::{MATE, TABLEBASE_WIN};
     use crate::types::{MoveKind, Square};
 
     const SAMPLE_KEY: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -353,6 +353,24 @@ mod tests {
             (10, 3, Bound::Exact, 5, 5, 3, Some(10)),
             (MATE - 5, 2, Bound::Exact, 2, 6, 2, Some(MATE - 9)),
             (-MATE + 7, 4, Bound::Exact, 4, 1, 1, Some(-MATE + 4)),
+            (
+                TABLEBASE_WIN - 3,
+                2,
+                Bound::Exact,
+                3,
+                7,
+                2,
+                Some(TABLEBASE_WIN - 7),
+            ),
+            (
+                -TABLEBASE_WIN + 2,
+                2,
+                Bound::Exact,
+                2,
+                0,
+                2,
+                Some(-TABLEBASE_WIN),
+            ),
             (50, 3, Bound::Lower, 0, 0, 4, None),
             (50, 3, Bound::Lower, 0, 0, 3, Some(50)),
             (-50, 3, Bound::Upper, 0, 0, 2, Some(-50)),
@@ -480,6 +498,8 @@ mod tests {
             (Bound::Upper, 5, 10, 5),
             (Bound::Upper, 40, 10, 10),
             (Bound::Exact, MATE - 3, 10, 10),
+            (Bound::Lower, TABLEBASE_WIN - 3, 10, 10),
+            (Bound::Upper, -TABLEBASE_WIN + 3, 10, 10),
         ];
 
         for (bound, score, static_eval, expected) in cases {

@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::board::Board;
-use crate::search::MATE_BOUND;
+use crate::search::DECISIVE_BOUND;
 use crate::types::{Bitboard, Color, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
 use simd::OutputKernel;
 pub(crate) use stack::AccumulatorStack;
@@ -52,7 +52,7 @@ pub struct Network {
 }
 
 const VALUE_BYTES: usize = std::mem::size_of::<i16>();
-const MAX_EVALUATION: i32 = MATE_BOUND - 1;
+const MAX_EVALUATION: i32 = DECISIVE_BOUND - 1;
 
 pub const NETWORK_VALUES: usize = INPUTS * HIDDEN + HIDDEN + OUTPUT_BUCKETS * (SIDES * HIDDEN + 1);
 pub const NETWORK_BYTES: usize = NETWORK_VALUES * VALUE_BYTES;
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_stays_below_mate_bound() {
+    fn evaluation_stays_below_decisive_bound() {
         let cases = [
             (START_POSITION, Some(i16::MAX), MAX_EVALUATION),
             (START_POSITION, Some(i16::MIN + 1), -MAX_EVALUATION),
@@ -712,7 +712,7 @@ mod tests {
             let active = embedded_with_output_weights(weight, OutputKernel::Portable);
             let score = evaluate_with(&active, &mut board(fen));
             assert_eq!(score, expected, "fen {fen:?}, output weights {weight:?}");
-            assert!(score.abs() < MATE_BOUND, "fen {fen:?}, score {score}");
+            assert!(score.abs() < DECISIVE_BOUND, "fen {fen:?}, score {score}");
         }
     }
 }

@@ -22,7 +22,7 @@ pub const MAX_DEPTH: u8 = 64;
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 pub const TABLEBASE_WIN: i32 = MATE_BOUND - 1 - MAX_PLY as i32;
 const TABLEBASE_DEPTH_BONUS: i32 = 6;
-const DECISIVE_BOUND: i32 = TABLEBASE_WIN - MAX_PLY as i32;
+pub const DECISIVE_BOUND: i32 = TABLEBASE_WIN - MAX_PLY as i32;
 const VOTE_SCORE_OFFSET: i64 = 14;
 const TIME_CHECK_INTERVAL: u64 = 2048;
 const QUIESCENCE_DEPTH: u8 = 0;
@@ -204,7 +204,7 @@ fn soft_time_scale(stable_iterations: usize, score_drop: i32, best_move_node_sha
     (stability * score_trend * node_share).clamp(lowest, highest)
 }
 
-fn is_decisive(score: i32) -> bool {
+pub fn is_decisive(score: i32) -> bool {
     score.abs() >= DECISIVE_BOUND
 }
 
@@ -748,7 +748,7 @@ impl Searcher {
     fn corrected_evaluation(&self, board: &Board, raw_eval: i32) -> i32 {
         self.history
             .corrected_eval(&correction_keys(board), raw_eval)
-            .clamp(-MATE_BOUND + 1, MATE_BOUND - 1)
+            .clamp(-DECISIVE_BOUND + 1, DECISIVE_BOUND - 1)
     }
 
     fn improving(&self, corrected_eval: Option<i32>) -> bool {
@@ -888,7 +888,7 @@ impl Searcher {
         hash_move: Option<Move>,
         probcut_beta: i32,
         static_eval: i32,
-        depth: i32,
+        probcut_depth: i32,
         cut_node: bool,
     ) -> Option<(Move, i32)> {
         let continuations = self.continuations();
@@ -908,7 +908,7 @@ impl Searcher {
             if score >= probcut_beta {
                 score = -self.negamax(
                     board,
-                    depth - PROBCUT_REDUCTION - 1,
+                    probcut_depth - 1,
                     -probcut_beta,
                     -probcut_beta + 1,
                     !cut_node,
@@ -1081,7 +1081,7 @@ impl Searcher {
 
         if prunable
             && depth <= REVERSE_FUTILITY_DEPTH
-            && !is_mate_score(beta)
+            && !is_decisive(beta)
             && static_eval - params::reverse_futility_margin() * depth
                 + params::reverse_futility_improving_margin() * i32::from(improving)
                 >= beta
@@ -1107,22 +1107,27 @@ impl Searcher {
                 return 0;
             }
             if score >= beta {
-                return if is_mate_score(score) { beta } else { score };
+                return if is_decisive(score) { beta } else { score };
             }
         }
 
         let probcut_beta = beta + params::probcut_margin();
-        let probcut_depth = depth - PROBCUT_REDUCTION + 1;
+        let probcut_depth = depth - PROBCUT_REDUCTION;
         if prunable
             && depth >= PROBCUT_DEPTH
-            && !is_mate_score(beta)
+            && !is_decisive(beta)
             && !hit.is_some_and(|hit| {
                 i32::from(hit.depth) >= probcut_depth && hit.score < probcut_beta
             })
         {
-            if let Some((best_move, score)) =
-                self.probcut(board, hash_move, probcut_beta, static_eval, depth, cut_node)
-            {
+            if let Some((best_move, score)) = self.probcut(
+                board,
+                hash_move,
+                probcut_beta,
+                static_eval,
+                probcut_depth,
+                cut_node,
+            ) {
                 self.shared.table.store(Store {
                     key,
                     best_move,
@@ -1381,7 +1386,7 @@ impl Searcher {
                 Bound::Upper => score < corrected_eval,
                 Bound::Exact => true,
             };
-            if quiet_best && consistent && !is_mate_score(score) {
+            if quiet_best && consistent && !is_decisive(score) {
                 let keys = correction_keys(board);
                 let residual = score - self.history.corrected_eval(&keys, raw_eval);
                 self.history.update_correction(&keys, depth, residual);
@@ -1513,7 +1518,7 @@ impl Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::testing::board;
+    use crate::board::testing::{board, find_move};
     use crate::board::{KIWIPETE, START_POSITION};
     use crate::syzygy::testing::local_tablebases;
     use crate::types::{MoveKind, Square};
@@ -1523,8 +1528,8 @@ mod tests {
     }
 
     #[test]
-    fn corrected_evaluation_stays_below_mate_bound() {
-        let ceiling = MATE_BOUND - 1;
+    fn corrected_evaluation_stays_below_decisive_bound() {
+        let ceiling = DECISIVE_BOUND - 1;
         let cases = [
             (0, None, 0),
             (ceiling, None, ceiling),
@@ -1988,6 +1993,35 @@ mod tests {
 
         for (score, expected) in cases {
             assert_eq!(uci_score(score), expected, "score {score}");
+        }
+    }
+
+    #[test]
+    fn probcut_stores_one_ply_above_its_verification_search() {
+        let fen = "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1";
+        for depth in [6, 7, 8] {
+            let mut position = board(fen);
+            let capture = find_move(&position, "e4d5");
+            let mut searcher =
+                Searcher::new(SearchLimits::default(), Arc::default(), small_shared());
+            let beta = searcher.static_evaluation(&mut position) + 100;
+            searcher.negamax(&mut position, depth, beta - 1, beta, false);
+
+            let parent = searcher
+                .shared
+                .table
+                .probe(position.state.zobrist_key, 0)
+                .expect("probcut entry");
+            position.make_move(capture);
+            let child = searcher
+                .shared
+                .table
+                .probe(position.state.zobrist_key, 1)
+                .expect("verification entry");
+
+            assert_eq!(parent.best_move, Some(capture), "depth {depth}");
+            assert_eq!(parent.bound, Bound::Lower, "depth {depth}");
+            assert_eq!(parent.depth, child.depth + 1, "depth {depth}");
         }
     }
 }
