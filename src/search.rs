@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, Threats, see_value};
-use crate::history::{Continuations, History, PieceTo, history_bonus};
+use crate::history::{Continuations, CorrectionKeys, History, PieceTo, history_bonus};
 use crate::movepick::{MovePicker, captured_piece, moved_piece};
 use crate::nnue;
 use crate::strength::EvalNoise;
@@ -88,8 +88,8 @@ const HISTORY_PRUNING_DEPTH: i32 = 4;
 const HISTORY_PRUNING_MARGIN: i32 = 2_048;
 const QUIET_SEE_DEPTH: i32 = 8;
 const QUIET_SEE_MARGIN: i32 = 60;
-const PAWN_KEY_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
-const BLACK_PAWNS_ROTATION: u32 = 29;
+const KEY_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+const KEY_ROTATION: u32 = 29;
 
 const ASPIRATION_DEPTH: i32 = 4;
 const ASPIRATION_WINDOW: i32 = 25;
@@ -283,10 +283,38 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
     !(board.occupied_by(side) & !pawns_and_kings).is_empty()
 }
 
-fn pawn_key(board: &Board) -> u64 {
-    let white = board.pieces_of(Color::White, Piece::Pawn).0;
-    let black = board.pieces_of(Color::Black, Piece::Pawn).0;
-    (white ^ black.rotate_left(BLACK_PAWNS_ROTATION)).wrapping_mul(PAWN_KEY_MULTIPLIER)
+fn bitboards_key(bitboards: impl IntoIterator<Item = Bitboard>) -> u64 {
+    bitboards
+        .into_iter()
+        .fold(0, |key: u64, bitboard| {
+            (key ^ bitboard.0)
+                .wrapping_mul(KEY_MULTIPLIER)
+                .rotate_left(KEY_ROTATION)
+        })
+        .wrapping_mul(KEY_MULTIPLIER)
+}
+
+fn correction_keys(board: &Board) -> CorrectionKeys {
+    let side_key = |side, pieces: &[Piece]| {
+        bitboards_key(pieces.iter().map(|&piece| board.pieces_of(side, piece)))
+    };
+    let non_pawns = [
+        Piece::King,
+        Piece::Queen,
+        Piece::Rook,
+        Piece::Bishop,
+        Piece::Knight,
+    ];
+    let pawns =
+        bitboards_key([Color::White, Color::Black].map(|side| board.pieces_of(side, Piece::Pawn)));
+    CorrectionKeys {
+        side: board.state.active_color,
+        hashed: [
+            pawns,
+            side_key(Color::White, &non_pawns),
+            side_key(Color::Black, &non_pawns),
+        ],
+    }
 }
 
 fn table_depth(depth: i32) -> u8 {
@@ -745,7 +773,7 @@ impl Searcher {
 
     fn corrected_evaluation(&self, board: &Board, raw_eval: i32) -> i32 {
         self.history
-            .corrected_eval(board.state.active_color, pawn_key(board), raw_eval)
+            .corrected_eval(&correction_keys(board), raw_eval)
             .clamp(-MATE_BOUND + 1, MATE_BOUND - 1)
     }
 
@@ -1367,8 +1395,9 @@ impl Searcher {
                 Bound::Exact => true,
             };
             if quiet_best && consistent && !is_mate_score(score) {
-                self.history
-                    .update_correction(us, pawn_key(board), depth, score - raw_eval);
+                let keys = correction_keys(board);
+                let residual = score - self.history.corrected_eval(&keys, raw_eval);
+                self.history.update_correction(&keys, depth, residual);
             }
         }
         self.shared.table.store(Store {
@@ -1515,20 +1544,15 @@ mod tests {
             (ceiling, Some(MATE), ceiling),
             (-ceiling, Some(-MATE), -ceiling),
             (ceiling - 10, Some(MATE), ceiling),
-            (ceiling, Some(-MATE), ceiling - 64),
-            (100, Some(MATE), 164),
+            (ceiling, Some(-MATE), ceiling - 48),
+            (100, Some(MATE), 148),
         ];
 
         for (raw_eval, search_error, expected) in cases {
             let position = board(KIWIPETE);
             let mut history = History::default();
             if let Some(error) = search_error {
-                history.update_correction(
-                    position.state.active_color,
-                    pawn_key(&position),
-                    MAX_DEPTH as i32,
-                    error,
-                );
+                history.update_correction(&correction_keys(&position), MAX_DEPTH as i32, error);
             }
             let searcher = Searcher::new(SearchLimits::default(), Arc::default(), small_shared())
                 .with_history(history);

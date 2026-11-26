@@ -9,12 +9,20 @@ const THREAT_BUCKETS: usize = 4;
 const VICTIM_SLOTS: usize = PIECE_TYPES + 1;
 const CORRECTION_BITS: u32 = 14;
 const CORRECTION_SLOTS: usize = 1 << CORRECTION_BITS;
+pub const HASHED_CORRECTIONS: usize = 3;
 const CORRECTION_GRAIN: i32 = 256;
 const CORRECTION_WEIGHT_SCALE: i32 = 256;
 const MAX_CORRECTION_WEIGHT: i32 = 16;
 const MAX_CORRECTION: i32 = 64 * CORRECTION_GRAIN;
+const MAX_CORRECTION_BONUS: i32 = MAX_CORRECTION / 4;
 
 pub type Continuations = [Option<PieceTo>; CONTINUATION_PLIES];
+
+#[derive(Clone, Copy, Debug)]
+pub struct CorrectionKeys {
+    pub side: Color,
+    pub hashed: [u64; HASHED_CORRECTIONS],
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PieceTo {
@@ -33,7 +41,7 @@ pub struct History {
     butterfly: Vec<i32>,
     continuation: [Vec<i32>; CONTINUATION_PLIES],
     capture: Vec<i32>,
-    correction: Vec<i32>,
+    correction: [Vec<i16>; HASHED_CORRECTIONS],
 }
 
 impl Default for History {
@@ -42,7 +50,7 @@ impl Default for History {
             butterfly: vec![0; SIDES * THREAT_BUCKETS * SQUARES * SQUARES],
             continuation: std::array::from_fn(|_| vec![0; PIECE_TO_SLOTS * PIECE_TO_SLOTS]),
             capture: vec![0; PIECE_TO_SLOTS * VICTIM_SLOTS],
-            correction: vec![0; SIDES * CORRECTION_SLOTS],
+            correction: std::array::from_fn(|_| vec![0; SIDES * CORRECTION_SLOTS]),
         }
     }
 }
@@ -70,8 +78,14 @@ fn capture_index(moved: PieceTo, victim: Option<Piece>) -> usize {
     moved.index() * VICTIM_SLOTS + victim.map_or(PIECE_TYPES, Piece::index)
 }
 
-fn correction_index(side: Color, pawn_key: u64) -> usize {
-    side.index() * CORRECTION_SLOTS + (pawn_key >> (u64::BITS - CORRECTION_BITS)) as usize
+fn nudge_correction(entry: &mut i16, bonus: i32) {
+    let entry_value = i32::from(*entry);
+    let nudged = entry_value + bonus - entry_value * bonus.abs() / MAX_CORRECTION;
+    *entry = nudged.clamp(-MAX_CORRECTION, MAX_CORRECTION) as i16;
+}
+
+fn correction_index(side: Color, key: u64) -> usize {
+    side.index() * CORRECTION_SLOTS + (key >> (u64::BITS - CORRECTION_BITS)) as usize
 }
 
 impl History {
@@ -81,7 +95,9 @@ impl History {
             table.fill(0);
         }
         self.capture.fill(0);
-        self.correction.fill(0);
+        for table in &mut self.correction {
+            table.fill(0);
+        }
     }
 
     pub fn quiet_score(
@@ -136,16 +152,23 @@ impl History {
         apply_gravity(&mut self.capture[capture_index(moved, victim)], bonus);
     }
 
-    pub fn corrected_eval(&self, side: Color, pawn_key: u64, raw_eval: i32) -> i32 {
-        raw_eval + self.correction[correction_index(side, pawn_key)] / CORRECTION_GRAIN
+    pub fn corrected_eval(&self, keys: &CorrectionKeys, raw_eval: i32) -> i32 {
+        let correction: i32 = self
+            .correction
+            .iter()
+            .zip(keys.hashed)
+            .map(|(table, key)| i32::from(table[correction_index(keys.side, key)]))
+            .sum();
+        raw_eval + correction / CORRECTION_GRAIN
     }
 
-    pub fn update_correction(&mut self, side: Color, pawn_key: u64, depth: i32, error: i32) {
+    pub fn update_correction(&mut self, keys: &CorrectionKeys, depth: i32, residual: i32) {
         let weight = (depth + 1).min(MAX_CORRECTION_WEIGHT);
-        let entry = &mut self.correction[correction_index(side, pawn_key)];
-        let blended =
-            *entry * (CORRECTION_WEIGHT_SCALE - weight) + error * CORRECTION_GRAIN * weight;
-        *entry = (blended / CORRECTION_WEIGHT_SCALE).clamp(-MAX_CORRECTION, MAX_CORRECTION);
+        let bonus = (residual * CORRECTION_GRAIN * weight / CORRECTION_WEIGHT_SCALE)
+            .clamp(-MAX_CORRECTION_BONUS, MAX_CORRECTION_BONUS);
+        for (table, key) in self.correction.iter_mut().zip(keys.hashed) {
+            nudge_correction(&mut table[correction_index(keys.side, key)], bonus);
+        }
     }
 }
 
@@ -217,25 +240,54 @@ mod tests {
     }
 
     #[test]
-    fn blends_eval_correction_toward_search_error() {
-        let pawn_key = 0xDEAD_BEEF_0123_4567;
+    fn steers_eval_correction_toward_search_score() {
+        let tables = HASHED_CORRECTIONS as i32;
+        let trained = CorrectionKeys {
+            side: Color::White,
+            hashed: std::array::from_fn(|table| {
+                0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(table as u64 + 1)
+            }),
+        };
+        let other_side = CorrectionKeys {
+            side: Color::Black,
+            ..trained
+        };
+        let mut other_first_key = trained;
+        other_first_key.hashed[0] ^= u64::MAX;
+        let partial = 100 * (tables - 1) / tables;
         let cases = [
-            (1, 15, 100, Color::White, 6..=6),
-            (1, 0, 100, Color::White, 0..=0),
-            (200, 15, 100, Color::White, 64..=64),
-            (200, 15, -30, Color::White, -30..=-29),
-            (200, 15, 100, Color::Black, 0..=0),
+            (
+                1,
+                15,
+                100,
+                trained,
+                (1_600 * tables / 256)..=(1_600 * tables / 256),
+            ),
+            (
+                1,
+                0,
+                100,
+                trained,
+                (100 * tables / 256)..=(100 * tables / 256),
+            ),
+            (200, 15, 100, trained, 97..=103),
+            (200, 15, -30, trained, -33..=-27),
+            (200, 15, 1_000, trained, (64 * tables)..=(64 * tables)),
+            (200, 15, 100, other_side, 0..=0),
+            (200, 15, 100, other_first_key, (partial - 6)..=(partial + 6)),
         ];
 
-        for (repetitions, depth, error, probed_side, expected) in cases {
+        for (repetitions, depth, search_score, probed, expected) in cases {
             let mut history = History::default();
             for _ in 0..repetitions {
-                history.update_correction(Color::White, pawn_key, depth, error);
+                let residual = search_score - history.corrected_eval(&trained, 0);
+                history.update_correction(&trained, depth, residual);
             }
-            let correction = history.corrected_eval(probed_side, pawn_key, 0);
+            let correction = history.corrected_eval(&probed, 0);
             assert!(
                 expected.contains(&correction),
-                "x{repetitions}, depth {depth}, error {error}, {probed_side:?}: {correction}"
+                "x{repetitions}, depth {depth}, score {search_score}, probed {probed:?}: \
+                 {correction}"
             );
         }
     }
