@@ -117,9 +117,11 @@ impl Engine {
                 println!(
                     "option name Mode type combo default {SEARCH_MODE_NAME} var {SEARCH_MODE_NAME}{plies_variants}"
                 );
+                print_tunable_options();
                 println!("uciok");
             }
             ["isready", ..] => println!("readyok"),
+            ["tunables", ..] => print_tunables(),
             ["ucinewgame", ..] => {
                 self.stop_search();
                 self.board = start_position();
@@ -143,6 +145,7 @@ impl Engine {
                     Some(EngineOption::EvalFile(path)) => self.set_network(path),
                     Some(EngineOption::SyzygyPath(paths)) => self.set_tablebases(paths),
                     Some(EngineOption::Mode(mode)) => self.mode = mode,
+                    None if set_tunable(arguments) => {}
                     None => println!("info string unsupported option: {}", arguments.join(" ")),
                 }
             }
@@ -593,6 +596,56 @@ enum EngineOption {
     EvalFile(Option<PathBuf>),
     SyzygyPath(Option<String>),
     Mode(Mode),
+}
+
+#[cfg(feature = "tune")]
+const TUNABLE_LEARNING_RATE: f64 = 0.002;
+
+#[cfg(feature = "tune")]
+fn print_tunable_options() {
+    for tunable in crate::params::TUNABLES {
+        println!(
+            "option name {} type spin default {} min {} max {}",
+            tunable.name, tunable.default, tunable.min, tunable.max
+        );
+    }
+}
+
+#[cfg(feature = "tune")]
+fn print_tunables() {
+    for tunable in crate::params::TUNABLES {
+        println!(
+            "{}, int, {}, {}, {}, {}, {TUNABLE_LEARNING_RATE}",
+            tunable.name,
+            tunable.value(),
+            tunable.min,
+            tunable.max,
+            tunable.step
+        );
+    }
+}
+
+#[cfg(feature = "tune")]
+fn set_tunable(arguments: &[&str]) -> bool {
+    let ["name", name, "value", value] = arguments else {
+        return false;
+    };
+    let (Some(tunable), Ok(value)) = (crate::params::find(name), value.parse()) else {
+        return false;
+    };
+    tunable.set(value);
+    true
+}
+
+#[cfg(not(feature = "tune"))]
+fn print_tunable_options() {}
+
+#[cfg(not(feature = "tune"))]
+fn print_tunables() {}
+
+#[cfg(not(feature = "tune"))]
+fn set_tunable(_arguments: &[&str]) -> bool {
+    false
 }
 
 fn parse_option(arguments: &[&str]) -> Option<EngineOption> {

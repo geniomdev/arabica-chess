@@ -7,6 +7,7 @@ mod history;
 mod minimax;
 mod movepick;
 pub mod nnue;
+mod params;
 pub mod progress;
 pub mod random;
 mod search;

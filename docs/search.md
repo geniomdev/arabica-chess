@@ -33,6 +33,11 @@
 - Time management
 - Syzygy tablebases (WDL and DTZ)
 
+## Parameter tuning
+
+Search parameters live in `src/params.rs`; a `--features tune` build exposes them as UCI options.
+`script/spsa <state file>` tunes them with SPSA over fastchess games and prints the values to paste back.
+
 ## Multithreaded search
 
 | Threads | 2 | 4 | 8 |

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+if [ $# -lt 1 ]; then
+  echo "usage: script/spsa <state file> [--iterations PAIRS] [--batch PAIRS] [--tc 8+0.08]" >&2
+  echo "                   [--hash 16] [--concurrency N] [--book FILE] [--fastchess FILE] [--seed N]" >&2
+  echo "builds the tune engine into target/tune and resumes from the state file if it exists" >&2
+  exit 1
+fi
+
+cd "$root"
+cargo build --release --quiet --features tune --target-dir target/tune
+cargo build --release --quiet --bin arabica-spsa
+exec target/release/arabica-spsa target/tune/release/arabica "$@"

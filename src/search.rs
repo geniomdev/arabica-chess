@@ -8,6 +8,7 @@ use crate::board::{Board, Threats, see_value};
 use crate::history::{Continuations, CorrectionKeys, History, PieceTo, history_bonus};
 use crate::movepick::{MovePicker, captured_piece, moved_piece};
 use crate::nnue;
+use crate::params;
 use crate::strength::EvalNoise;
 use crate::syzygy::{Tablebases, Wdl};
 use crate::tt::{Bound, Hit, Store, TranspositionTable};
@@ -25,74 +26,37 @@ const DECISIVE_BOUND: i32 = TABLEBASE_WIN - MAX_PLY as i32;
 const VOTE_SCORE_OFFSET: i64 = 14;
 const TIME_CHECK_INTERVAL: u64 = 2048;
 const QUIESCENCE_DEPTH: u8 = 0;
-const QUIESCENCE_FUTILITY_MARGIN: i32 = 200;
 
 const TRACKED_QUIETS: usize = 64;
 const TRACKED_NOISY: usize = 32;
 
 const REVERSE_FUTILITY_DEPTH: i32 = 8;
-const REVERSE_FUTILITY_MARGIN: i32 = 80;
-const REVERSE_FUTILITY_IMPROVING_MARGIN: i32 = 40;
 const NULL_MOVE_DEPTH: i32 = 3;
 const LATE_MOVE_PRUNING_DEPTH: i32 = 8;
 const FUTILITY_DEPTH: i32 = 6;
-const FUTILITY_BASE: i32 = 100;
-const FUTILITY_MARGIN: i32 = 100;
-const FUTILITY_HISTORY_DIVISOR: i32 = 128;
+const FUTILITY_HISTORY_GRAIN: i32 = 16_384;
 const NOISY_SEE_DEPTH: i32 = 6;
-const NOISY_SEE_MARGIN: i32 = 100;
 const REDUCTION_DEPTH: i32 = 3;
 const REDUCTION_GRAIN: i32 = 1_024;
+const LMR_PARAMETER_SCALE: i32 = 1_000;
 const REDUCTION_TABLE_SIZE: usize = 64;
-const QUIET_REDUCTION_HISTORY_DIVISOR: i32 = 16;
-const NOISY_REDUCTION_HISTORY_DIVISOR: i32 = 8;
-const NOISY_REDUCTION_DISCOUNT: i32 = 1_024;
-const KILLER_REDUCTION_DISCOUNT: i32 = 1_024;
-const NOISY_HASH_MOVE_REDUCTION: i32 = 1_024;
-const THREAT_ESCAPE_REDUCTION_DISCOUNT: i32 = 1_024;
-const PV_REDUCTION_DISCOUNT: i32 = 1_024;
-const WAS_PV_REDUCTION_DISCOUNT: i32 = 1_024;
-const NOT_IMPROVING_REDUCTION: i32 = 1_024;
-const CHECK_REDUCTION_DISCOUNT: i32 = 1_024;
-const CUT_NODE_REDUCTION: i32 = 1_536;
 const CHILD_CUTOFFS_THRESHOLD: u32 = 2;
-const CHILD_CUTOFFS_REDUCTION: i32 = 1_024;
-const PV_HASH_SCORE_ABOVE_ALPHA_DISCOUNT: i32 = 512;
-const PV_HASH_DEPTH_DISCOUNT: i32 = 512;
-const CORRECTION_REDUCTION_SCALE: i32 = 3;
 const INTERNAL_REDUCTION_DEPTH: i32 = 4;
 const SINGULAR_DEPTH: i32 = 6;
 const SINGULAR_TABLE_DEPTH_MARGIN: i32 = 3;
-const DOUBLE_EXTENSION_MARGIN: i32 = 0;
-const TRIPLE_EXTENSION_MARGIN: i32 = 32;
-const PV_DOUBLE_EXTENSION_MARGIN: i32 = 200;
-const PV_TRIPLE_EXTENSION_MARGIN: i32 = 288;
-const QUIET_EXTENSION_MARGIN_DISCOUNT: i32 = 16;
 const NEGATIVE_EXTENSION: i32 = -2;
-const DEEPER_RESEARCH_MARGIN: i32 = 40;
 const DEEPER_RESEARCH_DEPTH_SCALE: i32 = 2;
-const SHALLOWER_RESEARCH_MARGIN: i32 = 10;
-const STRONG_CUTOFF_MARGIN: i32 = 80;
 const PRIOR_FAIL_LOW_GRAIN: i32 = 128;
-const PRIOR_FAIL_LOW_BASE_FACTOR: i32 = 96;
-const PRIOR_FAIL_LOW_DEEP_FACTOR: i32 = 128;
 const PRIOR_FAIL_LOW_DEEP_DEPTH: i32 = 5;
-const PRIOR_FAIL_LOW_EVAL_FACTOR: i32 = 128;
-const PRIOR_FAIL_LOW_EVAL_MARGIN: i32 = 100;
-const EVAL_SWING_HISTORY_SCALE: i32 = 16;
 const EVAL_SWING_HISTORY_RANGE: (i32, i32) = (-320, 800);
 const PROBCUT_DEPTH: i32 = 5;
-const PROBCUT_MARGIN: i32 = 200;
 const PROBCUT_REDUCTION: i32 = 4;
 const HISTORY_PRUNING_DEPTH: i32 = 4;
-const HISTORY_PRUNING_MARGIN: i32 = 2_048;
 const QUIET_SEE_DEPTH: i32 = 8;
-const QUIET_SEE_MARGIN: i32 = 60;
 const KEY_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 const KEY_ROTATION: u32 = 29;
 
 const ASPIRATION_DEPTH: i32 = 4;
-const ASPIRATION_WINDOW: i32 = 25;
 const ASPIRATION_FULL_WINDOW_THRESHOLD: i32 = 400;
 
 const STABILITY_TIME_SCALES: [f64; 5] = [2.0, 1.4, 1.1, 0.9, 0.8];
@@ -106,14 +70,9 @@ type RootMoveNodes = [[u64; SQUARES]; SQUARES];
 
 static REDUCTIONS: LazyLock<[[i32; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE]> =
     LazyLock::new(|| {
-        let mut table = [[0; REDUCTION_TABLE_SIZE]; REDUCTION_TABLE_SIZE];
-        for (depth, row) in table.iter_mut().enumerate().skip(1) {
-            for (move_number, reduction) in row.iter_mut().enumerate().skip(1) {
-                let scaled = (depth as f64).ln() * (move_number as f64).ln() / 2.25;
-                *reduction = ((0.75 + scaled) * f64::from(REDUCTION_GRAIN)) as i32;
-            }
-        }
-        table
+        std::array::from_fn(|depth| {
+            std::array::from_fn(|move_number| reduction_formula(depth, move_number))
+        })
     });
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -321,9 +280,24 @@ fn table_depth(depth: i32) -> u8 {
     depth.min(i32::from(u8::MAX)) as u8
 }
 
+fn reduction_formula(depth: usize, move_number: usize) -> i32 {
+    if depth == 0 || move_number == 0 {
+        return 0;
+    }
+    let base = f64::from(params::lmr_base()) / f64::from(LMR_PARAMETER_SCALE);
+    let divisor = f64::from(params::lmr_divisor()) / f64::from(LMR_PARAMETER_SCALE);
+    let scaled = (depth as f64).ln() * (move_number as f64).ln() / divisor;
+    ((base + scaled) * f64::from(REDUCTION_GRAIN)) as i32
+}
+
 fn late_move_reduction(depth: i32, move_number: usize) -> i32 {
     let depth = (depth as usize).min(REDUCTION_TABLE_SIZE - 1);
-    REDUCTIONS[depth][move_number.min(REDUCTION_TABLE_SIZE - 1)]
+    let move_number = move_number.min(REDUCTION_TABLE_SIZE - 1);
+    if cfg!(feature = "tune") {
+        reduction_formula(depth, move_number)
+    } else {
+        REDUCTIONS[depth][move_number]
+    }
 }
 
 pub fn is_mate_score(score: i32) -> bool {
@@ -676,7 +650,7 @@ impl Searcher {
         if depth < ASPIRATION_DEPTH || is_mate_score(previous_score) {
             return self.negamax(board, depth, -INFINITY, INFINITY, false);
         }
-        let mut window = ASPIRATION_WINDOW;
+        let mut window = params::aspiration_window();
         let mut alpha = previous_score - window;
         let mut beta = previous_score + window;
         let mut fail_highs = 0;
@@ -837,8 +811,8 @@ impl Searcher {
         }
         if let Some((prior, moved, parent)) = self.prior_quiet(board) {
             let (lowest, highest) = EVAL_SWING_HISTORY_RANGE;
-            let bonus =
-                (-EVAL_SWING_HISTORY_SCALE * (corrected_eval + parent_eval)).clamp(lowest, highest);
+            let bonus = (-params::eval_swing_history_scale() * (corrected_eval + parent_eval))
+                .clamp(lowest, highest);
             self.history
                 .update_butterfly(prior, moved.side, self.threats_at[parent], bonus);
         }
@@ -974,11 +948,18 @@ impl Searcher {
         );
         self.excluded[self.ply] = Move::NULL;
         if score < singular_beta {
-            let quiet_discount = QUIET_EXTENSION_MARGIN_DISCOUNT * i32::from(!candidate.is_noisy());
+            let quiet_discount =
+                params::quiet_extension_margin_discount() * i32::from(!candidate.is_noisy());
             let (double_margin, triple_margin) = if node.is_pv {
-                (PV_DOUBLE_EXTENSION_MARGIN, PV_TRIPLE_EXTENSION_MARGIN)
+                (
+                    params::pv_double_extension_margin(),
+                    params::pv_triple_extension_margin(),
+                )
             } else {
-                (DOUBLE_EXTENSION_MARGIN, TRIPLE_EXTENSION_MARGIN)
+                (
+                    params::double_extension_margin(),
+                    params::triple_extension_margin(),
+                )
             };
             Ok(
                 1 + i32::from(score < singular_beta - double_margin + quiet_discount)
@@ -1101,8 +1082,8 @@ impl Searcher {
         if prunable
             && depth <= REVERSE_FUTILITY_DEPTH
             && !is_mate_score(beta)
-            && static_eval - REVERSE_FUTILITY_MARGIN * depth
-                + REVERSE_FUTILITY_IMPROVING_MARGIN * i32::from(improving)
+            && static_eval - params::reverse_futility_margin() * depth
+                + params::reverse_futility_improving_margin() * i32::from(improving)
                 >= beta
         {
             return (static_eval + beta) / 2;
@@ -1114,7 +1095,8 @@ impl Searcher {
             && board.state.played_move != Move::NULL
             && has_non_pawn_material(board, us)
         {
-            let reduction = 3 + depth / 4 + ((static_eval - beta) / 200).min(3);
+            let reduction =
+                3 + depth / 4 + ((static_eval - beta) / params::null_move_eval_divisor()).min(3);
             self.played[self.ply] = None;
             board.make_null_move();
             self.ply += 1;
@@ -1129,7 +1111,7 @@ impl Searcher {
             }
         }
 
-        let probcut_beta = beta + PROBCUT_MARGIN;
+        let probcut_beta = beta + params::probcut_margin();
         let probcut_depth = depth - PROBCUT_REDUCTION + 1;
         if prunable
             && depth >= PROBCUT_DEPTH
@@ -1196,30 +1178,32 @@ impl Searcher {
                     }
                     if !board.gives_check(candidate) {
                         let reduction = late_move_reduction(depth, legal_moves as usize + 1)
-                            - move_history / QUIET_REDUCTION_HISTORY_DIVISOR;
+                            - move_history * params::quiet_reduction_history_scale()
+                                / REDUCTION_GRAIN;
                         let lmr_depth = (depth - 1 - reduction / REDUCTION_GRAIN).max(0);
                         let futile = lmr_depth <= FUTILITY_DEPTH
                             && static_eval
-                                + FUTILITY_BASE
-                                + FUTILITY_MARGIN * lmr_depth
-                                + move_history / FUTILITY_HISTORY_DIVISOR
+                                + params::futility_base()
+                                + params::futility_margin() * lmr_depth
+                                + move_history * params::futility_history_scale()
+                                    / FUTILITY_HISTORY_GRAIN
                                 <= alpha;
                         if futile {
                             continue;
                         }
                         if depth <= HISTORY_PRUNING_DEPTH
-                            && move_history < -HISTORY_PRUNING_MARGIN * depth
+                            && move_history < -params::history_pruning_margin() * depth
                         {
                             continue;
                         }
                         if depth <= QUIET_SEE_DEPTH
-                            && !board.see(candidate, -QUIET_SEE_MARGIN * depth)
+                            && !board.see(candidate, -params::quiet_see_margin() * depth)
                         {
                             continue;
                         }
                     }
                 } else if depth <= NOISY_SEE_DEPTH
-                    && !board.see(candidate, -NOISY_SEE_MARGIN * depth)
+                    && !board.see(candidate, -params::noisy_see_margin() * depth)
                 {
                     continue;
                 }
@@ -1265,44 +1249,46 @@ impl Searcher {
                     let mut reduction = late_move_reduction(depth, legal_moves as usize);
                     if is_quiet {
                         if self.killers[self.ply - 1].contains(&candidate) {
-                            reduction -= KILLER_REDUCTION_DISCOUNT;
+                            reduction -= params::killer_reduction_discount();
                         }
                         if hash_move_is_noisy {
-                            reduction += NOISY_HASH_MOVE_REDUCTION;
+                            reduction += params::noisy_hash_move_reduction();
                         }
                         if escapes_threat {
-                            reduction -= THREAT_ESCAPE_REDUCTION_DISCOUNT;
+                            reduction -= params::threat_escape_reduction_discount();
                         }
-                        reduction -= move_history / QUIET_REDUCTION_HISTORY_DIVISOR;
+                        reduction -= move_history * params::quiet_reduction_history_scale()
+                            / REDUCTION_GRAIN;
                     } else {
-                        reduction -= NOISY_REDUCTION_DISCOUNT;
-                        reduction -= move_history / NOISY_REDUCTION_HISTORY_DIVISOR;
+                        reduction -= params::noisy_reduction_discount();
+                        reduction -= move_history * params::noisy_reduction_history_scale()
+                            / REDUCTION_GRAIN;
                     }
                     if is_pv {
-                        reduction -= PV_REDUCTION_DISCOUNT;
+                        reduction -= params::pv_reduction_discount();
                     }
                     if was_pv {
-                        reduction -= WAS_PV_REDUCTION_DISCOUNT;
+                        reduction -= params::was_pv_reduction_discount();
                         if hit.is_some_and(|hit| hit.score > alpha) {
-                            reduction -= PV_HASH_SCORE_ABOVE_ALPHA_DISCOUNT;
+                            reduction -= params::pv_hash_score_above_alpha_discount();
                         }
                         if hit.is_some_and(|hit| i32::from(hit.depth) >= depth) {
-                            reduction -= PV_HASH_DEPTH_DISCOUNT;
+                            reduction -= params::pv_hash_depth_discount();
                         }
                     }
                     if cut_node && !was_pv {
-                        reduction += CUT_NODE_REDUCTION;
+                        reduction += params::cut_node_reduction();
                     }
                     if !improving {
-                        reduction += NOT_IMPROVING_REDUCTION;
+                        reduction += params::not_improving_reduction();
                     }
                     if gives_check {
-                        reduction -= CHECK_REDUCTION_DISCOUNT;
+                        reduction -= params::check_reduction_discount();
                     }
                     if self.cutoff_counts[self.ply] > CHILD_CUTOFFS_THRESHOLD {
-                        reduction += CHILD_CUTOFFS_REDUCTION;
+                        reduction += params::child_cutoffs_reduction();
                     }
-                    reduction -= CORRECTION_REDUCTION_SCALE * correction_magnitude;
+                    reduction -= params::correction_reduction_scale() * correction_magnitude;
                     reduced_depth =
                         (new_depth - reduction / REDUCTION_GRAIN).clamp(1, new_depth + 1);
                 }
@@ -1312,9 +1298,10 @@ impl Searcher {
                 let mut full_depth = new_depth;
                 if !self.stopped && score > alpha && reduced_depth < new_depth {
                     let deeper_margin =
-                        DEEPER_RESEARCH_MARGIN + DEEPER_RESEARCH_DEPTH_SCALE * new_depth;
+                        params::deeper_research_margin() + DEEPER_RESEARCH_DEPTH_SCALE * new_depth;
                     full_depth += i32::from(score > best_score + deeper_margin);
-                    full_depth -= i32::from(score < best_score + SHALLOWER_RESEARCH_MARGIN);
+                    full_depth -=
+                        i32::from(score < best_score + params::shallower_research_margin());
                     if full_depth > reduced_depth {
                         score =
                             -self.negamax(board, full_depth, -alpha - 1, -alpha, child_cut_node);
@@ -1347,7 +1334,7 @@ impl Searcher {
                         candidate,
                         &tried_quiets[..tried_quiet_count],
                         &tried_noisy[..tried_noisy_count],
-                        depth + i32::from(score > beta + STRONG_CUTOFF_MARGIN),
+                        depth + i32::from(score > beta + params::strong_cutoff_margin()),
                     );
                     break;
                 }
@@ -1380,11 +1367,11 @@ impl Searcher {
         };
         if !is_root && legal_moves > 0 && bound == Bound::Upper {
             let deep = depth > PRIOR_FAIL_LOW_DEEP_DEPTH;
-            let far_below_eval =
-                corrected_eval.is_some_and(|eval| score <= eval - PRIOR_FAIL_LOW_EVAL_MARGIN);
-            let factor = PRIOR_FAIL_LOW_BASE_FACTOR
-                + PRIOR_FAIL_LOW_DEEP_FACTOR * i32::from(deep)
-                + PRIOR_FAIL_LOW_EVAL_FACTOR * i32::from(far_below_eval);
+            let far_below_eval = corrected_eval
+                .is_some_and(|eval| score <= eval - params::prior_fail_low_eval_margin());
+            let factor = params::prior_fail_low_base_factor()
+                + params::prior_fail_low_deep_factor() * i32::from(deep)
+                + params::prior_fail_low_eval_factor() * i32::from(far_below_eval);
             self.reward_prior_quiet(board, history_bonus(depth) * factor / PRIOR_FAIL_LOW_GRAIN);
         }
         if let (Some(raw_eval), Some(corrected_eval)) = (unrefined_eval, corrected_eval) {
@@ -1462,7 +1449,7 @@ impl Searcher {
             MovePicker::good_noisy_only(hash_move)
         };
 
-        let futility_base = best_score + QUIESCENCE_FUTILITY_MARGIN;
+        let futility_base = best_score + params::quiescence_futility_margin();
         let continuations = self.continuations();
         let threats = if in_check {
             board.threats()

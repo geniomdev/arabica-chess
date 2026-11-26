@@ -1,9 +1,9 @@
+use crate::params;
 use crate::types::{Bitboard, Color, Move, PIECE_TYPES, Piece, SIDES, SQUARES, Square};
 
 pub const CONTINUATION_PLIES: usize = 2;
 
 const MAX_HISTORY: i32 = 16_384;
-const MAX_HISTORY_BONUS: i32 = 1_200;
 const PIECE_TO_SLOTS: usize = SIDES * PIECE_TYPES * SQUARES;
 const THREAT_BUCKETS: usize = 4;
 const VICTIM_SLOTS: usize = PIECE_TYPES + 1;
@@ -56,7 +56,7 @@ impl Default for History {
 }
 
 pub fn history_bonus(depth: i32) -> i32 {
-    (16 * depth * depth).min(MAX_HISTORY_BONUS)
+    (params::history_bonus_scale() * depth * depth).min(params::history_bonus_max())
 }
 
 fn apply_gravity(entry: &mut i32, bonus: i32) {
