@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 
 if [ $# -lt 2 ]; then
   echo "usage: script/sprt <new engine> <base engine> [elo0] [elo1]" >&2
-  echo "env:   TC=8+0.08 HASH=16 CONCURRENCY=11 BOOK=data/UHO_Lichess_4852_v1.epd" >&2
+  echo "env:   TC=8+0.08 HASH=16 CONCURRENCY=11 BOOK=data/UHO_Lichess_4852_v1.epd VARIANT=standard" >&2
   exit 1
 fi
 
@@ -14,7 +14,8 @@ elo1=${4:-5}
 tc=${TC:-8+0.08}
 hash=${HASH:-16}
 concurrency=${CONCURRENCY:-11}
-book=${BOOK:-$root/data/UHO_Lichess_4852_v1.epd}
+book=$(realpath -e "${BOOK:-$root/data/UHO_Lichess_4852_v1.epd}")
+variant=${VARIANT:-standard}
 fastchess=${FASTCHESS:-$root/bin/fastchess}
 
 new_name=$(basename "$1")
@@ -34,6 +35,7 @@ setsid "$fastchess" \
   -engine cmd="$work/$new_name" name="$new_name" \
   -engine cmd="$work/$base_name" name="$base_name" \
   -each tc="$tc" option.Hash="$hash" \
+  -variant "$variant" \
   -openings file="$book" format=epd order=random \
   -sprt elo0="$elo0" elo1="$elo1" alpha=0.05 beta=0.05 model=normalized \
   -rounds 50000 -games 2 -repeat -concurrency "$concurrency" -ratinginterval 10 -recover \
@@ -84,7 +86,7 @@ table() {
   count=$(grep -c '^Finished game' "$log" || true)
   rate=$(( elapsed > 0 ? count * 3600 / elapsed : 0 ))
   row "Match" "$new_name vs $base_name"
-  row "Settings" "tc $tc, hash $hash, concurrency $concurrency, SPRT [$elo0, $elo1]"
+  row "Settings" "tc $tc, hash $hash, variant $variant, concurrency $concurrency, SPRT [$elo0, $elo1]"
   row "Elapsed" "$(printf '%02d:%02d:%02d' $((elapsed / 3600)) $((elapsed % 3600 / 60)) $((elapsed % 60))), $count games finished, $rate games/h"
   row "Games" "$(latest 'Games:' | sed -E 's/Games: ([0-9]+), Wins: ([0-9]+), Losses: ([0-9]+), Draws: ([0-9]+), Points: [0-9.]+ \(([0-9.]+) %\)/\1 (+\2 -\3 =\4)  \5 %/')"
   row "Elo" "$(latest 'Elo:' | sed -E 's/Elo: ([-0-9.]+) \+\/- ([0-9.]+), nElo: ([-0-9.]+) \+\/- ([0-9.]+)/\1 ± \2  (nElo \3 ± \4)/')"
