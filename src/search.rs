@@ -463,7 +463,7 @@ impl Searcher {
             .and_then(|tablebases| tablebases.root_moves(board));
         self.tablebase_probing =
             self.tablebases.is_some() && root.is_none() && self.tablebases_in_search;
-        self.tablebase_root_moves = root.map_or_default(|root| root.moves);
+        self.tablebase_root_moves = root.map(|root| root.moves).unwrap_or_default();
         if !self.tablebase_root_moves.is_empty() {
             self.shared
                 .count_tablebase_hits(self.tablebase_root_moves.len() as u64);
